@@ -263,6 +263,7 @@ pub struct Document {
     pub filter_refresh_pending: bool,
     pub filter_progress: Option<FilterProgress>,
     pub filter_status: Option<String>,
+    pub filter_paused_row_limit: Option<u64>,
     pub export_job: Option<FilterExportJob>,
     pub export_progress: Option<FilterExportProgress>,
     pub export_status: Option<String>,
@@ -414,10 +415,12 @@ impl Document {
             .collect();
         let progress = IndexProgress {
             bytes_scanned: 0,
+            bytes_read: 0,
             rows_scanned: 0,
             columns_found: 0,
             file_size: session.file_size,
             elapsed: Duration::ZERO,
+            paused: false,
             done: false,
             cancelled: false,
         };
@@ -456,6 +459,7 @@ impl Document {
             filter_refresh_pending: false,
             filter_progress: None,
             filter_status: None,
+            filter_paused_row_limit: None,
             export_job: None,
             export_progress: None,
             export_status: None,
@@ -2037,6 +2041,76 @@ impl Document {
         Ok(())
     }
 
+    pub fn is_indexing_paused(&self) -> bool {
+        self.job.as_ref().is_some_and(IndexJob::is_paused)
+    }
+
+    pub fn is_indexing_pausing(&self) -> bool {
+        self.job
+            .as_ref()
+            .is_some_and(|job| job.is_pause_requested() && !job.is_paused())
+    }
+
+    pub fn can_pause_indexing(&self) -> bool {
+        !self.is_compressed()
+            && self.job.is_some()
+            && !self.progress.done
+            && !self.is_indexing_paused()
+            && !self.is_indexing_pausing()
+            && !self.saving_in_place
+            && !self.source_changed
+    }
+
+    pub fn can_resume_indexing(&self) -> bool {
+        !self.is_compressed()
+            && self.job.is_some()
+            && !self.progress.done
+            && self.is_indexing_paused()
+            && !self.saving_in_place
+            && !self.source_changed
+    }
+
+    pub fn committed_data_rows(&self) -> u64 {
+        self.progress.rows_scanned.saturating_sub(self.data_start)
+    }
+
+    pub fn pause_indexing(&mut self) -> Result<(), String> {
+        let Some(job) = &self.job else {
+            return Err("No active indexing job to pause.".into());
+        };
+        if self.progress.done || self.saving_in_place {
+            return Err("Indexing is already complete.".into());
+        }
+        job.pause();
+        self.progress = job.progress();
+        self.last_poll = Instant::now() - POLL_INTERVAL;
+        Ok(())
+    }
+
+    pub fn resume_indexing(&mut self) -> Result<(), String> {
+        let result = {
+            let Some(job) = self.job.as_mut() else {
+                return Err("No paused indexing job to resume.".into());
+            };
+            if !job.is_paused() {
+                return Err("Indexing is not paused.".into());
+            }
+            job.resume()
+        };
+        if let Err(error) = result {
+            if matches!(error, QuarryError::SourceChanged) {
+                self.invalidate_changed_source();
+                return Err(SOURCE_CHANGED_NOTICE.into());
+            }
+            return Err(self.diagnostic_error(error));
+        }
+        if let Some(job) = &self.job {
+            self.progress = job.progress();
+        }
+        self.last_poll = Instant::now() - POLL_INTERVAL;
+        Ok(())
+    }
+
     pub fn poll(&mut self) -> Result<(), String> {
         if self.poll_decompression()? {
             return Ok(());
@@ -2045,7 +2119,8 @@ impl Document {
             return Ok(());
         };
         let progress = job.progress();
-        if self.last_poll.elapsed() < POLL_INTERVAL && !progress.done {
+        let transitioned_to_paused = progress.paused && !self.progress.paused;
+        if self.last_poll.elapsed() < POLL_INTERVAL && !progress.done && !transitioned_to_paused {
             return Ok(());
         }
         self.last_poll = Instant::now();
@@ -2072,7 +2147,7 @@ impl Document {
             }
         }
         self.apply_indexed_width(self.progress.columns_found);
-        if self.progress.done {
+        if self.progress.done || transitioned_to_paused {
             self.load_buffer(self.viewport_start)?;
         }
         Ok(())
@@ -2128,7 +2203,15 @@ impl Document {
                 column: found.column.saturating_add(1),
             },
         );
-        let index = self.index.as_ref().expect("index was checked above");
+        let partial_snapshot;
+        let index = if let Some(index) = &self.index {
+            index
+        } else if let Some(job) = &self.job {
+            partial_snapshot = job.snapshot();
+            &partial_snapshot
+        } else {
+            return Err("Search is available after indexing completes.".into());
+        };
         self.search_job = Some(
             self.session
                 .start_search_with_cell_edits_and_case(
@@ -2276,11 +2359,16 @@ impl Document {
         self.selected_rows.clear();
         self.selected_columns.clear();
         self.column_selection_anchor = None;
-        self.search_status = Some(format!(
-            "Found row {}, column {}.",
-            row.saturating_sub(self.data_start).saturating_add(1),
-            column.saturating_add(1)
-        ));
+        let data_row = row.saturating_sub(self.data_start).saturating_add(1);
+        let data_col = column.saturating_add(1);
+        self.search_status = Some(if self.is_indexing_paused() {
+            format!(
+                "Found row {data_row}, column {data_col} (searched up to row {}, indexing paused).",
+                self.committed_data_rows()
+            )
+        } else {
+            format!("Found row {data_row}, column {data_col}.")
+        });
         self.last_match = Some(found);
         Ok(())
     }
@@ -2293,8 +2381,8 @@ impl Document {
             return Ok(());
         }
         let job = self.search_job.take().expect("search job is present");
-        match job.wait().map_err(|error| self.diagnostic_error(error))? {
-            SearchOutcome::Match(found) => {
+        match job.wait() {
+            Ok(SearchOutcome::Match(found)) => {
                 if let Some(index) = self.search_history_index {
                     self.search_history.truncate(index + 1);
                 }
@@ -2302,12 +2390,26 @@ impl Document {
                 self.search_history_index = self.search_history.len().checked_sub(1);
                 self.show_search_match(found)?;
             }
-            SearchOutcome::NotFound => {
-                self.search_status = Some("No further matches.".into());
+            Ok(SearchOutcome::NotFound) => {
+                self.search_status = Some(if self.is_indexing_paused() {
+                    format!(
+                        "No further matches (searched up to row {}, indexing paused).",
+                        self.committed_data_rows()
+                    )
+                } else {
+                    "No further matches.".into()
+                });
             }
-            SearchOutcome::Cancelled => {
+            Ok(SearchOutcome::Cancelled) => {
                 self.search_status = Some("Search cancelled.".into());
             }
+            Err(QuarryError::RowNotIndexed { indexed_rows, .. }) if self.is_indexing_paused() => {
+                self.search_status = Some(format!(
+                    "No match — searched up to row {}, indexing paused.",
+                    indexed_rows.saturating_sub(self.data_start)
+                ));
+            }
+            Err(error) => return Err(self.diagnostic_error(error)),
         }
         Ok(())
     }
@@ -2351,9 +2453,24 @@ impl Document {
             .map_err(|error| self.diagnostic_error(error))?;
 
         self.commit_edits();
+        let (max_bytes, paused_row_limit) = if self.is_indexing_paused() {
+            let partial = self.job.as_ref().map(IndexJob::snapshot);
+            (
+                partial.as_ref().map(StructuralIndex::committed_record_end),
+                partial
+                    .as_ref()
+                    .map(|idx| idx.indexed_rows().saturating_sub(self.data_start)),
+            )
+        } else {
+            (None, None)
+        };
         let job = self
             .session
-            .start_filter_with_edits(query.clone(), Arc::new(self.cell_edits.as_ref().clone()))
+            .start_filter_with_edits_and_limit(
+                query.clone(),
+                Arc::new(self.cell_edits.as_ref().clone()),
+                max_bytes,
+            )
             .map_err(|error| {
                 if matches!(error, QuarryError::SourceChanged) {
                     self.invalidate_changed_source();
@@ -2366,7 +2483,12 @@ impl Document {
         self.filter_job = Some(job);
         self.filter_query = Some(query);
         self.filter_refresh_pending = false;
-        self.filter_status = Some("Filtering rows…".into());
+        self.filter_paused_row_limit = paused_row_limit;
+        self.filter_status = Some(if let Some(limit) = paused_row_limit {
+            format!("Filtering rows (up to row {limit}, indexing paused)…")
+        } else {
+            "Filtering rows…".into()
+        });
         self.export_progress = None;
         self.export_status = None;
         self.export_cancel_requested = false;
@@ -2462,7 +2584,21 @@ impl Document {
             Ok(index) => {
                 let matches = index.matches_found();
                 self.filter_index = Some(index);
-                self.filter_status = Some(if progress.cancelled {
+                self.filter_status = Some(if let Some(limit) = self.filter_paused_row_limit {
+                    if progress.cancelled {
+                        format!(
+                            "Filter cancelled after {matches} matches (searched up to row {limit}, indexing paused)."
+                        )
+                    } else if matches == 0 {
+                        format!(
+                            "Filter complete. No matching rows (searched up to row {limit}, indexing paused)."
+                        )
+                    } else {
+                        format!(
+                            "Filter complete. {matches} matches (searched up to row {limit}, indexing paused)."
+                        )
+                    }
+                } else if progress.cancelled {
                     format!("Filter cancelled after {matches} matches.")
                 } else if matches == 0 {
                     "Filter complete. No matching rows.".into()
@@ -2485,6 +2621,7 @@ impl Document {
                 self.filter_refresh_pending = false;
                 self.filter_progress = None;
                 self.filter_status = None;
+                self.filter_paused_row_limit = None;
                 self.whitespace.invalidate_rows();
                 self.filtered_rows.clear();
                 self.filter_viewport_start = 0;
@@ -2869,6 +3006,7 @@ impl Document {
         self.filter_query = None;
         self.filter_refresh_pending = false;
         self.filter_progress = None;
+        self.filter_paused_row_limit = None;
         self.whitespace.invalidate_rows();
         self.buffered_rows.clear();
         self.whitespace.invalidate_rows();
@@ -2921,6 +3059,7 @@ impl Document {
         self.filter_refresh_pending = false;
         self.filter_progress = None;
         self.filter_status = None;
+        self.filter_paused_row_limit = None;
         self.export_progress = None;
         self.export_status = None;
         self.export_cancel_requested = false;
@@ -2984,10 +3123,10 @@ impl Document {
     }
 
     pub fn is_search_ready(&self) -> bool {
-        self.index.is_some()
-            && self.progress.done
-            && !self.progress.cancelled
-            && self.structural_job.is_none()
+        self.structural_job.is_none()
+            && !self.source_changed
+            && ((self.index.is_some() && self.progress.done && !self.progress.cancelled)
+                || (self.is_indexing_paused() && self.job.is_some()))
     }
 
     pub fn cancel_search(&self) {

@@ -463,7 +463,11 @@ impl Session {
         } else {
             start
         };
-        let indexed_frontier = index.indexed_bytes().min(self.file_size);
+        let indexed_frontier = if index.indexed_bytes() == self.file_size {
+            self.file_size
+        } else {
+            index.committed_record_end().min(self.file_size)
+        };
         let checkpoint = index.nearest_checkpoint(start.row);
         let stripes = build_search_stripes(
             index,

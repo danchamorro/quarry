@@ -17,13 +17,14 @@ use quarry_workbench::compressed::{
 };
 use quarry_workbench::{
     AppMessage, CombineWorkflow, CommandContext, CommandId, CommandResolution,
-    DEFAULT_NOFILE_TARGET, DelimiterMode, Document, DocumentId, FailedOpen, InspectWorkflow,
-    JOIN_INPUT_RESERVED, JoinWorkflow, MessageSeverity, Palette, ResidencyState, ResolvedTheme,
-    SchedulerError, SelectionModifiers, StoragePreferences, StructuralDialog, StructuralJob,
-    ThemeAppearance, ThemePreference, ThemePreferences, WakeOutcome, WindowId, WorkbenchScheduler,
-    WorkbenchSchedulerConfig, WorkbenchTab, clear_index_cache_summary, evaluate_command,
-    inspect_temporary_storage, materialization_progress, omarchy_theme_fingerprint, resolve_theme,
-    select_column, sort_progress,
+    DEFAULT_NOFILE_TARGET, DelimiterMode, Document, DocumentId, FailedOpen, HudAnnouncement,
+    HudAnnouncementTracker, HudIndexPhase, InspectWorkflow, JOIN_INPUT_RESERVED, JoinWorkflow,
+    MessageSeverity, Palette, ResidencyState, ResolvedTheme, ResourceHudSample, ResourceHudSampler,
+    ResourceHudTargets, SchedulerError, SelectionModifiers, StoragePreferences, StructuralDialog,
+    StructuralJob, ThemeAppearance, ThemePreference, ThemePreferences, WakeOutcome, WindowId,
+    WorkbenchScheduler, WorkbenchSchedulerConfig, WorkbenchTab, clear_index_cache_summary,
+    evaluate_command, inspect_temporary_storage, materialization_progress,
+    omarchy_theme_fingerprint, resolve_theme, select_column, sort_progress,
 };
 
 /// Shared global concurrency cap across document saves, exports, structural edits, decompressions,
@@ -73,7 +74,14 @@ pub struct DocumentSnapshot {
     pub selected_rows_count: u64,
     pub selected_columns: Vec<usize>,
     pub index_done: bool,
+    pub index_paused: bool,
+    pub index_pausing: bool,
     pub index_fraction: f32,
+    pub index_committed_bytes: u64,
+    pub index_bytes_read: u64,
+    pub index_committed_rows: u64,
+    pub can_pause_indexing: bool,
+    pub can_resume_indexing: bool,
     pub dirty: bool,
     pub saving: bool,
     pub busy: bool,
@@ -203,6 +211,11 @@ pub struct WorkbenchController {
     pending_review_action: Option<CloseReviewAction>,
     pending_close_windows: Vec<WindowId>,
     quit_requested_complete: bool,
+    hud_sampler: ResourceHudSampler,
+    hud_targets: ResourceHudTargets,
+    hud_sample: ResourceHudSample,
+    hud_announcements: BTreeMap<WindowId, HudAnnouncementTracker>,
+    last_hud_announcement: BTreeMap<WindowId, HudAnnouncement>,
 }
 
 impl WorkbenchController {
@@ -258,6 +271,12 @@ impl WorkbenchController {
         let custom_dir = scheduler.custom_working_directory();
         let cleanup = scheduler.working_cleanup();
         let slots = scheduler.decompression_slots().clone();
+        let hud_targets = ResourceHudTargets {
+            document_dir: None,
+            scratch_dir: working_dir.clone(),
+        };
+        let hud_sampler = ResourceHudSampler::start(hud_targets.clone());
+        let hud_sample = hud_sampler.snapshot();
         Self {
             scheduler,
             storage_prefs,
@@ -297,6 +316,11 @@ impl WorkbenchController {
             pending_review_action: None,
             pending_close_windows: Vec::new(),
             quit_requested_complete: false,
+            hud_sampler,
+            hud_targets,
+            hud_sample,
+            hud_announcements: BTreeMap::new(),
+            last_hud_announcement: BTreeMap::new(),
         }
     }
 
@@ -528,6 +552,8 @@ impl WorkbenchController {
         self.windows.remove(&id);
         self.editing_windows.remove(&id);
         self.window_messages.remove(&id);
+        self.hud_announcements.remove(&id);
+        self.last_hud_announcement.remove(&id);
         if self.combine_dialog_owner == Some(id) {
             self.combine_dialog_owner = None;
         }
@@ -944,11 +970,18 @@ impl WorkbenchController {
             selected_rows_count: doc.selected_rows.count(),
             selected_columns: doc.selected_columns.iter().copied().collect(),
             index_done: doc.job.is_none() && doc.progress.done,
+            index_paused: doc.is_indexing_paused(),
+            index_pausing: doc.is_indexing_pausing(),
             index_fraction: if doc.session.file_size == 0 {
                 1.0
             } else {
                 (doc.progress.bytes_scanned as f32 / doc.session.file_size as f32).clamp(0.0, 1.0)
             },
+            index_committed_bytes: doc.progress.bytes_scanned,
+            index_bytes_read: doc.progress.bytes_read,
+            index_committed_rows: doc.committed_data_rows(),
+            can_pause_indexing: doc.can_pause_indexing(),
+            can_resume_indexing: doc.can_resume_indexing(),
             dirty: doc.is_dirty(),
             saving: doc.save_job.is_some(),
             busy: tab.document_writing(),
@@ -1026,6 +1059,7 @@ impl WorkbenchController {
             {
                 let _ = handle.update(cx, |_, window, _| window.activate_window());
             }
+            let _ = self.sync_resource_hud();
             cx.notify();
             return Ok((owner_window, doc_id));
         }
@@ -3248,6 +3282,116 @@ impl WorkbenchController {
             })
     }
 
+    pub fn resource_hud_sample(&self) -> &ResourceHudSample {
+        &self.hud_sample
+    }
+
+    pub fn hud_announcement(&self, window: WindowId) -> Option<&HudAnnouncement> {
+        self.last_hud_announcement.get(&window)
+    }
+
+    pub fn pause_active_indexing(
+        &mut self,
+        window: WindowId,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let Some(id) = self.scheduler.active_document(window) else {
+            return Err("Open a file first.".into());
+        };
+        self.scheduler.pause_indexing(id)?;
+        let _ = self.sync_resource_hud();
+        cx.notify();
+        Ok(())
+    }
+
+    pub fn resume_active_indexing(
+        &mut self,
+        window: WindowId,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let Some(id) = self.scheduler.active_document(window) else {
+            return Err("Open a file first.".into());
+        };
+        self.scheduler.resume_indexing(id)?;
+        let _ = self.sync_resource_hud();
+        cx.notify();
+        Ok(())
+    }
+
+    pub fn toggle_active_indexing_pause(
+        &mut self,
+        window: WindowId,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let paused = self
+            .active_document(window)
+            .is_some_and(Document::is_indexing_paused);
+        if paused {
+            self.resume_active_indexing(window, cx)
+        } else {
+            self.pause_active_indexing(window, cx)
+        }
+    }
+
+    fn sync_resource_hud(&mut self) -> bool {
+        let mut changed = false;
+        let document_dir = self
+            .scheduler
+            .windows()
+            .into_iter()
+            .find_map(|window| self.active_document(window))
+            .and_then(|doc| doc.logical_path.parent().map(Path::to_path_buf));
+        let next_targets = ResourceHudTargets {
+            document_dir,
+            scratch_dir: self.scheduler.working_directory().to_path_buf(),
+        };
+        if next_targets != self.hud_targets {
+            self.hud_targets = next_targets.clone();
+            self.hud_sampler.set_targets(next_targets);
+        }
+        let latest = self.hud_sampler.snapshot();
+        if latest != self.hud_sample {
+            self.hud_sample = latest;
+            changed = true;
+        }
+        let windows = self.scheduler.windows();
+        for window in windows {
+            let (doc_instance, phase, committed_rows, committed_bytes, file_size) =
+                match self.active_document(window) {
+                    Some(doc) => {
+                        let phase = if doc.job.is_none() && doc.progress.done {
+                            HudIndexPhase::Complete
+                        } else if doc.is_indexing_paused() {
+                            HudIndexPhase::Paused
+                        } else {
+                            HudIndexPhase::Indexing
+                        };
+                        (
+                            Some(doc.instance_id),
+                            phase,
+                            doc.committed_data_rows(),
+                            doc.progress.bytes_scanned,
+                            doc.session.file_size,
+                        )
+                    }
+                    None => (None, HudIndexPhase::Idle, 0, 0, 0),
+                };
+            let tracker = self.hud_announcements.entry(window).or_default();
+            if let Some(announcement) = tracker.update(
+                doc_instance,
+                phase,
+                committed_rows,
+                committed_bytes,
+                file_size,
+                &self.hud_sample.volumes,
+            ) {
+                self.last_hud_announcement.insert(window, announcement);
+                changed = true;
+            }
+        }
+        changed
+    }
+
     pub fn poll_background(&mut self, cx: &mut Context<Self>) {
         // Track whether any hydrated tab had an active background job BEFORE polling so
         // the exact tick a job finishes cleanly still notifies observers.
@@ -3400,6 +3544,9 @@ impl WorkbenchController {
                 }
                 CloseReviewAction::Proceed => {}
             }
+            changed = true;
+        }
+        if self.sync_resource_hud() {
             changed = true;
         }
         if !changed && self.any_hydrated_tab_busy() {

@@ -33,7 +33,8 @@ use gpui_kit::{
 use quarry_core::{Encoding, OpenOptions};
 use quarry_workbench::{
     AppMessage, CommandId, DocumentId, FailedOpen, MessageSeverity, ResidencyState, ResolvedTheme,
-    ThemeAppearance, ThemePreference, WindowId, compressed::uncompressed_name, format_bytes,
+    ResourceHudSample, ThemeAppearance, ThemePreference, WindowId, compressed::uncompressed_name,
+    format_bytes,
 };
 
 use find_bar::{FindBar, FindBarEvent};
@@ -43,11 +44,11 @@ use menus::{
     CopySelection, DeleteSelectedColumns, DeleteSelectedRows, DiscardChanges, EditCell,
     ExportFiltered, FindDuplicates, FindNext, FindPrevious, FindText, InsertColumns, InsertRows,
     InspectFile, JoinFiles, MoveColumns, MoveTabToNewWindow, NewWindow, NextTab, OpenFile,
-    OpenIso88591, OpenUtf8, OpenUtf16Be, OpenUtf16Le, OpenWindows1252, PreviousTab,
-    QUARRY_KEY_CONTEXT, QuitApp, RedoEdit, ReloadFromDisk, RenameHeader, ReplaceText, SaveAsFile,
-    SaveAsUtf8, SaveFile, ShowAllWhitespace, SortRows, SplitColumn, TemporaryStorage, ThemeDark,
-    ThemeLight, ThemeOmarchy, ThemeSystem, ToggleColumns, ToggleFilters, UndoEdit, bind_shortcuts,
-    encoding_label, install_menus,
+    OpenIso88591, OpenUtf8, OpenUtf16Be, OpenUtf16Le, OpenWindows1252, PauseResumeIndexing,
+    PreviousTab, QUARRY_KEY_CONTEXT, QuitApp, RedoEdit, ReloadFromDisk, RenameHeader, ReplaceText,
+    SaveAsFile, SaveAsUtf8, SaveFile, ShowAllWhitespace, SortRows, SplitColumn, TemporaryStorage,
+    ThemeDark, ThemeLight, ThemeOmarchy, ThemeSystem, ToggleColumns, ToggleFilters, UndoEdit,
+    bind_shortcuts, encoding_label, install_menus,
 };
 use panels::{PanelEvent, Panels, Tool};
 use workbench::{
@@ -1336,6 +1337,23 @@ impl QuarryWindow {
         }
     }
 
+    fn pause_resume_indexing_action(
+        &mut self,
+        _: &PauseResumeIndexing,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.command_enabled(CommandId::PauseResumeIndexing, cx) {
+            return;
+        }
+        let result = self.controller.update(cx, |controller, cx| {
+            controller.toggle_active_indexing_pause(self.window_id, cx)
+        });
+        if let Err(error) = result {
+            self.set_message(AppMessage::warning(error), cx);
+        }
+    }
+
     fn quit_action(&mut self, _: &QuitApp, window: &mut Window, cx: &mut Context<Self>) {
         self.quit_requested(window, cx);
     }
@@ -2391,6 +2409,7 @@ impl Render for QuarryWindow {
             .on_action(cx.listener(Self::move_columns_action))
             .on_action(cx.listener(Self::split_column_action))
             .on_action(cx.listener(Self::combine_columns_action))
+            .on_action(cx.listener(Self::pause_resume_indexing_action))
             .on_action(cx.listener(Self::toggle_whitespace_action))
             .on_action(cx.listener(Self::theme_system_action))
             .on_action(cx.listener(Self::theme_light_action))
@@ -2888,29 +2907,83 @@ impl Render for QuarryWindow {
             })
             .unwrap_or_else(|| "Ready".into());
 
-        let progress = if let Some(info) = &info {
+        let (progress, index_control) = if let Some(info) = &info {
             if let Some(ref decomp) = info.decompression_status {
-                decomp.label.clone()
+                (decomp.label.clone(), None)
             } else if info.saving {
-                "Saving…".into()
+                ("Saving…".into(), None)
             } else if info.filter_active {
-                if info.filter_done {
-                    "Filter complete".into()
+                let label = if info.filter_done {
+                    if info.index_paused {
+                        "Filter complete (indexing paused)".into()
+                    } else {
+                        "Filter complete".into()
+                    }
                 } else {
                     "Filtering…".into()
-                }
+                };
+                let control = if info.index_paused || info.can_pause_indexing || info.index_pausing
+                {
+                    Some((
+                        info.index_paused,
+                        info.index_pausing,
+                        info.can_pause_indexing,
+                        info.can_resume_indexing,
+                    ))
+                } else {
+                    None
+                };
+                (label, control)
             } else if info.index_done {
-                "Index complete".into()
+                ("Index complete".into(), None)
+            } else if info.index_paused {
+                (
+                    format!(
+                        "Paused · {} / {} ({} rows)",
+                        format_bytes(info.index_committed_bytes),
+                        format_bytes(info.file_size),
+                        number(info.index_committed_rows)
+                    ),
+                    Some((true, false, false, info.can_resume_indexing)),
+                )
+            } else if info.index_pausing {
+                (
+                    "Pausing indexing…".into(),
+                    Some((false, true, false, false)),
+                )
             } else {
-                format!("Indexing {:.0}%", info.index_fraction * 100.0)
+                let text = if info.index_bytes_read > info.index_committed_bytes {
+                    format!(
+                        "Indexing {:.0}% · {} committed ({} read)",
+                        info.index_fraction * 100.0,
+                        format_bytes(info.index_committed_bytes),
+                        format_bytes(info.index_bytes_read)
+                    )
+                } else {
+                    format!(
+                        "Indexing {:.0}% · {}",
+                        info.index_fraction * 100.0,
+                        format_bytes(info.index_committed_bytes)
+                    )
+                };
+                (text, Some((false, false, info.can_pause_indexing, false)))
             }
         } else {
             #[cfg(target_os = "macos")]
             let hint = "⌘O to open · ⌘N new window";
             #[cfg(not(target_os = "macos"))]
             let hint = "Ctrl+O to open · Ctrl+N new window";
-            hint.into()
+            (hint.into(), None)
         };
+
+        let hud_sample = self.controller.read(cx).resource_hud_sample().clone();
+        let hud_text = format_resource_hud(&hud_sample);
+        let hud_low_disk = hud_sample.volumes.iter().any(|v| v.low_disk);
+        let hud_announcement = self
+            .controller
+            .read(cx)
+            .hud_announcement(self.window_id)
+            .cloned();
 
         let tabs_badge = if total_open_tabs > 1 {
             format!(
@@ -2922,29 +2995,99 @@ impl Render for QuarryWindow {
             "Quarry".into()
         };
 
-        body.child(
-            div()
-                .id("document-status")
-                .role(Role::Status)
-                .aria_label(format!("{status} · {progress}"))
-                .flex()
-                .items_center()
-                .h(px(30.))
-                .flex_shrink_0()
-                .px_3()
-                .gap_4()
-                .border_t_1()
-                .border_color(cx.theme().border)
-                .bg(rgb(tokens.chrome.to_rgb_hex()))
-                .text_size(px(12.))
-                .font_features(grid::tabular_font_features())
-                .text_color(cx.theme().muted_foreground)
-                .child(status)
-                .child(div().flex_1())
-                .child(progress)
-                .child(div().child(tabs_badge)),
-        )
+        let mut status_bar = div()
+            .id("document-status")
+            .role(Role::Group)
+            .aria_label(format!("{status} · {progress}"))
+            .relative()
+            .flex()
+            .items_center()
+            .h(px(30.))
+            .flex_shrink_0()
+            .px_3()
+            .gap_3()
+            .border_t_1()
+            .border_color(cx.theme().border)
+            .bg(rgb(tokens.chrome.to_rgb_hex()))
+            .text_size(px(12.))
+            .font_features(grid::tabular_font_features())
+            .text_color(cx.theme().muted_foreground)
+            .child(status)
+            .child(div().flex_1())
+            .child(progress);
+
+        if let Some((paused, pausing, can_pause, can_resume)) = index_control {
+            let (label, aria_label, enabled) = if paused {
+                ("Resume", "Resume indexing", can_resume)
+            } else if pausing {
+                ("Pausing…", "Pausing indexing", false)
+            } else {
+                ("Pause", "Pause indexing", can_pause)
+            };
+            status_bar = status_bar.child(
+                Button::new("index-pause-resume")
+                    .label(label)
+                    .accessibility_label(aria_label)
+                    .ghost()
+                    .xsmall()
+                    .disabled(!enabled)
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.pause_resume_indexing_action(&PauseResumeIndexing, window, cx);
+                    })),
+            );
+        }
+
+        if !hud_text.is_empty() {
+            status_bar = status_bar.child(
+                div()
+                    .id("resource-hud")
+                    .role(Role::Group)
+                    .aria_label(hud_text.clone())
+                    .text_color(if hud_low_disk {
+                        rgb(tokens.warning_text.to_rgb_hex()).into()
+                    } else {
+                        cx.theme().muted_foreground
+                    })
+                    .child(hud_text),
+            );
+        }
+
+        if let Some(announcement) = hud_announcement {
+            status_bar = status_bar.child(
+                div()
+                    .id("hud-announcement")
+                    .role(if announcement.is_alert {
+                        Role::Alert
+                    } else {
+                        Role::Status
+                    })
+                    .aria_label(announcement.text)
+                    .absolute()
+                    .left(px(0.))
+                    .top(px(0.))
+                    .w(px(1.))
+                    .h(px(1.))
+                    .overflow_hidden(),
+            );
+        }
+
+        body.child(status_bar.child(div().child(tabs_badge)))
     }
+}
+
+fn format_resource_hud(sample: &ResourceHudSample) -> String {
+    let mut parts = Vec::new();
+    if let Some(mem) = sample.memory {
+        parts.push(format!("{} {}", mem.label, format_bytes(mem.bytes)));
+    }
+    for volume in &sample.volumes {
+        parts.push(format!(
+            "{} {} free",
+            volume.label,
+            format_bytes(volume.available_bytes)
+        ));
+    }
+    parts.join(" · ")
 }
 
 fn number(value: u64) -> String {

@@ -243,6 +243,12 @@ fn reject_scratch_symlink_components(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Query advisory available disk bytes on the volume containing `directory` without writing a
+/// probe file. Run this off the UI thread so slow or network volumes never block rendering.
+pub fn available_disk_space(directory: &Path) -> Result<u64, QuarryError> {
+    available_space(directory).map_err(|error| storage_error(directory, error))
+}
+
 #[cfg(unix)]
 pub(crate) fn available_space(directory: &Path) -> io::Result<u64> {
     let space = rustix::fs::statvfs(directory)?;

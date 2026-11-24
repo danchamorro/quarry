@@ -88,6 +88,7 @@ pub enum CommandId {
     ShowAllWhitespace,
     Columns,
     Filters,
+    PauseResumeIndexing,
     NextTab,
     PreviousTab,
     Quit,
@@ -221,7 +222,8 @@ pub fn evaluate_command(command: CommandId, ctx: &CommandContext<'_>) -> Command
         | CommandId::InsertRows
         | CommandId::InsertColumns
         | CommandId::Columns
-        | CommandId::Filters => doc_target,
+        | CommandId::Filters
+        | CommandId::PauseResumeIndexing => doc_target,
     };
 
     // Close-review actions are explicitly active during the close confirmation/wait modal.
@@ -307,6 +309,9 @@ pub fn evaluate_command(command: CommandId, ctx: &CommandContext<'_>) -> Command
         CommandId::Find => open && !filter_active,
         CommandId::InsertRows => insertion(true),
         CommandId::InsertColumns => insertion(false),
+        CommandId::PauseResumeIndexing => {
+            document.is_some_and(|doc| doc.can_pause_indexing() || doc.can_resume_indexing())
+        }
         CommandId::NextTab | CommandId::PreviousTab => ctx.open_document_count > 1,
         CommandId::KeepEditing | CommandId::DiscardAndClose => unreachable!(),
     };

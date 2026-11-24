@@ -2946,3 +2946,131 @@ fn external_open_urls_routes_hardlink_alias_to_owning_window(cx: &mut gpui_kit::
         controller.update(cx, |c, cx| c.set_window_editing(w1_id, false, cx));
     });
 }
+
+#[gpui_kit::test]
+fn pause_resume_indexing_and_live_resource_hud_work_through_gpui_ui(cx: &mut TestAppContext) {
+    use std::io::Write as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let big_csv = dir.path().join("hud-pausable.csv");
+    {
+        let mut file = std::io::BufWriter::new(std::fs::File::create(&big_csv).unwrap());
+        writeln!(file, "id,tag,payload").unwrap();
+        let pad = "p".repeat(80);
+        for i in 1..=250_000_u64 {
+            writeln!(file, "{i},row_{i},{pad}").unwrap();
+        }
+        file.flush().unwrap();
+    }
+
+    let controller = cx.update(|cx| {
+        gpui_kit::init(cx);
+        crate::apply_light_theme(cx);
+        bind_shortcuts(cx);
+        install_menus(cx);
+        WorkbenchController::reset_for_test(
+            cx,
+            WorkbenchSchedulerConfig {
+                index_cache_enabled: false,
+                ..WorkbenchSchedulerConfig::default()
+            },
+        )
+    });
+    let (handle, view) = open_test_window(cx, &controller);
+    let win_id = cx.update(|cx| view.read(cx).window_id);
+
+    // 1. Live Resource HUD samples OS-labelled memory + disk space off-thread.
+    wait_for_ui(cx, handle, &controller, &view, |_, _, cx| {
+        !controller.read(cx).resource_hud_sample().volumes.is_empty()
+    });
+    let hud_sample = cx.update(|cx| controller.read(cx).resource_hud_sample().clone());
+    #[cfg(target_os = "macos")]
+    assert_eq!(
+        hud_sample.memory.map(|m| m.label),
+        Some("phys_footprint"),
+        "macOS HUD must label memory as phys_footprint"
+    );
+    #[cfg(target_os = "linux")]
+    assert_eq!(
+        hud_sample.memory.map(|m| m.label),
+        Some("VmRSS"),
+        "Linux HUD must label memory as VmRSS"
+    );
+    assert!(
+        !hud_sample.volumes.is_empty(),
+        "HUD should report at least one volume's available space"
+    );
+    let formatted_hud = crate::format_resource_hud(&hud_sample);
+    assert!(
+        formatted_hud.contains("free"),
+        "formatted HUD readout should include free disk space: {formatted_hud:?}"
+    );
+
+    // 2. Open large CSV and immediately pause via PauseResumeIndexing action.
+    cx.update_window(handle.into(), |_, window, cx| {
+        view.update(cx, |q, cx| {
+            q.open_paths_direct(
+                vec![big_csv.clone()],
+                OpenOptions {
+                    header_mode: HeaderMode::FirstRow,
+                    ..OpenOptions::default()
+                },
+                None,
+                window,
+                cx,
+            );
+            q.pause_resume_indexing_action(&crate::menus::PauseResumeIndexing, window, cx);
+        });
+    })
+    .unwrap();
+
+    wait_for_ui(cx, handle, &controller, &view, |q, _, cx| {
+        q.snapshot(cx)
+            .is_some_and(|s| s.index_paused || s.index_done)
+    });
+    let paused_snap = cx.update(|cx| view.read(cx).snapshot(cx).unwrap());
+    assert!(
+        paused_snap.index_paused,
+        "expected large CSV indexing to pause cleanly before EOF"
+    );
+    assert!(paused_snap.can_resume_indexing);
+    assert!(cx.update(|cx| {
+        view.read(cx)
+            .command_enabled(quarry_workbench::CommandId::PauseResumeIndexing, cx)
+    }));
+
+    // Verify status bar shows interactive Resume button and state-transition announcement says paused.
+    let paused_announcement = cx.update(|cx| controller.read(cx).hud_announcement(win_id).cloned());
+    assert!(
+        paused_announcement
+            .as_ref()
+            .is_some_and(|a| !a.is_alert && a.text.contains("Indexing paused")),
+        "expected pause transition announcement, got: {paused_announcement:?}"
+    );
+
+    // 3. Click the inline status bar Resume button and verify completion announcement.
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.find("index-pause-resume").visible());
+        window.click("index-pause-resume", cx);
+    })
+    .unwrap();
+
+    wait_for_ui(cx, handle, &controller, &view, |q, _, cx| {
+        q.snapshot(cx).is_some_and(|s| s.index_done)
+    });
+    let done_snap = cx.update(|cx| view.read(cx).snapshot(cx).unwrap());
+    assert_eq!(done_snap.total_rows, 250_000);
+    assert!(!done_snap.index_paused);
+    assert!(!cx.update(|cx| {
+        view.read(cx)
+            .command_enabled(quarry_workbench::CommandId::PauseResumeIndexing, cx)
+    }));
+    let done_announcement = cx.update(|cx| controller.read(cx).hud_announcement(win_id).cloned());
+    assert!(
+        done_announcement
+            .as_ref()
+            .is_some_and(|a| !a.is_alert && a.text.contains("Indexing complete")),
+        "expected completion transition announcement, got: {done_announcement:?}"
+    );
+}

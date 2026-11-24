@@ -2445,3 +2445,188 @@ fn eager_gzip_hydration_reserves_four_job_descriptors_before_decompression() {
     finish_active_indexing(&mut roomy, doc_id);
     assert!(roomy.fd_budget().snapshot().peak_reserved < 7);
 }
+
+#[test]
+fn paused_indexing_pins_tab_supports_partial_find_and_filter_and_resumes_cleanly() {
+    use quarry_core::{CaseSensitivity, FilterOperator, FilterQuery};
+    use std::io::Write as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+
+    // Generate a ~24 MiB CSV so background indexing runs long enough to pause mid-stream,
+    // with a unique marker near the start and another near the very end.
+    let big_path = dir.path().join("big-pausable.csv");
+    {
+        let mut file = std::io::BufWriter::new(std::fs::File::create(&big_path).unwrap());
+        writeln!(file, "id,tag,payload").unwrap();
+        let pad = "x".repeat(80);
+        for i in 1..=250_000_u64 {
+            let tag = if i == 5 {
+                "EARLY_MARKER"
+            } else if i == 249_995 {
+                "LATE_TAIL_MARKER"
+            } else {
+                "steady"
+            };
+            writeln!(file, "{i},{tag},{pad}").unwrap();
+        }
+        file.flush().unwrap();
+    }
+    let other_path = write_csv(dir.path(), "other-pause-tab.csv", 10);
+    let third_path = write_csv(dir.path(), "third-pause-tab.csv", 10);
+
+    let mut scheduler = WorkbenchScheduler::new(WorkbenchSchedulerConfig {
+        max_hydrated_tabs: 1,
+        working_directory: scratch.path().to_path_buf(),
+        index_cache_enabled: false,
+        ..Default::default()
+    });
+    let ids = scheduler
+        .open_many_lazy(
+            WindowId::PRIMARY,
+            [big_path.clone(), other_path, third_path],
+            open_options(),
+            None,
+        )
+        .unwrap();
+
+    // Request pause immediately; if indexing already reached EOF on a very fast machine,
+    // retry once with a 2x file so this test deterministically exercises paused state.
+    let paused = if scheduler.pause_indexing(ids[0]).is_ok() {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let _ = scheduler.poll_all();
+            let doc = scheduler.tab(ids[0]).unwrap().document.as_ref().unwrap();
+            if doc.is_indexing_paused() {
+                break true;
+            }
+            if doc.progress.done {
+                break false;
+            }
+            assert!(Instant::now() < deadline, "pause did not settle");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    } else {
+        false
+    };
+    assert!(
+        paused,
+        "expected 24 MiB CSV indexing to pause before EOF so paused behavior is verified"
+    );
+
+    // 1. Paused tab cannot be evicted under max_hydrated_tabs = 1, and stays pinned with
+    //    PinReason::IndexingPaused when switching away under max_hydrated_tabs = 2.
+    assert_eq!(
+        scheduler.pin_reason(ids[0]),
+        Some(PinReason::ActiveInWindow(WindowId::PRIMARY))
+    );
+    let pinned_err = scheduler
+        .activate_tab(WindowId::PRIMARY, ids[1])
+        .unwrap_err();
+    assert!(
+        matches!(pinned_err, SchedulerError::AllTabsPinned { .. }),
+        "expected paused tab to block eviction under cap=1, got: {pinned_err:?}"
+    );
+    assert_eq!(scheduler.residency(ids[0]), Some(ResidencyState::Hydrated));
+
+    scheduler.config_mut().max_hydrated_tabs = 2;
+    scheduler.activate_tab(WindowId::PRIMARY, ids[1]).unwrap();
+    finish_active_indexing(&mut scheduler, ids[1]);
+    assert_eq!(
+        scheduler.pin_reason(ids[0]),
+        Some(PinReason::IndexingPaused)
+    );
+    assert_eq!(scheduler.residency(ids[0]), Some(ResidencyState::Hydrated));
+
+    // Switch back to the paused tab.
+    scheduler.activate_tab(WindowId::PRIMARY, ids[0]).unwrap();
+    let committed_rows = scheduler
+        .tab(ids[0])
+        .unwrap()
+        .document
+        .as_ref()
+        .unwrap()
+        .committed_data_rows();
+    assert!(
+        committed_rows < 250_000,
+        "paused frontier should be strictly partial (got {committed_rows})"
+    );
+
+    // 2. Partial-index Find reports "searched up to row N, indexing paused" when marker is past frontier.
+    {
+        let doc = scheduler
+            .tab_mut(ids[0])
+            .unwrap()
+            .document
+            .as_mut()
+            .unwrap();
+        assert!(doc.is_search_ready());
+        doc.start_find_next_with_case(b"LATE_TAIL_MARKER", CaseSensitivity::Sensitive)
+            .unwrap();
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let _ = scheduler.poll_searches();
+        let doc = scheduler.tab(ids[0]).unwrap().document.as_ref().unwrap();
+        if doc.search_job.is_none() {
+            let status = doc.search_status.as_deref().unwrap_or("");
+            assert!(
+                status.contains("searched up to row") && status.contains("indexing paused"),
+                "expected partial-index paused search status, got: {status:?}"
+            );
+            break;
+        }
+        assert!(Instant::now() < deadline, "partial search timed out");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    // 3. Partial-index Filter scans only the committed frontier and reports paused status.
+    let filter_query = FilterQuery::single_with_case(
+        1,
+        FilterOperator::Equals,
+        b"LATE_TAIL_MARKER".to_vec(),
+        CaseSensitivity::Sensitive,
+    );
+    scheduler.start_filter(ids[0], filter_query).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let _ = scheduler.poll_all();
+        let doc = scheduler.tab(ids[0]).unwrap().document.as_ref().unwrap();
+        if doc.filter_job.is_none() {
+            let status = doc.filter_status.as_deref().unwrap_or("");
+            assert!(
+                status.contains("searched up to row") && status.contains("indexing paused"),
+                "expected partial-index paused filter status, got: {status:?}"
+            );
+            assert_eq!(doc.available_filter_rows(), 0);
+            break;
+        }
+        assert!(Instant::now() < deadline, "partial filter timed out");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    scheduler
+        .tab_mut(ids[0])
+        .unwrap()
+        .document
+        .as_mut()
+        .unwrap()
+        .clear_filter()
+        .unwrap();
+
+    // 4. Resume completes full index (250,000 rows) and releases PinReason::IndexingPaused.
+    scheduler.resume_indexing(ids[0]).unwrap();
+    finish_active_indexing(&mut scheduler, ids[0]);
+    let doc = scheduler.tab(ids[0]).unwrap().document.as_ref().unwrap();
+    assert_eq!(doc.available_data_rows(), 250_000);
+    assert!(!doc.is_indexing_paused());
+
+    // Hydrating a third tab under cap=1 now evicts ids[0] cleanly since IndexingPaused pin is released.
+    scheduler.config_mut().max_hydrated_tabs = 1;
+    scheduler.activate_tab(WindowId::PRIMARY, ids[2]).unwrap();
+    finish_active_indexing(&mut scheduler, ids[2]);
+    assert_eq!(
+        scheduler.residency(ids[0]),
+        Some(ResidencyState::DormantClean)
+    );
+}

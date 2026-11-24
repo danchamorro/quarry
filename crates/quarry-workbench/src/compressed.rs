@@ -576,11 +576,13 @@ impl Document {
         self.session = Arc::new(session);
         self.progress = IndexProgress {
             bytes_scanned: index.indexed_bytes(),
+            bytes_read: index.indexed_bytes(),
             rows_scanned: index.indexed_rows(),
             columns_found: width,
             file_size: self.session.file_size,
             elapsed: self.progress.elapsed,
             done: true,
+            paused: false,
             cancelled: false,
         };
         self.index = Some(index);

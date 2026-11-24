@@ -723,11 +723,35 @@ impl Session {
         edits: FilterEdits,
         threads: Option<usize>,
     ) -> Result<FilterJob, QuarryError> {
+        self.start_filter_with_edits_threads_and_limit(query, edits, threads, None)
+    }
+
+    /// Filters an immutable snapshot of working cell values up to an optional committed byte limit
+    /// (for example while background indexing is paused).
+    pub fn start_filter_with_edits_and_limit(
+        &self,
+        query: FilterQuery,
+        edits: FilterEdits,
+        max_bytes: Option<u64>,
+    ) -> Result<FilterJob, QuarryError> {
+        self.start_filter_with_edits_threads_and_limit(query, edits, None, max_bytes)
+    }
+
+    fn start_filter_with_edits_threads_and_limit(
+        &self,
+        query: FilterQuery,
+        edits: FilterEdits,
+        threads: Option<usize>,
+        max_bytes: Option<u64>,
+    ) -> Result<FilterJob, QuarryError> {
         let requested_threads = resolve_worker_count(threads)?;
         self.ensure_source_unchanged()?;
+        let scan_limit = max_bytes
+            .map(|limit| limit.min(self.file_size))
+            .unwrap_or(self.file_size);
         FilterJob::start_with_edits_and_tuning(
             self.path.clone(),
-            self.file_size,
+            scan_limit,
             self.dialect.delimiter,
             u64::from(self.dialect.has_header),
             query,
@@ -1132,7 +1156,13 @@ fn run_filter(
             shared.cancelled.store(true, Ordering::Release);
             return Ok(());
         }
-        let read = encoding.read_chunk(&mut file, &mut chunk)?;
+        let remaining = shared.file_size.saturating_sub(absolute_start);
+        let read = if remaining == 0 {
+            0
+        } else {
+            let cap = encoding.chunk_size((remaining as usize).min(chunk.len()));
+            encoding.read_chunk(&mut file, &mut chunk[..cap])?
+        };
         if read == 0 {
             let mut deferred_error = None;
             let mut cancelled = false;

@@ -223,6 +223,7 @@ pub enum PinReason {
     PendingDuplicatePreview,
     CompressedDecompressing,
     CompressedPendingStorage,
+    IndexingPaused,
     JoinReserved,
     CloseFlowPending,
 }
@@ -813,6 +814,9 @@ impl WorkbenchScheduler {
         if doc.join_reserved() {
             return Some(PinReason::JoinReserved);
         }
+        if doc.is_indexing_paused() || doc.is_indexing_pausing() {
+            return Some(PinReason::IndexingPaused);
+        }
         if slot.tab.document_writing() {
             return Some(PinReason::ActiveWriteJob);
         }
@@ -853,6 +857,24 @@ impl WorkbenchScheduler {
     /// True when the shared global two-write limit (`MAX_WRITE_JOBS`) has a free slot.
     pub fn write_slot_available(&self) -> bool {
         self.active_write_operations() < MAX_WRITE_JOBS
+    }
+
+    /// Pause active background indexing on `id` without parking pool threads; pins the tab.
+    pub fn pause_indexing(&mut self, id: DocumentId) -> Result<(), String> {
+        let doc = self
+            .tab_mut(id)
+            .and_then(|tab| tab.document.as_mut())
+            .ok_or_else(|| "Document is not hydrated.".to_owned())?;
+        doc.pause_indexing()
+    }
+
+    /// Resume paused background indexing on `id` after revalidating `SourceStamp`.
+    pub fn resume_indexing(&mut self, id: DocumentId) -> Result<(), String> {
+        let doc = self
+            .tab_mut(id)
+            .and_then(|tab| tab.document.as_mut())
+            .ok_or_else(|| "Document is not hydrated.".to_owned())?;
+        doc.resume_indexing()
     }
 
     /// Lazily registers a batch of paths (e.g. 200 files) as lightweight stubs without
@@ -2898,6 +2920,8 @@ impl WorkbenchScheduler {
             return false;
         };
         if doc.join_reserved()
+            || doc.is_indexing_paused()
+            || doc.is_indexing_pausing()
             || slot.tab.document_writing()
             || doc.pending_materialization.is_some()
             || matches!(
