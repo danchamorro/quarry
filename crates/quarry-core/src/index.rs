@@ -3136,7 +3136,7 @@ mod tests {
         .unwrap();
         assert_eq!(expected.maximum_width(), 8);
 
-        let gate = test_hooks::TestIndexPauseGate::arm(&path);
+        let gate = super::test_hooks::TestIndexPauseGate::arm(&path);
         let job = IndexJob::start_with_tuning_cache_and_pool(
             &session,
             IndexConfig {
