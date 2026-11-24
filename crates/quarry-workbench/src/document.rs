@@ -3218,11 +3218,7 @@ impl Document {
             .map(|(column, name)| (*column, name.as_bytes().to_vec()))
             .collect();
         let saving_in_place = destination.is_none();
-        let save_as_transformation = if self.is_section() {
-            None
-        } else {
-            self.save_as_transformation()
-        };
+        let save_as_transformation = self.save_as_transformation();
         let result = match destination {
             Some(destination) if utf8 => self.session.start_save_as_utf8(
                 renames,
@@ -3601,7 +3597,11 @@ impl Document {
         if !self.session.dialect.has_header {
             return None;
         }
-        let field = self.session.first_rows.first()?.fields.get(column)?;
+        let header_row = self
+            .session
+            .section_header_row()
+            .or_else(|| self.session.first_rows.first())?;
+        let field = header_row.fields.get(column)?;
         std::str::from_utf8(field).ok()
     }
 

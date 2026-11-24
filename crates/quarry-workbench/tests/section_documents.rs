@@ -638,3 +638,56 @@ fn dirty_section_preserves_verified_override_across_dormancy_and_respects_blocke
     let _ = fs::remove_file(&path1);
     let _ = fs::remove_file(&path2);
 }
+
+#[test]
+fn interior_section_header_rename_uses_captured_header_and_reordered_columns_reject_save() {
+    let raw = b"name,value\nalice,1\nbob,2\n";
+    let path = temp_csv("header-rename-and-reorder", raw);
+    let out_path = path.with_extension("reordered-out.csv");
+    let _ = fs::remove_file(&out_path);
+
+    let mut scheduler = WorkbenchScheduler::new(WorkbenchSchedulerConfig::default());
+    scheduler.register_window(WindowId::PRIMARY);
+
+    let sec_start = b"name,value\n".len() as u64;
+    let sec_end = sec_start + b"alice,1\n".len() as u64;
+    let sec_id = match scheduler
+        .open_section(
+            WindowId::PRIMARY,
+            path.clone(),
+            ByteWindow::from_range(sec_start, sec_end).unwrap(),
+            SectionOpenOptions::default(),
+        )
+        .unwrap()
+    {
+        WakeOutcome::Ready { document_id, .. } => document_id,
+        other => panic!("unexpected open outcome: {other:?}"),
+    };
+    wait_for_index(&mut scheduler, sec_id);
+
+    let doc = scheduler
+        .tab_mut(sec_id)
+        .unwrap()
+        .document
+        .as_mut()
+        .unwrap();
+    // 1. Source header name for an interior section must come from byte-0 header ("name"),
+    // NOT the section's first data row ("alice"), so renaming "name" -> "alice" marks dirty.
+    assert_eq!(doc.source_header_name(0), Some("name"));
+    doc.rename_header(0, "alice".into()).unwrap();
+    assert!(doc.is_dirty());
+    assert_eq!(doc.headers[0], "alice");
+
+    // 2. Reordering columns on a section must reject Save As rather than silently dropping order.
+    assert!(doc.move_column(1, 0));
+    let err = doc.start_save_as(out_path.clone()).unwrap_err();
+    assert!(
+        err.text.to_lowercase().contains("transformation"),
+        "expected unsupported transformation error, got: {}",
+        err.text
+    );
+    assert!(!out_path.exists());
+
+    let _ = fs::remove_file(&path);
+    let _ = fs::remove_file(&out_path);
+}
