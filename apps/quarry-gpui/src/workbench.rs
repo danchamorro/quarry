@@ -3282,6 +3282,7 @@ impl WorkbenchController {
             })
     }
 
+    #[cfg(test)]
     pub fn resource_hud_sample(&self) -> &ResourceHudSample {
         &self.hud_sample
     }
