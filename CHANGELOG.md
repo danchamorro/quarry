@@ -12,12 +12,17 @@ parentheses are GitHub pull requests.
 
 ### Added
 
+- Added right-click and `Shift+F10` context menus across column headers, data cells (with instant **Filter to This Value** and **Filter Out This Value**), and `#` row gutters (with **Add/Remove Bookmark**, row insert/delete, and **Copy Row**). (#218)
+- Added external file drag-and-drop onto the Quarry window, double-clicking a column header to rename it, status-bar **Cancel** buttons for active Save and Indexing jobs, and visible row-range and selection counts in the status bar. (#218)
 - Added session-only row bookmarks via **Edit → Toggle Bookmark** (`Cmd+B` / `Ctrl+B`), **Next Bookmark** (`Cmd+]` / `Ctrl+]`), **Previous Bookmark** (`Cmd+[` / `Ctrl+[`), **Clear Bookmarks**, right-clicking the `#` row gutter, and the toolbar **Bookmarks** popover (**View → Bookmarks…**). Bookmarks survive cell edits, filters, saves, and tab dormancy, shift across row insertions and deletions, and restore via **Undo** if cleared by sort or duplicate removal. (#215)
 - Added in-place guarded **Save** (`Cmd+S` / `Ctrl+S`) for verified sections, splicing edited section bytes back into the parent file using copy-on-write cloning on APFS and supported Linux filesystems (with streaming fallback elsewhere), advisory disk-space checks, and automatic parent reload notices in open sibling tabs. Documented in [ADR 0015](docs/adr/0015-guarded-section-splice-save.md). (#213)
 - Added section-scoped **Insert Rows…**, **Delete Selected Rows**, **Replace All**, and **Undo** / **Redo** for verified sections while keeping header edits, column schema changes, **Sort**, **Find Duplicates**, and **Join Files** routed to **Save Section As New…**. (#213)
 
 ### Fixed
 
+- Fixed `Cmd+C` / `Ctrl+C` row copying after selecting a row in the `#` gutter (including while filtered) and fixed **Edit → Rename Selected Column Header…** to target the selected column header rather than the previously focused cell. (#218)
+- Fixed grid whitespace visualization to inspect raw unescaped cell bytes, highlight leading, trailing, repeated, tab, newline, and special whitespace with corner indicators and tooltips, distinguish missing ragged fields, and persist **Show All Whitespace** across restarts. (#218)
+- Fixed error banners for damaged or unsupported `.gz` files so they no longer offer an unusable **Inspect…** action. (#218)
 - Fixed modal dialog confirm and cancel buttons (**Sort Rows**, **Clean Selected Columns**, **Split Column**, **Open Section…**, and other dialogs) so clicking the primary action or **Cancel** works on the first click even when a dropdown or text input still holds focus. (#216)
 - Fixed active grid cell and list selection highlights so selected cell text remains clearly readable in both Light and Dark themes instead of being obscured by an opaque selection fill. (#216)
 
