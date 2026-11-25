@@ -140,7 +140,10 @@ fn cow_clone_file(src: &File, dst_dir: &Path, dst_name: &str) -> io::Result<Opti
             };
         }
     };
-    if let Err(err) = ro_file.set_permissions(fs::Permissions::from_mode(0o600)) {
+    if let Err(err) = ro_file
+        .set_permissions(fs::Permissions::from_mode(0o600))
+        .and_then(|()| set_macos_acl(&ro_file, None))
+    {
         drop(ro_file);
         let _ = fs::remove_file(&dst_path);
         return if err.kind() == io::ErrorKind::PermissionDenied {
@@ -881,8 +884,12 @@ fn run_section_splice(
         opts.read(true).write(true).create_new(true);
         #[cfg(unix)]
         opts.mode(0o600);
-        opts.open(&section_stage_path)
-            .map_err(|error| storage_error(parent_dir, error))?
+        let file = opts
+            .open(&section_stage_path)
+            .map_err(|error| storage_error(parent_dir, error))?;
+        crate::storage::restrict_private_file(&section_stage_path, &file)
+            .map_err(|error| storage_error(parent_dir, error))?;
+        file
     };
     let mut section_writer = BufWriter::new(section_stage_file);
     let Some((rows_written, new_section_len)) = serialize_section_to_stage(
@@ -1197,6 +1204,8 @@ fn assemble_streaming_splice(
     opts.mode(0o600);
     let mut output_file = opts
         .open(output_stage_path)
+        .map_err(|error| storage_error(parent_dir, error))?;
+    crate::storage::restrict_private_file(output_stage_path, &output_file)
         .map_err(|error| storage_error(parent_dir, error))?;
 
     let Some(prefix_copied) = copy_file_range_streaming(
@@ -3247,5 +3256,36 @@ mod tests {
         let sp = saved.splice.unwrap();
         assert_eq!(sp.rows_written, 1);
         assert_eq!(fs::read(&path).unwrap(), b"0,x\n\xEF\xBB\xBF");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_splice_staging_clears_inherited_parent_dir_acl() {
+        use std::process::Command;
+
+        let dir = TempDir::new().unwrap();
+        let status = Command::new("/bin/chmod")
+            .args([
+                "+a",
+                "everyone allow list,search,readattr,readextattr,readsecurity,file_inherit,directory_inherit",
+            ])
+            .arg(dir.path())
+            .status()
+            .unwrap();
+        if !status.success() {
+            // Skip if the test volume does not support macOS ACLs.
+            return;
+        }
+        let stage = crate::export::private_staging_directory(dir.path()).unwrap();
+        let ls = Command::new("/bin/ls")
+            .args(["-lde"])
+            .arg(stage.path())
+            .output()
+            .unwrap();
+        let listing = String::from_utf8_lossy(&ls.stdout);
+        assert!(
+            !listing.contains("everyone allow"),
+            "splice staging directory must clear inherited ACLs, got:\n{listing}"
+        );
     }
 }

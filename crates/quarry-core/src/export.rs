@@ -2723,14 +2723,29 @@ pub(crate) struct ExportTarget {
 }
 
 /// Reserves private staging on the output volume, including file-only drop folders.
+/// On macOS, clears any inherited ACL on the staging directory before returning so staging files
+/// created inside cannot inherit permissive parent ACLs.
 pub(crate) fn private_staging_directory(parent: &Path) -> io::Result<tempfile::TempDir> {
+    #[cfg(target_os = "macos")]
+    fn clear_staging_dir_acl(directory: &tempfile::TempDir) -> io::Result<()> {
+        use rustix::fs::{Mode, OFlags};
+        let dir_file = File::from(rustix::fs::open(
+            directory.path(),
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?);
+        rustix::fs::fchmod(&dir_file, Mode::RWXU)?;
+        crate::storage::set_macos_acl(&dir_file, None)?;
+        Ok(())
+    }
+
     let mut builder = tempfile::Builder::new();
     let prefix = format!(".quarry-export-{}-", std::process::id());
     builder.prefix(&prefix);
     #[cfg(unix)]
     builder.permissions(fs::Permissions::from_mode(0o700));
-    match builder.tempdir_in(parent) {
-        Ok(directory) => Ok(directory),
+    let directory = match builder.tempdir_in(parent) {
+        Ok(directory) => directory,
         Err(error) => {
             // Unix file-only ACLs can deny subdirectories while allowing the final
             // rename. Use the user's temporary directory only on the same volume.
@@ -2739,12 +2754,17 @@ pub(crate) fn private_staging_directory(parent: &Path) -> io::Result<tempfile::T
                 use std::os::unix::fs::MetadataExt;
                 let directory = builder.tempdir()?;
                 if fs::metadata(directory.path())?.dev() == fs::metadata(parent)?.dev() {
+                    #[cfg(target_os = "macos")]
+                    clear_staging_dir_acl(&directory)?;
                     return Ok(directory);
                 }
             }
-            Err(error)
+            return Err(error);
         }
-    }
+    };
+    #[cfg(target_os = "macos")]
+    clear_staging_dir_acl(&directory)?;
+    Ok(directory)
 }
 
 impl ExportTarget {
