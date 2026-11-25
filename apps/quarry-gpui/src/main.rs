@@ -40,15 +40,16 @@ use quarry_workbench::{
 use find_bar::{FindBar, FindBarEvent};
 use grid::Grid;
 use menus::{
-    AboutQuarry, CleanupColumns, CloseTab, CloseWindow, CombineColumns, CombineFiles,
-    CopySelection, DeleteSelectedColumns, DeleteSelectedRows, DiscardChanges, EditCell,
-    ExportFiltered, FindDuplicates, FindNext, FindPrevious, FindText, InsertColumns, InsertRows,
-    InspectFile, JoinFiles, MoveColumns, MoveTabToNewWindow, NewWindow, NextTab, OpenFile,
-    OpenIso88591, OpenSection, OpenUtf8, OpenUtf16Be, OpenUtf16Le, OpenWindows1252,
-    PauseResumeIndexing, PreviousTab, QUARRY_KEY_CONTEXT, QuitApp, RedoEdit, ReloadFromDisk,
-    RenameHeader, ReplaceText, SaveAsFile, SaveAsUtf8, SaveFile, ShowAllWhitespace, SortRows,
-    SplitColumn, TemporaryStorage, ThemeDark, ThemeLight, ThemeOmarchy, ThemeSystem, ToggleColumns,
-    ToggleFilters, UndoEdit, VerifySectionBoundary, bind_shortcuts, encoding_label, install_menus,
+    AboutQuarry, CleanupColumns, ClearBookmarks, CloseTab, CloseWindow, CombineColumns,
+    CombineFiles, CopySelection, DeleteSelectedColumns, DeleteSelectedRows, DiscardChanges,
+    EditCell, ExportFiltered, FindDuplicates, FindNext, FindPrevious, FindText, InsertColumns,
+    InsertRows, InspectFile, JoinFiles, MoveColumns, MoveTabToNewWindow, NewWindow, NextBookmark,
+    NextTab, OpenFile, OpenIso88591, OpenSection, OpenUtf8, OpenUtf16Be, OpenUtf16Le,
+    OpenWindows1252, PauseResumeIndexing, PreviousBookmark, PreviousTab, QUARRY_KEY_CONTEXT,
+    QuitApp, RedoEdit, ReloadFromDisk, RenameHeader, ReplaceText, SaveAsFile, SaveAsUtf8, SaveFile,
+    ShowAllWhitespace, SortRows, SplitColumn, TemporaryStorage, ThemeDark, ThemeLight,
+    ThemeOmarchy, ThemeSystem, ToggleBookmark, ToggleBookmarks, ToggleColumns, ToggleFilters,
+    UndoEdit, VerifySectionBoundary, bind_shortcuts, encoding_label, install_menus,
 };
 use panels::{PanelEvent, Panels, Tool};
 use workbench::{
@@ -256,6 +257,38 @@ impl QuarryWindow {
                                 cx.notify();
                             });
                         }
+                    }
+                    PanelEvent::ToggleBookmarkCurrent => {
+                        this.toggle_bookmark_action(&ToggleBookmark, window, cx);
+                    }
+                    PanelEvent::JumpToBookmark(local_row) => {
+                        let res = this.controller.update(cx, |controller, cx| {
+                            controller.jump_to_bookmark_active(this.window_id, *local_row, cx)
+                        });
+                        match res {
+                            Ok((table_row, _)) => {
+                                this.table.update(cx, |table, cx| {
+                                    table.scroll_to_row(table_row, cx);
+                                    cx.notify();
+                                });
+                            }
+                            Err(error) => this.set_message(AppMessage::warning(error), cx),
+                        }
+                    }
+                    PanelEvent::RemoveBookmark(local_row) => {
+                        this.controller.update(cx, |controller, cx| {
+                            controller.remove_bookmark_row_active(this.window_id, *local_row, cx);
+                        });
+                        this.table.update(cx, |_, cx| cx.notify());
+                    }
+                    PanelEvent::NextBookmark => {
+                        this.next_bookmark_action(&NextBookmark, window, cx);
+                    }
+                    PanelEvent::PreviousBookmark => {
+                        this.previous_bookmark_action(&PreviousBookmark, window, cx);
+                    }
+                    PanelEvent::ClearBookmarks => {
+                        this.clear_bookmarks_action(&ClearBookmarks, window, cx);
                     }
                 }
                 cx.notify();
@@ -1496,6 +1529,94 @@ impl QuarryWindow {
             self.panels
                 .update(cx, |panels, cx| panels.open_tool(Tool::Filters, window, cx));
         }
+    }
+
+    fn toggle_bookmarks_action(
+        &mut self,
+        _: &ToggleBookmarks,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.command_enabled(CommandId::ToggleBookmarksPanel, cx) {
+            self.panels.update(cx, |panels, cx| {
+                panels.open_tool(Tool::Bookmarks, window, cx)
+            });
+        }
+    }
+
+    fn toggle_bookmark_action(
+        &mut self,
+        _: &ToggleBookmark,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.command_enabled(CommandId::ToggleBookmark, cx) {
+            return;
+        }
+        let result = self.controller.update(cx, |controller, cx| {
+            controller.toggle_bookmark_active(self.window_id, cx)
+        });
+        if let Err(error) = result {
+            self.set_message(AppMessage::warning(error), cx);
+        } else {
+            self.table.update(cx, |_, cx| cx.notify());
+        }
+    }
+
+    fn next_bookmark_action(&mut self, _: &NextBookmark, _: &mut Window, cx: &mut Context<Self>) {
+        if !self.command_enabled(CommandId::NextBookmark, cx) {
+            return;
+        }
+        let result = self.controller.update(cx, |controller, cx| {
+            controller.step_bookmark_active(self.window_id, true, cx)
+        });
+        match result {
+            Ok((table_row, _)) => {
+                self.table.update(cx, |table, cx| {
+                    table.scroll_to_row(table_row, cx);
+                    cx.notify();
+                });
+            }
+            Err(error) => self.set_message(AppMessage::warning(error), cx),
+        }
+    }
+
+    fn previous_bookmark_action(
+        &mut self,
+        _: &PreviousBookmark,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.command_enabled(CommandId::PreviousBookmark, cx) {
+            return;
+        }
+        let result = self.controller.update(cx, |controller, cx| {
+            controller.step_bookmark_active(self.window_id, false, cx)
+        });
+        match result {
+            Ok((table_row, _)) => {
+                self.table.update(cx, |table, cx| {
+                    table.scroll_to_row(table_row, cx);
+                    cx.notify();
+                });
+            }
+            Err(error) => self.set_message(AppMessage::warning(error), cx),
+        }
+    }
+
+    fn clear_bookmarks_action(
+        &mut self,
+        _: &ClearBookmarks,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.command_enabled(CommandId::ClearBookmarks, cx) {
+            return;
+        }
+        self.controller.update(cx, |controller, cx| {
+            controller.clear_bookmarks_active(self.window_id, cx);
+        });
+        self.table.update(cx, |_, cx| cx.notify());
     }
 
     fn pause_resume_indexing_action(
@@ -3040,6 +3161,9 @@ impl QuarryWindow {
         let filters = self
             .panels
             .update(cx, |panels, cx| panels.render_filters(window, cx));
+        let bookmarks = self
+            .panels
+            .update(cx, |panels, cx| panels.render_bookmarks(window, cx));
         div()
             .id("document-toolbar")
             .role(Role::Toolbar)
@@ -3104,6 +3228,7 @@ impl QuarryWindow {
             )
             .child(columns)
             .child(filters)
+            .child(bookmarks)
             .child(
                 Button::new("toolbar-find")
                     .label("Find")
@@ -3615,6 +3740,10 @@ impl Render for QuarryWindow {
             .on_action(cx.listener(Self::find_next_action))
             .on_action(cx.listener(Self::find_previous_action))
             .on_action(cx.listener(Self::replace_action))
+            .on_action(cx.listener(Self::toggle_bookmark_action))
+            .on_action(cx.listener(Self::next_bookmark_action))
+            .on_action(cx.listener(Self::previous_bookmark_action))
+            .on_action(cx.listener(Self::clear_bookmarks_action))
             .on_action(cx.listener(Self::sort_rows_action))
             .on_action(cx.listener(Self::find_duplicates_action))
             .on_action(cx.listener(Self::cleanup_columns_action))
@@ -3634,6 +3763,7 @@ impl Render for QuarryWindow {
             .on_action(cx.listener(Self::theme_omarchy_action))
             .on_action(cx.listener(Self::toggle_columns_action))
             .on_action(cx.listener(Self::toggle_filters_action))
+            .on_action(cx.listener(Self::toggle_bookmarks_action))
             .on_action(cx.listener(Self::combine_files_action))
             .on_action(cx.listener(Self::join_files_action))
             .on_action(cx.listener(Self::inspect_file_action))

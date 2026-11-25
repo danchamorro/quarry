@@ -272,7 +272,20 @@ impl TableDelegate for Grid {
     fn cell_label(&self, row: usize, column: usize, cx: &App) -> Option<SharedString> {
         let value = self.display_raw_loaded(row, column, cx)?;
         if column == 0 {
-            return (!value.is_empty()).then(|| format!("Row {value}").into());
+            if value.is_empty() {
+                return None;
+            }
+            let bookmarked = self.source_row_at(row, cx).is_some_and(|src_row| {
+                self.controller
+                    .read(cx)
+                    .active_document(self.window_id)
+                    .is_some_and(|doc| doc.bookmarks.contains_row(src_row))
+            });
+            return Some(if bookmarked {
+                format!("Row {value}, bookmarked").into()
+            } else {
+                format!("Row {value}").into()
+            });
         }
         let controller = self.controller.read(cx);
         let doc = controller.active_document(self.window_id)?;
@@ -361,15 +374,21 @@ impl TableDelegate for Grid {
             (false, true)
         };
         let tokens = self.controller.read(cx).active_palette();
-        let row_selected = if column == 0 {
-            self.source_row_at(row, cx).is_some_and(|src_row| {
-                self.controller
-                    .read(cx)
-                    .active_document(self.window_id)
-                    .is_some_and(|doc| doc.selected_rows.contains(src_row))
-            })
+        let (row_selected, row_bookmarked) = if column == 0 {
+            self.source_row_at(row, cx)
+                .map_or((false, false), |src_row| {
+                    self.controller
+                        .read(cx)
+                        .active_document(self.window_id)
+                        .map_or((false, false), |doc| {
+                            (
+                                doc.selected_rows.contains(src_row),
+                                doc.bookmarks.contains_row(src_row),
+                            )
+                        })
+                })
         } else {
-            false
+            (false, false)
         };
         let mut cell = div()
             .id(("grid-cell", row * 1024 + column))
@@ -400,6 +419,7 @@ impl TableDelegate for Grid {
         {
             let controller = self.controller.clone();
             let win_id = self.window_id;
+            let right_controller = self.controller.clone();
             cell = cell
                 .cursor_pointer()
                 .on_mouse_down(MouseButton::Left, move |event, _, cx| {
@@ -408,7 +428,34 @@ impl TableDelegate for Grid {
                     controller.update(cx, |controller, cx| {
                         controller.select_row_active(win_id, src_row, shift, toggle, cx);
                     });
+                })
+                .on_mouse_down(MouseButton::Right, move |_, _, cx| {
+                    right_controller.update(cx, |controller, cx| {
+                        if let Err(error) =
+                            controller.toggle_bookmark_row_active(win_id, src_row, cx)
+                        {
+                            controller.set_window_message(
+                                win_id,
+                                Some(quarry_workbench::AppMessage::warning(error)),
+                                cx,
+                            );
+                        }
+                    });
                 });
+        }
+        if row_bookmarked {
+            cell = cell.child(
+                div()
+                    .w(px(6.))
+                    .h(px(6.))
+                    .flex_shrink_0()
+                    .rounded_full()
+                    .bg(rgb(if row_selected {
+                        tokens.on_accent.to_rgb_hex()
+                    } else {
+                        tokens.accent_text.to_rgb_hex()
+                    })),
+            );
         }
         let mut text_div = div().flex_1().min_w_0().overflow_hidden().text_ellipsis();
         if numeric_cell {

@@ -3745,3 +3745,244 @@ fn active_table_and_list_overlays_stay_translucent_in_light_and_dark_themes(
         }
     });
 }
+
+#[gpui_kit::test]
+fn row_bookmarks_toggle_navigate_sort_undo_and_accessible_labels_in_gpui(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("bookmarks_ui.csv");
+    std::fs::write(
+        &path,
+        "id,name\n3,charlie\n1,alpha\n4,delta\n2,bravo\n5,echo\n",
+    )
+    .unwrap();
+
+    let controller = cx.update(|cx| {
+        gpui_kit::init(cx);
+        crate::apply_light_theme(cx);
+        bind_shortcuts(cx);
+        install_menus(cx);
+        WorkbenchController::reset_for_test(
+            cx,
+            WorkbenchSchedulerConfig {
+                index_cache_enabled: false,
+                ..WorkbenchSchedulerConfig::default()
+            },
+        )
+    });
+    let (handle, view) = open_test_window(cx, &controller);
+    let win_id = cx.update(|cx| view.read(cx).window_id);
+
+    cx.update_window(handle.into(), |_, window, cx| {
+        view.update(cx, |q, cx| {
+            q.open_paths_direct(
+                vec![path.clone()],
+                OpenOptions {
+                    header_mode: HeaderMode::FirstRow,
+                    ..OpenOptions::default()
+                },
+                None,
+                window,
+                cx,
+            );
+        });
+    })
+    .unwrap();
+    wait_for_ui(cx, handle, &controller, &view, |q, _, cx| {
+        q.snapshot(cx).is_some_and(|s| s.index_done)
+    });
+
+    // 1. Toggle bookmarks on physical rows 2 (1,alpha) and 4 (2,bravo); verify snapshot & AX label!
+    cx.update(|cx| {
+        controller
+            .update(cx, |c, cx| c.toggle_bookmark_row_active(win_id, 2, cx))
+            .unwrap();
+        controller
+            .update(cx, |c, cx| c.toggle_bookmark_row_active(win_id, 4, cx))
+            .unwrap();
+    });
+    let snap = cx.update(|cx| view.read(cx).snapshot(cx).unwrap());
+    assert_eq!(snap.bookmark_count, 2);
+    assert_eq!(snap.bookmarks.len(), 2);
+    assert_eq!(snap.bookmarks[0].local_row, 2);
+    assert_eq!(snap.bookmarks[1].local_row, 4);
+    assert!(snap.bookmarks[0].record_start_offset.is_some());
+    assert_eq!(snap.split_at_bookmarks_disabled_reason, None);
+    assert!(!snap.dirty, "bookmarks must not mark document dirty");
+
+    // Verify accessible row gutter label includes ", bookmarked" for row 2 (table row 1) and not row 1 (table row 0).
+    let (row0_label, row1_label) = cx.update(|cx| {
+        let table = view.read(cx).table.read(cx);
+        let delegate = table.delegate();
+        use gpui_kit::component::table::TableDelegate;
+        (
+            delegate.cell_label(0, 0, cx).map(|s| s.to_string()),
+            delegate.cell_label(1, 0, cx).map(|s| s.to_string()),
+        )
+    });
+    assert_eq!(row0_label.as_deref(), Some("Row 1"));
+    assert_eq!(row1_label.as_deref(), Some("Row 2, bookmarked"));
+
+    // 2. Step Next / Previous Bookmark wraps cleanly and selects target row.
+    let (next_table_row, _) = cx.update(|cx| {
+        controller
+            .update(cx, |c, cx| c.step_bookmark_active(win_id, true, cx))
+            .unwrap()
+    });
+    assert_eq!(next_table_row, 1); // physical row 2 -> table row 1
+    let (next2_table_row, _) = cx.update(|cx| {
+        controller
+            .update(cx, |c, cx| c.step_bookmark_active(win_id, true, cx))
+            .unwrap()
+    });
+    assert_eq!(next2_table_row, 3); // physical row 4 -> table row 3
+    let (prev_table_row, _) = cx.update(|cx| {
+        controller
+            .update(cx, |c, cx| c.step_bookmark_active(win_id, false, cx))
+            .unwrap()
+    });
+    assert_eq!(prev_table_row, 1);
+
+    // 3. Sort clears bookmarks with notice; Undo restores them!
+    let doc_id = snap.document_id;
+    cx.update(|cx| {
+        let plan = quarry_core::SortPlan::from(quarry_core::SortSpec {
+            column: 0,
+            mode: quarry_core::SortMode::Number,
+            direction: quarry_core::SortDirection::Ascending,
+            case_sensitivity: quarry_core::CaseSensitivity::Insensitive,
+        });
+        controller
+            .update(cx, |c, cx| c.start_sort_active(win_id, doc_id, plan, cx))
+            .unwrap();
+    });
+    wait_for_ui(cx, handle, &controller, &view, |q, _, cx| {
+        q.snapshot(cx)
+            .is_some_and(|s| !s.structural_running && s.index_done && s.dirty)
+    });
+    let after_sort = cx.update(|cx| view.read(cx).snapshot(cx).unwrap());
+    assert_eq!(after_sort.bookmark_count, 0);
+
+    // Undo Sort restores both bookmarks!
+    cx.update_window(handle.into(), |_, window, cx| {
+        view.update(cx, |q, cx| {
+            q.undo_action(&crate::menus::UndoEdit, window, cx);
+        });
+    })
+    .unwrap();
+    wait_for_ui(cx, handle, &controller, &view, |q, _, cx| {
+        q.snapshot(cx)
+            .is_some_and(|s| s.index_done && s.bookmark_count == 2)
+    });
+
+    // 4. Clear bookmarks removes all bookmarks cleanly.
+    cx.update_window(handle.into(), |_, window, cx| {
+        view.update(cx, |q, cx| {
+            q.clear_bookmarks_action(&crate::menus::ClearBookmarks, window, cx);
+        });
+    })
+    .unwrap();
+    let after_clear = cx.update(|cx| view.read(cx).snapshot(cx).unwrap());
+    assert_eq!(after_clear.bookmark_count, 0);
+}
+
+#[gpui_kit::test]
+fn row_bookmarks_filtered_stepping_advances_and_wraps_cleanly(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("bookmarks_filtered_ui.csv");
+    std::fs::write(
+        &path,
+        "id,name,group\n1,alpha,a\n2,beta,b\n3,gamma,a\n4,delta,b\n5,epsilon,a\n6,zeta,b\n",
+    )
+    .unwrap();
+
+    let controller = cx.update(|cx| {
+        gpui_kit::init(cx);
+        crate::apply_light_theme(cx);
+        bind_shortcuts(cx);
+        install_menus(cx);
+        WorkbenchController::reset_for_test(
+            cx,
+            WorkbenchSchedulerConfig {
+                index_cache_enabled: false,
+                ..WorkbenchSchedulerConfig::default()
+            },
+        )
+    });
+    let (handle, view) = open_test_window(cx, &controller);
+    let win_id = cx.update(|cx| view.read(cx).window_id);
+
+    cx.update_window(handle.into(), |_, window, cx| {
+        view.update(cx, |q, cx| {
+            q.open_paths_direct(
+                vec![path.clone()],
+                OpenOptions {
+                    header_mode: HeaderMode::FirstRow,
+                    ..OpenOptions::default()
+                },
+                None,
+                window,
+                cx,
+            );
+        });
+    })
+    .unwrap();
+    wait_for_ui(cx, handle, &controller, &view, |q, _, cx| {
+        q.snapshot(cx).is_some_and(|s| s.index_done)
+    });
+
+    // Bookmark all 3 group-a rows (physical rows 1, 3, 5) and activate a filter for group == a.
+    cx.update(|cx| {
+        controller
+            .update(cx, |c, cx| {
+                c.toggle_bookmark_row_active(win_id, 1, cx).unwrap();
+                c.toggle_bookmark_row_active(win_id, 3, cx).unwrap();
+                c.toggle_bookmark_row_active(win_id, 5, cx).unwrap();
+                c.start_filter_active(
+                    win_id,
+                    quarry_core::FilterQuery::single(
+                        2,
+                        quarry_core::FilterOperator::Equals,
+                        b"a".to_vec(),
+                    ),
+                    cx,
+                )
+            })
+            .unwrap();
+    });
+    wait_for_ui(cx, handle, &controller, &view, |q, _, cx| {
+        q.snapshot(cx).is_some_and(|s| {
+            s.filter_active && s.filter_done && !s.filter_running && s.available_rows == 3
+        })
+    });
+
+    // Repeated Next Bookmark must advance through filtered rows (0 -> 1 -> 2 -> 0) without stalling!
+    let (r1, _) = cx.update(|cx| {
+        controller
+            .update(cx, |c, cx| c.step_bookmark_active(win_id, true, cx))
+            .unwrap()
+    });
+    let (r2, _) = cx.update(|cx| {
+        controller
+            .update(cx, |c, cx| c.step_bookmark_active(win_id, true, cx))
+            .unwrap()
+    });
+    let (r3, _) = cx.update(|cx| {
+        controller
+            .update(cx, |c, cx| c.step_bookmark_active(win_id, true, cx))
+            .unwrap()
+    });
+    assert_eq!((r1, r2, r3), (1, 2, 0));
+
+    // Previous Bookmark must wrap cleanly from 0 -> 2 -> 1.
+    let (p1, _) = cx.update(|cx| {
+        controller
+            .update(cx, |c, cx| c.step_bookmark_active(win_id, false, cx))
+            .unwrap()
+    });
+    let (p2, _) = cx.update(|cx| {
+        controller
+            .update(cx, |c, cx| c.step_bookmark_active(win_id, false, cx))
+            .unwrap()
+    });
+    assert_eq!((p1, p2), (2, 1));
+}

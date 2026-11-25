@@ -60,6 +60,15 @@ pub struct SectionSnapshot {
     pub speculative_save_warning: Option<&'static str>,
 }
 
+/// Summary of one bookmarked logical CSV record rendered in the Bookmarks popover.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BookmarkListEntry {
+    pub local_row: u64,
+    pub label: String,
+    pub record_start_offset: Option<u64>,
+    pub global_ordinal: Option<u64>,
+}
+
 /// Read-only snapshot of an active hydrated document for toolbar, panels, and status bar rendering.
 #[derive(Clone, Debug, PartialEq)]
 pub struct DocumentSnapshot {
@@ -70,6 +79,9 @@ pub struct DocumentSnapshot {
     pub file_size: u64,
     pub active_byte_len: u64,
     pub section: Option<Box<SectionSnapshot>>,
+    pub bookmark_count: usize,
+    pub bookmarks: Vec<BookmarkListEntry>,
+    pub split_at_bookmarks_disabled_reason: Option<String>,
     pub delimiter: u8,
     pub has_header: bool,
     pub encoding: Encoding,
@@ -977,6 +989,18 @@ impl WorkbenchController {
                 speculative_save_warning: doc.speculative_save_warning(),
             })
         });
+        let bookmark_count = doc.bookmarks.len();
+        let bookmarks = doc
+            .bookmarks
+            .iter()
+            .map(|bookmark| BookmarkListEntry {
+                local_row: bookmark.local_row,
+                label: doc.bookmark_row_label(bookmark),
+                record_start_offset: bookmark.key.record_start_offset,
+                global_ordinal: bookmark.key.global_ordinal,
+            })
+            .collect::<Vec<_>>();
+        let split_at_bookmarks_disabled_reason = doc.split_at_bookmarks_disabled_reason();
         Some(DocumentSnapshot {
             document_id: doc_id,
             instance_id: doc.instance_id,
@@ -985,6 +1009,9 @@ impl WorkbenchController {
             file_size: doc.session.file_size,
             active_byte_len,
             section,
+            bookmark_count,
+            bookmarks,
+            split_at_bookmarks_disabled_reason,
             delimiter: doc.session.dialect.delimiter,
             has_header: doc.session.dialect.has_header,
             encoding: doc.session.encoding(),
@@ -2297,6 +2324,216 @@ impl WorkbenchController {
         cell: (u64, usize),
     ) {
         self.pending_reveal_cells.insert(doc_id, cell);
+    }
+
+    /// Toggles a session-only bookmark on the currently selected/active row.
+    pub fn toggle_bookmark_active(
+        &mut self,
+        window: WindowId,
+        cx: &mut Context<Self>,
+    ) -> Result<String, String> {
+        let Some(doc) = self.active_document_mut(window) else {
+            return Err("Open a file before adding bookmarks.".into());
+        };
+        let (local_row, added) = doc.toggle_bookmark_current()?;
+        let label = doc.bookmarks.get(local_row).map_or_else(
+            || {
+                let display = doc
+                    .bookmark_global_ordinal(local_row)
+                    .unwrap_or_else(|| local_row.saturating_add(1).saturating_sub(doc.data_start));
+                format!("Row {}", quarry_workbench::group_digits(display))
+            },
+            |bookmark| doc.bookmark_row_label(bookmark),
+        );
+        let message = if added {
+            format!("Bookmarked {label}.")
+        } else {
+            format!("Removed bookmark on {label}.")
+        };
+        self.set_window_message(window, Some(AppMessage::status(message.clone())), cx);
+        cx.notify();
+        Ok(message)
+    }
+
+    /// Toggles a session-only bookmark on a specific physical row (e.g. gutter right-click).
+    pub fn toggle_bookmark_row_active(
+        &mut self,
+        window: WindowId,
+        local_row: u64,
+        cx: &mut Context<Self>,
+    ) -> Result<String, String> {
+        let Some(doc) = self.active_document_mut(window) else {
+            return Err("Open a file before adding bookmarks.".into());
+        };
+        let added = doc.toggle_bookmark_row(local_row)?;
+        let label = doc.bookmarks.get(local_row).map_or_else(
+            || {
+                let display = doc
+                    .bookmark_global_ordinal(local_row)
+                    .unwrap_or_else(|| local_row.saturating_add(1).saturating_sub(doc.data_start));
+                format!("Row {}", quarry_workbench::group_digits(display))
+            },
+            |bookmark| doc.bookmark_row_label(bookmark),
+        );
+        let message = if added {
+            format!("Bookmarked {label}.")
+        } else {
+            format!("Removed bookmark on {label}.")
+        };
+        self.set_window_message(window, Some(AppMessage::status(message.clone())), cx);
+        cx.notify();
+        Ok(message)
+    }
+
+    pub fn remove_bookmark_row_active(
+        &mut self,
+        window: WindowId,
+        local_row: u64,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(doc) = self.active_document_mut(window) else {
+            return false;
+        };
+        let removed = doc.remove_bookmark_row(local_row);
+        if removed {
+            self.set_window_message(window, Some(AppMessage::status("Bookmark removed.")), cx);
+            cx.notify();
+        }
+        removed
+    }
+
+    pub fn clear_bookmarks_active(&mut self, window: WindowId, cx: &mut Context<Self>) -> usize {
+        let Some(doc) = self.active_document_mut(window) else {
+            return 0;
+        };
+        let cleared = doc.clear_bookmarks();
+        if cleared > 0 {
+            self.set_window_message(
+                window,
+                Some(AppMessage::status(format!(
+                    "Cleared {cleared} row bookmark{}.",
+                    if cleared == 1 { "" } else { "s" }
+                ))),
+                cx,
+            );
+            cx.notify();
+        }
+        cleared
+    }
+
+    /// Jumps to a specific bookmarked physical row, returning `(table_row, status_message)`.
+    pub fn jump_to_bookmark_active(
+        &mut self,
+        window: WindowId,
+        local_row: u64,
+        cx: &mut Context<Self>,
+    ) -> Result<(usize, String), String> {
+        let Some(doc) = self.active_document_mut(window) else {
+            return Err("Open a file first.".into());
+        };
+        if doc.source_changed {
+            return Err(quarry_workbench::SOURCE_CHANGED_NOTICE.into());
+        }
+        let Some(bookmark) = doc.bookmarks.get(local_row).copied() else {
+            return Err("Bookmark no longer exists.".into());
+        };
+        let label = doc.bookmark_row_label(&bookmark);
+        let table_row = if doc.filter_active() {
+            let Some(rel) = doc
+                .filtered_rows
+                .iter()
+                .position(|matched| matched.row == local_row)
+            else {
+                return Err(format!(
+                    "{label} is not in the currently visible filtered page. Clear the filter to jump directly to any bookmarked row."
+                ));
+            };
+            let table_row = usize::try_from(doc.filter_buffer_start)
+                .ok()
+                .and_then(|start| start.checked_add(rel))
+                .ok_or_else(|| {
+                    "Bookmarked row is outside the scrollable table range.".to_owned()
+                })?;
+            doc.selection = Some(quarry_workbench::GridSelection::Row { row: local_row });
+            doc.cursor.select_row(local_row);
+            doc.selected_rows
+                .select(local_row, SelectionModifiers::NONE);
+            table_row
+        } else {
+            if local_row < doc.data_start || local_row >= doc.available_rows() {
+                return Err(format!(
+                    "Wait for indexing to reach {label} before jumping to it."
+                ));
+            }
+            let rel = local_row - doc.data_start;
+            let table_row = usize::try_from(rel)
+                .map_err(|_| "Bookmarked row is outside the scrollable table range.".to_owned())?;
+            doc.viewport_start = local_row;
+            let _ = doc.load_buffer(local_row);
+            doc.selection = Some(quarry_workbench::GridSelection::Row { row: local_row });
+            doc.cursor.select_row(local_row);
+            doc.selected_rows
+                .select(local_row, SelectionModifiers::NONE);
+            table_row
+        };
+        let message = format!("Jumped to {label}.");
+        self.set_window_message(window, Some(AppMessage::status(message.clone())), cx);
+        cx.notify();
+        Ok((table_row, message))
+    }
+
+    /// Steps to the next (`forward == true`) or previous (`forward == false`) bookmarked row.
+    pub fn step_bookmark_active(
+        &mut self,
+        window: WindowId,
+        forward: bool,
+        cx: &mut Context<Self>,
+    ) -> Result<(usize, String), String> {
+        let target_row = {
+            let Some(doc) = self.active_document(window) else {
+                return Err("Open a file first.".into());
+            };
+            if doc.source_changed {
+                return Err(quarry_workbench::SOURCE_CHANGED_NOTICE.into());
+            }
+            if doc.bookmarks.is_empty() {
+                return Err("No row bookmarks in this document.".into());
+            }
+            let anchor = doc.bookmark_target_row();
+            if doc.filter_active() {
+                let visible_bookmarked: Vec<u64> = doc
+                    .filtered_rows
+                    .iter()
+                    .filter(|matched| doc.bookmarks.contains_row(matched.row))
+                    .map(|matched| matched.row)
+                    .collect();
+                if visible_bookmarked.is_empty() {
+                    return Err(
+                        "No bookmarked rows are visible in the current filtered page. Clear the filter to jump to any bookmark."
+                            .into(),
+                    );
+                }
+                if forward {
+                    anchor
+                        .and_then(|cur| visible_bookmarked.iter().copied().find(|&r| r > cur))
+                        .unwrap_or(visible_bookmarked[0])
+                } else {
+                    anchor
+                        .and_then(|cur| visible_bookmarked.iter().rev().copied().find(|&r| r < cur))
+                        .unwrap_or(*visible_bookmarked.last().unwrap())
+                }
+            } else {
+                let candidate = if forward {
+                    doc.next_bookmark(anchor)
+                } else {
+                    doc.previous_bookmark(anchor)
+                };
+                candidate
+                    .map(|bm| bm.local_row)
+                    .ok_or_else(|| "No row bookmarks in this document.".to_owned())?
+            }
+        };
+        self.jump_to_bookmark_active(window, target_row, cx)
     }
 
     pub fn select_row_active(

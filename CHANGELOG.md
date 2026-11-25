@@ -12,6 +12,7 @@ parentheses are GitHub pull requests.
 
 ### Added
 
+- Added session-only row bookmarks via **Edit → Toggle Bookmark** (`Cmd+B` / `Ctrl+B`), **Next Bookmark** (`Cmd+]` / `Ctrl+]`), **Previous Bookmark** (`Cmd+[` / `Ctrl+[`), **Clear Bookmarks**, right-clicking the `#` row gutter, and the toolbar **Bookmarks** popover (**View → Bookmarks…**). Bookmarks survive cell edits, filters, saves, and tab dormancy, shift across row insertions and deletions, and restore via **Undo** if cleared by sort or duplicate removal. (#215)
 - Added in-place guarded **Save** (`Cmd+S` / `Ctrl+S`) for verified sections, splicing edited section bytes back into the parent file using copy-on-write cloning on APFS and supported Linux filesystems (with streaming fallback elsewhere), advisory disk-space checks, and automatic parent reload notices in open sibling tabs. Documented in [ADR 0015](docs/adr/0015-guarded-section-splice-save.md). (#213)
 - Added section-scoped **Insert Rows…**, **Delete Selected Rows**, **Replace All**, and **Undo** / **Redo** for verified sections while keeping header edits, column schema changes, **Sort**, **Find Duplicates**, and **Join Files** routed to **Save Section As New…**. (#213)
 
