@@ -1137,6 +1137,28 @@ impl Session {
             !self.section_is_interior(),
         )
     }
+
+    /// Resolves the byte offset where logical record `row` starts in this session's active
+    /// backing file, returning `Ok(None)` if the row is not yet indexed or past EOF.
+    pub fn record_start_offset(
+        &self,
+        index: Option<&StructuralIndex>,
+        row: u64,
+    ) -> Result<Option<u64>, QuarryError> {
+        if let Ok(first_idx) = usize::try_from(row)
+            && let Some(found) = self.first_rows.get(first_idx)
+        {
+            return Ok(Some(found.offset));
+        }
+        let Some(index) = index else {
+            return Ok(None);
+        };
+        if row >= index.indexed_rows() {
+            return Ok(None);
+        }
+        let rows = self.read_rows(index, row, 1)?;
+        Ok(rows.first().map(|found| found.offset))
+    }
 }
 
 fn validate_open_options(options: &OpenOptions) -> Result<(), QuarryError> {

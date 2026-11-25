@@ -1208,6 +1208,8 @@ fn structural_undo_snapshot_overlay_bytes_count_toward_memory_cap() {
             path: a,
             overlay,
             edit_history: quarry_workbench::EditHistory::default(),
+            source_generation: 1,
+            bookmarks: quarry_workbench::RowBookmarks::new(),
         });
         doc.working_copy = Some(wc);
         assert!(quarry_workbench::document_overlay_bytes(doc) >= 512);

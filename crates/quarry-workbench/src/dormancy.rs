@@ -26,10 +26,10 @@
 
 use crate::compressed::CompressedDormancyPolicy;
 use crate::{
-    AppMessage, ColumnView, Document, DocumentId, EditHistory, GridCursor, GridSelection,
-    JOIN_INPUT_RESERVED, MaterializedWorkingCopy, RowSelection, SOURCE_CHANGED_NOTICE,
-    SharedCellEdits, StructuralJob, StructuralOverlay, WindowId, WorkbenchTab, WorkingCopySnapshot,
-    WorkingCopyState, compressed,
+    AppMessage, BookmarkTransform, ColumnView, Document, DocumentId, EditHistory, GridCursor,
+    GridSelection, JOIN_INPUT_RESERVED, MaterializedWorkingCopy, RowBookmarks, RowSelection,
+    SOURCE_CHANGED_NOTICE, SharedCellEdits, StructuralJob, StructuralOverlay, WindowId,
+    WorkbenchTab, WorkingCopySnapshot, WorkingCopyState, compressed,
 };
 use quarry_core::{
     ByteWindow, CompletedIndex, Encoding, FileIdentity, FilterQuery, OpenOptions, QuarryError,
@@ -420,6 +420,8 @@ struct DormantViewSnapshot {
     filter_query: Option<FilterQuery>,
     filter_viewport_start: u64,
     edit_history: EditHistory,
+    source_generation: u64,
+    bookmarks: RowBookmarks,
 }
 
 struct DormantDirtyState {
@@ -2357,6 +2359,8 @@ impl WorkbenchScheduler {
             filter_query: None,
             filter_viewport_start: 0,
             edit_history: crate::history::EditHistory::default(),
+            source_generation: replacement.source_generation,
+            bookmarks: RowBookmarks::new(),
         };
         replacement.shutdown();
         let canonical_path = canonicalize_best_effort(&path);
@@ -2581,6 +2585,8 @@ impl WorkbenchScheduler {
                 cell_edits: current.cell_edits.as_ref().clone(),
             },
             edit_history: current.edit_history.clone(),
+            source_generation: current.source_generation,
+            bookmarks: current.bookmarks.clone(),
         };
         // Reserve descriptor headroom for the concurrent replacement open + its index worker
         // BEFORE opening or mutating live state so admission failure leaves history untouched.
@@ -2638,6 +2644,9 @@ impl WorkbenchScheduler {
         replacement.header_renames = Arc::new(target.overlay.header_renames.clone());
         replacement.cell_edits = Arc::new(target.overlay.cell_edits.clone());
         replacement.edit_history = target.edit_history;
+        replacement.source_generation = target.source_generation;
+        replacement.bookmarks = target.bookmarks;
+        replacement.refresh_bookmark_offsets();
         replacement.refresh_column_headers();
         replacement.index_cache_enabled = self.config.index_cache_enabled;
         replacement.start_indexing().map_err(AppMessage::error)?;
@@ -2823,6 +2832,10 @@ impl WorkbenchScheduler {
                     let source_encoding = doc.session.encoding();
                     let prior_encoding_mode = slot.tab.encoding_mode;
 
+                    let next_generation = doc.source_generation.saturating_add(1);
+                    let mut carried_bookmarks = doc.bookmarks.clone();
+                    carried_bookmarks
+                        .apply_transform(next_generation, &BookmarkTransform::PreserveSameRows);
                     let reload = if let Some(splice) = splice_summary {
                         let sec_opts = SectionOpenOptions {
                             open: options,
@@ -2858,6 +2871,9 @@ impl WorkbenchScheduler {
                         replacement.index_cache_enabled = self.config.index_cache_enabled;
                         replacement.working_cleanup = self.working_cleanup.clone();
                         replacement.decompression_slots = self.decompression_slots.clone();
+                        replacement.source_generation = next_generation;
+                        replacement.bookmarks = carried_bookmarks;
+                        replacement.refresh_bookmark_offsets();
                         replacement.start_indexing()?;
                         Ok(replacement)
                     });
@@ -3101,6 +3117,30 @@ impl WorkbenchScheduler {
             return;
         };
         current.accept_materialized_change(ready.undo);
+        let next_generation = current.source_generation.saturating_add(1);
+        let mut carried_bookmarks = current.bookmarks.clone();
+        let bookmark_affected =
+            carried_bookmarks.apply_transform(next_generation, &ready.bookmark_transform);
+        let mut notice = ready.notice;
+        if bookmark_affected > 0 {
+            match &ready.bookmark_transform {
+                BookmarkTransform::ClearRowOrderChanged => {
+                    notice.push_str(
+                        " Row bookmarks were cleared because row order changed (Undo to restore).",
+                    );
+                }
+                BookmarkTransform::ShiftDeleteRows { .. } => {
+                    notice.push_str(&format!(
+                        " {bookmark_affected} row bookmark{} on deleted rows removed (Undo to restore).",
+                        if bookmark_affected == 1 { "" } else { "s" }
+                    ));
+                }
+                _ => {}
+            }
+        }
+        replacement.source_generation = next_generation;
+        replacement.bookmarks = carried_bookmarks;
+        replacement.refresh_bookmark_offsets();
         replacement.logical_path = current.logical_path.clone();
         replacement.original_session = current.original_session.take();
         replacement.working_copy = current.working_copy.take();
@@ -3128,7 +3168,7 @@ impl WorkbenchScheduler {
         slot.tab.columns_open = false;
         slot.tab.structural_dialog = None;
         slot.tab.notice = None;
-        slot.tab.footer_status = Some(AppMessage::status(ready.notice));
+        slot.tab.footer_status = Some(AppMessage::status(notice));
         self.close_approved.remove(&id);
     }
 
@@ -3329,8 +3369,14 @@ impl WorkbenchScheduler {
             };
             match prepared {
                 Ok(replacement) => {
-                    let notice = ready.notice.clone();
+                    let fallback_notice = ready.notice.clone();
                     self.install_prepared_working_copy(id, replacement, ready, index_job_fd);
+                    let notice = self
+                        .tabs
+                        .get(&id)
+                        .and_then(|slot| slot.tab.footer_status.as_ref())
+                        .map(|msg| msg.text.clone())
+                        .unwrap_or(fallback_notice);
                     drop(temp_open_fd);
                     results.push(StructuralCompletion {
                         document_id: id,
@@ -3452,12 +3498,19 @@ impl WorkbenchScheduler {
                 undo,
                 selected_columns,
                 notice: notice.clone(),
+                bookmark_transform: BookmarkTransform::ClearRowOrderChanged,
             },
             index_job_fd,
         );
+        let final_notice = self
+            .tabs
+            .get(&id)
+            .and_then(|slot| slot.tab.footer_status.as_ref())
+            .map(|msg| msg.text.clone())
+            .unwrap_or(notice);
         drop(temp_open_fd);
         let _ = self.sync_fd_leases();
-        Ok(notice)
+        Ok(final_notice)
     }
 
     /// Cancels a pending `DuplicatePreview` or active structural job on tab `id`.
@@ -4345,6 +4398,8 @@ fn demote_document(
         filter_query: doc.filter_query.clone(),
         filter_viewport_start: doc.filter_viewport_start,
         edit_history: std::mem::take(&mut doc.edit_history),
+        source_generation: doc.source_generation,
+        bookmarks: std::mem::take(&mut doc.bookmarks),
     };
 
     let logical_path = doc.logical_path.clone();
@@ -5008,6 +5063,8 @@ fn apply_view_snapshot(
     doc.columns = view.columns.clone();
     doc.headers = view.headers.clone();
     doc.total_columns = view.total_columns;
+    doc.source_generation = view.source_generation;
+    doc.bookmarks = view.bookmarks.clone();
     doc.working_directory = config.working_directory.clone();
     doc.custom_working_directory = config.custom_working_directory;
     doc.index_cache_enabled = config.index_cache_enabled;

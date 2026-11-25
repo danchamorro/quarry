@@ -1,5 +1,6 @@
 //! Frontend-neutral document, selection, edit history, and workbench state for Quarry.
 
+pub mod bookmarks;
 pub mod command;
 pub mod compressed;
 pub mod document;
@@ -13,6 +14,10 @@ pub mod theme;
 pub mod whitespace;
 pub mod workflows;
 
+pub use bookmarks::{
+    BookmarkKey, BookmarkSplitTarget, BookmarkTransform, MAX_ROW_BOOKMARKS, RowBookmark,
+    RowBookmarks,
+};
 pub use command::{
     CloseCommandOutcome, CommandContext, CommandId, CommandResolution, CommandTarget, DocumentId,
     FileCommands, WindowId, evaluate_command,

@@ -17,7 +17,7 @@ use quarry_core::{
 };
 
 use crate::menus::{encoding_from_label, encoding_index, encoding_label};
-use crate::workbench::DocumentSnapshot;
+use crate::workbench::{BookmarkListEntry, DocumentSnapshot};
 
 pub enum PanelEvent {
     Columns(Vec<usize>),
@@ -27,6 +27,12 @@ pub enum PanelEvent {
     ExportFiltered,
     CancelFilterOrExport,
     Reopen(OpenOptions, Option<Encoding>),
+    ToggleBookmarkCurrent,
+    JumpToBookmark(u64),
+    RemoveBookmark(u64),
+    NextBookmark,
+    PreviousBookmark,
+    ClearBookmarks,
 }
 
 #[derive(Clone)]
@@ -83,6 +89,7 @@ pub enum Tool {
     Columns,
     Filters,
     Format,
+    Bookmarks,
 }
 
 pub struct Panels {
@@ -104,12 +111,16 @@ pub struct Panels {
     detected: String,
     busy: bool,
     dirty: bool,
+    source_changed: bool,
     filter_active: bool,
     filter_running: bool,
     can_export_filtered: bool,
     export_running: bool,
     filter_status: Option<String>,
     export_status: Option<String>,
+    bookmark_count: usize,
+    bookmarks: Vec<BookmarkListEntry>,
+    speculative_section: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -207,12 +218,16 @@ impl Panels {
             detected: String::new(),
             busy: false,
             dirty: false,
+            source_changed: false,
             filter_active: false,
             filter_running: false,
             can_export_filtered: false,
             export_running: false,
             filter_status: None,
             export_status: None,
+            bookmark_count: 0,
+            bookmarks: Vec::new(),
+            speculative_section: false,
             _subscriptions: subscriptions,
         }
     }
@@ -243,6 +258,10 @@ impl Panels {
             self.rules.clear();
             self.dirty = false;
             self.busy = false;
+            self.source_changed = false;
+            self.bookmark_count = 0;
+            self.bookmarks.clear();
+            self.speculative_section = false;
             self.detected.clear();
             cx.notify();
         }
@@ -256,12 +275,19 @@ impl Panels {
     ) {
         self.dirty = info.dirty;
         self.busy = info.busy;
+        self.source_changed = info.source_changed;
         self.filter_active = info.filter_active;
         self.filter_running = info.filter_running;
         self.can_export_filtered = info.can_export_filtered;
         self.export_running = info.export_running;
         self.filter_status = info.filter_status.clone();
         self.export_status = info.export_status.clone();
+        self.bookmark_count = info.bookmark_count;
+        self.bookmarks = info.bookmarks.clone();
+        self.speculative_section = info
+            .section
+            .as_ref()
+            .is_some_and(|section| section.bounds.trust == quarry_core::BoundaryTrust::Speculative);
         self.detected = format!(
             "Detected: {} · {} · {}",
             match info.delimiter {
@@ -481,7 +507,7 @@ impl Panels {
         &self,
         tool: Tool,
         id: &'static str,
-        label: &'static str,
+        label: impl Into<SharedString>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let panel = cx.entity();
@@ -530,6 +556,7 @@ impl Panels {
                             Tool::Columns => this.columns_content(window, cx),
                             Tool::Filters => this.filters_content(window, cx),
                             Tool::Format => this.format_content(window, cx),
+                            Tool::Bookmarks => this.bookmarks_content(window, cx),
                         })
                     }),
             )
@@ -546,6 +573,191 @@ impl Panels {
 
     pub fn render_format(&mut self, _: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         self.popover(Tool::Format, "format-popover", "Format", cx)
+    }
+
+    pub fn render_bookmarks(&mut self, _: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let label = if self.bookmark_count > 0 {
+            format!("Bookmarks ({})", self.bookmark_count)
+        } else {
+            "Bookmarks".to_owned()
+        };
+        self.popover(Tool::Bookmarks, "bookmarks-popover", label, cx)
+    }
+
+    fn bookmarks_content(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let panel = cx.entity();
+        let height = (f32::from(window.viewport_size().height) - 270.).clamp(84., 300.);
+        let count = self.bookmark_count;
+        let has_bookmarks = count > 0;
+        let disabled = self.source_changed;
+        let mut content = div()
+            .flex()
+            .flex_col()
+            .w(px(360.))
+            .gap_2()
+            .text_size(px(13.))
+            .child(self.heading("Bookmarks", cx))
+            .child(
+                div().flex().items_center().justify_between().gap_2().child(
+                    div()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(if has_bookmarks {
+                            format!(
+                                "{count} bookmark{} · session-only (max {})",
+                                if count == 1 { "" } else { "s" },
+                                quarry_workbench::group_digits(
+                                    quarry_workbench::MAX_ROW_BOOKMARKS as u64
+                                )
+                            )
+                        } else {
+                            "No bookmarks yet · right-click # or press Cmd/Ctrl+B".to_owned()
+                        }),
+                ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .child(
+                        Button::new("bookmark-toggle-current")
+                            .label("Toggle Row")
+                            .small()
+                            .disabled(disabled)
+                            .on_click(cx.listener(|_, _, _, cx| {
+                                cx.emit(PanelEvent::ToggleBookmarkCurrent);
+                            })),
+                    )
+                    .child(
+                        Button::new("bookmark-prev")
+                            .label("Prev")
+                            .ghost()
+                            .small()
+                            .disabled(disabled || !has_bookmarks)
+                            .on_click(cx.listener(|_, _, _, cx| {
+                                cx.emit(PanelEvent::PreviousBookmark);
+                            })),
+                    )
+                    .child(
+                        Button::new("bookmark-next")
+                            .label("Next")
+                            .ghost()
+                            .small()
+                            .disabled(disabled || !has_bookmarks)
+                            .on_click(cx.listener(|_, _, _, cx| {
+                                cx.emit(PanelEvent::NextBookmark);
+                            })),
+                    )
+                    .child(
+                        Button::new("bookmark-clear-all")
+                            .label("Clear All")
+                            .ghost()
+                            .small()
+                            .disabled(disabled || !has_bookmarks)
+                            .on_click(cx.listener(|_, _, _, cx| {
+                                cx.emit(PanelEvent::ClearBookmarks);
+                            })),
+                    ),
+            );
+        if self.speculative_section {
+            content = content.child(
+                div()
+                    .text_size(px(12.))
+                    .text_color(cx.theme().muted_foreground)
+                    .child(
+                        "Speculative section: navigation works, but Split at Bookmarks requires Data > Verify Section Boundary.",
+                    ),
+            );
+        }
+        if has_bookmarks {
+            content = content.child(
+                uniform_list(
+                    "bookmark-rows",
+                    self.bookmarks.len(),
+                    move |range, _, cx| {
+                        let start = range.start;
+                        panel.update(cx, |this, cx| {
+                            range
+                                .filter_map(|index| this.bookmarks.get(index).cloned())
+                                .enumerate()
+                                .map(|(offset_ix, entry)| {
+                                    this.bookmark_row(start + offset_ix, entry, cx)
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                    },
+                )
+                .h(px(height.min(self.bookmarks.len().max(1) as f32 * 30.)))
+                .w_full(),
+            );
+        }
+        content
+            .child(
+                div()
+                    .flex()
+                    .justify_end()
+                    .pt_2()
+                    .border_t_1()
+                    .border_color(cx.theme().border)
+                    .child(
+                        Button::new("bookmarks-done")
+                            .label("Done")
+                            .small()
+                            .on_click(cx.listener(|this, _, window, cx| this.close(window, cx))),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn bookmark_row(
+        &self,
+        index: usize,
+        entry: BookmarkListEntry,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let local_row = entry.local_row;
+        let offset_text = entry.record_start_offset.map_or_else(
+            || "offset indexing…".to_owned(),
+            |offset| format!("@ {} B", quarry_workbench::group_digits(offset)),
+        );
+        div()
+            .flex()
+            .h(px(30.))
+            .w_full()
+            .min_w_0()
+            .items_center()
+            .justify_between()
+            .gap_2()
+            .px_1()
+            .rounded(px(4.))
+            .when(index % 2 == 1, |this| {
+                this.bg(cx.theme().muted.opacity(0.45))
+            })
+            .child(
+                Button::new(("bookmark-jump", index))
+                    .label(format!("{} · {}", entry.label, offset_text))
+                    .ghost()
+                    .small()
+                    .flex_1()
+                    .min_w_0()
+                    .disabled(self.source_changed)
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        cx.emit(PanelEvent::JumpToBookmark(local_row));
+                        this.close(window, cx);
+                    })),
+            )
+            .child(
+                Button::new(("bookmark-remove", index))
+                    .label("×")
+                    .ghost()
+                    .small()
+                    .accessibility_label(format!("Remove bookmark for {}", entry.label))
+                    .disabled(self.source_changed)
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        cx.emit(PanelEvent::RemoveBookmark(local_row));
+                    })),
+            )
+            .into_any_element()
     }
 
     fn heading(&self, title: &'static str, cx: &mut Context<Self>) -> impl IntoElement {

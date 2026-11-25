@@ -1,5 +1,6 @@
 //! Working-copy storage ownership, structural overlays, and bounded value edit history.
 
+use crate::bookmarks::RowBookmarks;
 use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -119,6 +120,8 @@ pub struct WorkingCopySnapshot {
     pub path: PathBuf,
     pub overlay: StructuralOverlay,
     pub edit_history: EditHistory,
+    pub source_generation: u64,
+    pub bookmarks: RowBookmarks,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

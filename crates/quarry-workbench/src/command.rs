@@ -84,6 +84,11 @@ pub enum CommandId {
     Paste,
     SelectAll,
     Find,
+    ToggleBookmark,
+    NextBookmark,
+    PreviousBookmark,
+    ClearBookmarks,
+    ToggleBookmarksPanel,
     InsertRows,
     InsertColumns,
     ShowAllWhitespace,
@@ -222,6 +227,11 @@ pub fn evaluate_command(command: CommandId, ctx: &CommandContext<'_>) -> Command
         | CommandId::Paste
         | CommandId::SelectAll
         | CommandId::Find
+        | CommandId::ToggleBookmark
+        | CommandId::NextBookmark
+        | CommandId::PreviousBookmark
+        | CommandId::ClearBookmarks
+        | CommandId::ToggleBookmarksPanel
         | CommandId::InsertRows
         | CommandId::InsertColumns
         | CommandId::Columns
@@ -312,6 +322,11 @@ pub fn evaluate_command(command: CommandId, ctx: &CommandContext<'_>) -> Command
         CommandId::Undo => ctx.text_field_focused || document.is_some_and(Document::can_undo),
         CommandId::Redo => ctx.text_field_focused || document.is_some_and(Document::can_redo),
         CommandId::Find => open && !filter_active,
+        CommandId::ToggleBookmark => document.is_some_and(Document::can_toggle_bookmark),
+        CommandId::NextBookmark | CommandId::PreviousBookmark | CommandId::ClearBookmarks => {
+            document.is_some_and(|doc| !doc.source_changed && !doc.bookmarks.is_empty())
+        }
+        CommandId::ToggleBookmarksPanel => open,
         CommandId::InsertRows => insertion(true),
         CommandId::InsertColumns => insertion(false),
         CommandId::PauseResumeIndexing => {
