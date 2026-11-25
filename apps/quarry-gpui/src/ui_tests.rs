@@ -4238,7 +4238,8 @@ fn rename_header_targets_selected_column_and_context_menus_work(cx: &mut TestApp
         Some(quarry_workbench::GridSelection::Row { row: 2 })
     );
 
-    // Open cell context menu and invoke quick Filter to This Value (`city == Boston` -> 2 rows).
+    // Open cell context menu and verify table selection syncs to the right-clicked cell before
+    // invoking quick Filter to This Value (`city == Boston` -> 2 rows).
     cx.update_window(handle.into(), |_, window, cx| {
         view.update(cx, |q, cx| {
             q.handle_grid_action(
@@ -4253,6 +4254,11 @@ fn rename_header_targets_selected_column_and_context_menus_work(cx: &mut TestApp
                 cx,
             );
             assert!(q.grid_context_menu.is_some());
+            assert_eq!(
+                q.table.read(cx).selected_cell(),
+                Some((0, 3)),
+                "right-clicking a cell must sync TableState::selected_cell()"
+            );
             q.close_grid_context_menu(cx);
             q.apply_quick_cell_filter(
                 2,

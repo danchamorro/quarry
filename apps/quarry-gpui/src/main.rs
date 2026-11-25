@@ -1868,6 +1868,10 @@ impl QuarryWindow {
         self.controller.update(cx, |controller, cx| {
             controller.ensure_row_selected_for_context_menu(self.window_id, source_row, cx);
         });
+        self.table.update(cx, |table, cx| {
+            table.delegate().record_gutter_mouse_selection(table_row);
+            table.set_selected_cell(table_row, 0, cx);
+        });
         let Some((bookmarked, can_insert_rows, can_delete_rows, display_row)) = ({
             let controller = self.controller.read(cx);
             controller.active_document(self.window_id).map(|doc| {
@@ -1980,6 +1984,9 @@ impl QuarryWindow {
     ) {
         self.controller.update(cx, |controller, cx| {
             controller.select_cell_active(self.window_id, Some((source_row, source_col)), cx);
+        });
+        self.table.update(cx, |table, cx| {
+            table.set_selected_cell(table_row, table_col, cx);
         });
         let raw_opt = self
             .table

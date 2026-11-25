@@ -82,6 +82,12 @@ impl Grid {
         }
     }
 
+    /// Records a mouse-driven gutter selection on `row` so the subsequent `TableEvent::SelectCell`
+    /// does not overwrite modifier/toggle/multi-row selection.
+    pub fn record_gutter_mouse_selection(&self, row: usize) {
+        self.gutter_mouse_row.set(Some(row));
+    }
+
     /// Consumes a recent mouse-click gutter selection on `row` so the bubbled `TableEvent::SelectCell`
     /// does not overwrite modifier/toggle mouse row selection.
     pub fn take_gutter_mouse_selection(&self, row: usize) -> bool {
