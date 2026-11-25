@@ -97,11 +97,7 @@ concurrently across tabs, Combine Files, and Join Files. Temporary working
 files are released when their owning document closes. See
 [ADR 0007](adr/0007-document-tabs.md) for lifecycle and resource policy.
 
-Core uses `std::fs::File`, fixed-size sequential reads, and seeks from the
-nearest structural checkpoint for viewport access. Memory mapping remains
-deferred until measurements show a benefit that justifies the dependency and
-platform tradeoffs. [Issue #75](https://github.com/danchamorro/quarry/issues/75)
-tracks that conditional investigation.
+Core uses parallel positional reads (`pread` / `FileExt::read_at` with OS read-ahead hints on Unix; `seek_read` on Windows) through `crates/quarry-core/src/positional_io.rs` and a bounded `EnginePool`. Memory mapping (`mmap`) on user source files remains intentionally avoided so external file truncation or media removal surfaces as a clean `SourceChanged` or I/O error rather than an unrecoverable `SIGBUS` ([ADR 0001](adr/0001-initial-engine.md)).
 
 ## Progressive open
 Bootstrap by sampling a bounded region and parsing enough rows for the first viewport. Return that viewport immediately. Continue structural indexing in background workers.
@@ -141,14 +137,23 @@ every output name ending in `.gz` is refused. Join Files and Combine Files need
 an uncompressed copy first. The macOS bundle declares gzip archives
 (`org.gnu.gnu-zip-archive`) with the Viewer role.
 
-## Structural indexing
-Delimited files cannot be indexed correctly by blindly finding newline bytes because quoted fields may contain line breaks. The indexer must track dialect and quote state.
+## Structural indexing and persistent sidecar cache
+Delimited files cannot be indexed correctly by blindly finding newline bytes because quoted fields may contain line breaks. The indexer tracks dialect and quote state across chunk boundaries.
 
-By default, the current index scans 1 MiB chunks and starts with one byte-offset
-checkpoint per 4,096 records. Checkpoints have a 16 MiB default budget; when
-full, the interval doubles and existing checkpoints compact. Persistent sidecar
-indexes and their invalidation rules remain deferred;
-[issue #60](https://github.com/danchamorro/quarry/issues/60) tracks the design.
+`crates/quarry-delimited/src/simd.rs` provides a runtime-dispatched 64-byte SIMD structural scanner (Apple Silicon NEON, x86_64 AVX2, and pure-scalar fallback) verified against a scalar oracle for byte-identical record boundaries. Multi-threaded parallel indexing splits large files across `EnginePool` workers using positional I/O, starting with one byte-offset checkpoint per 4,096 records under a 16 MiB default checkpoint budget (doubling the interval and compacting checkpoints if needed).
+
+An optional privacy-preserving **persistent sidecar index cache** (`crates/quarry-core/src/sidecar.rs`) accelerates reopening large unchanged files. Sidecar files live under an owner-only cache directory (`0700` dir / `0600` files, `O_NOFOLLOW`/`O_EXCL` atomic writes, 256 MiB LRU cap, automatic opt-out on network/FAT/exFAT filesystems) with keyed opaque filenames and store **only** structural offsets, file identity, and content hashes—never filenames, headers, or cell contents. Users can clear the cache at any time via **File → Temporary Storage…**.
+
+## Parallel out-of-core execution, adaptive 300 MB budget, and hash-join
+Out-of-core Sort (including Natural sort), Find & Remove Duplicates (selected columns or whole-row `DuplicateTarget::AllFields`), Replace All, and Join share bounded parallel workers and an adaptive **300 MB** single-run in-RAM fast path drawn from `EnginePool`'s shared byte budget ([ADR 0005](adr/0005-temporary-storage.md) amendment). Inputs below the budget avoid disk spills while producing byte-identical output to the multi-pass external merge path.
+
+Join Files uses a partitioned multi-threaded **Hash-Join** with key-only late materialization and automatic fallback to external sort-merge on heavy key skew ([ADR 0011](adr/0011-bounded-file-joining.md) amendment).
+
+## Pause/resume indexing, bounded section windows, splice-save, and row bookmarks
+- **Pause / Resume Indexing & Live Resource HUD:** Background indexing supports park-the-job pause/resume without parking pool worker threads (`PinReason::IndexingPaused`), paired with an off-thread (`<= 2 Hz`) Live Resource HUD reporting `phys_footprint` (macOS), `VmRSS` (Linux), and per-volume free disk space without probe writes.
+- **Bounded Section Windows (`Session::open_section`):** Opens arbitrary byte slices of multi-gigabyte to multi-terabyte files (verified on a 20 TiB sparse file) using checked `u64` arithmetic, outward line-boundary snapping, and an explicit two-tier boundary trust contract (`BoundaryTrust::Verified` vs `BoundaryTrust::Speculative`) with pausable/cancellable `VerifyBoundaryJob` ([ADR 0014](adr/0014-large-file-controller-and-section-windows.md)).
+- **Guarded Section Splice-Save:** For `Verified` sections, saves section edits back into the full source file by assembling `prefix + rewritten section + suffix` in private staging—using APFS `fclonefileat` or Linux `FICLONE` consistent-snapshot copy-on-write when supported, with a bounded streaming fallback—under strict source guards, dirty mutual exclusion across sibling tabs, and post-splice sibling refresh ([ADR 0015](adr/0015-guarded-section-splice-save.md)). `Speculative` sections allow **Save Section As New File** until boundaries are verified.
+- **Session Row Bookmarks:** `RowBookmarks` (capped at `10,000` entries per document, keyed by source generation, record start offset, and global ordinal) tracks marked rows across cell edits, filtering, and tab dormancy, shifts deterministically on row inserts/deletes, and clears cleanly (restorable via Undo) on full-file reorder/dedup operations.
 
 ## Parsing
 Optimize common paths without compromising quoted fields, escaped quotes, embedded delimiters/newlines, CRLF/LF, UTF-8 boundaries, malformed records, wide rows, or giant fields. Avoid allocating an owned string for every cell; materialize only what the viewport needs.

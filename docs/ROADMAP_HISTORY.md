@@ -9,7 +9,7 @@ ongoing work.
 
 The roadmap is ordered by technical risk rather than feature excitement.
 
-Quarry follows the [free and open-source policy](../README.md#free-and-open-source):
+Quarry follows the [free and open-source policy](../README.md#free-open-source-and-local-first):
 all application features remain available in source builds, and official
 releases are free of charge. There are no paid tiers or activation requirements.
 The first public beta is available with documented validation limits. The
@@ -54,7 +54,7 @@ merged app was installed and verified; native editing, sort, Undo/Redo, and
 exact Save As output passed with the original source unchanged. The original
 1 GB and cross-volume measurements were not repeated on this merge. See
 [ADR 0005](adr/0005-temporary-storage.md) and the
-[user guide](USER_GUIDE.md#temporary-storage-and-free-space).
+[user guide](USER_GUIDE.md#temporary-storage-index-cache-and-free-space).
 
 The [2026-09-06 connected-workflow validation](benchmarks/2026-09-06-pre-beta-closeout.md)
 passed in the clean installed app at `f5efee2`, covering cell/header Undo/Redo,

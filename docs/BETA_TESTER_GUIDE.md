@@ -83,11 +83,11 @@ filters before structural changes or Find/Replace.
 Undo history is bounded, and case-insensitive matching folds ASCII letters only.
 Read the [documented limits](USER_GUIDE.md#undo-and-redo-changes) and
 [filter rules](USER_GUIDE.md#filter-rows). Build 167 also includes
-[document tabs](USER_GUIDE.md#work-with-document-tabs),
+[document tabs](USER_GUIDE.md#work-with-tabs-and-multiple-windows),
 [Combine Files](USER_GUIDE.md#combine-files),
 [Join Files](USER_GUIDE.md#join-files), and
 [compressed `.gz` files](USER_GUIDE.md#open-compressed-files). A TUI remains
-[future work](ROADMAP.md#post-beta-sequence). The
+[future work](ROADMAP.md). The
 [beta checklist](BETA_RELEASE_CHECKLIST.md) tracks acceptance still outstanding.
 
 ## Character encoding checks

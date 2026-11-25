@@ -2,8 +2,7 @@
 
 ## Scope
 
-Phase 7A packages the selected egui desktop into one canonical local alpha
-application:
+`scripts/macos-app.sh` packages the production GPUI desktop application (`apps/quarry-gpui`, [ADR 0013](adr/0013-adopt-gpui-desktop-frontend.md)) into one canonical local macOS application bundle (for Linux and Omarchy source builds, see [`docs/LINUX_AND_OMARCHY.md`](LINUX_AND_OMARCHY.md)):
 
 | Property | Value |
 |---|---|
@@ -39,7 +38,7 @@ is available free through GitHub Releases for Apple Silicon, targeting macOS
 Git source history; distribute approved archives as release assets.
 
 Official releases are free of charge under Quarry's
-[free and open-source policy](../README.md#free-and-open-source). Source builds
+[free and open-source policy](../README.md#free-open-source-and-local-first). Source builds
 include all application features without paid tiers or activation. Signing and
 notarization establish trusted distribution; they do not unlock features.
 The project remains dual-licensed under MIT or Apache-2.0, and public downloads
@@ -73,8 +72,8 @@ icon and license notices, applies an ad-hoc signature without a timestamp, and
 verifies the bundle.
 It rechecks the Git revision and working state after compilation and stops if
 either changed during the build.
-Two consecutive runs from the same checkout, pinned Rust 1.88.0 toolchain, and
-macOS SDK produced identical plist, executable, and icon payload hashes. The
+Two consecutive runs from the same checkout, pinned Rust toolchain (`rust-toolchain.toml`, currently `1.100.0`), and
+macOS SDK produce identical plist, executable, and icon payload hashes. The
 runner-provided macOS SDK is not pinned, so this is not a claim of byte-identical
 output across machines or SDK updates.
 
@@ -147,8 +146,8 @@ Local packages include these files in `Contents/Resources/Licenses/`:
 - `LICENSE-MIT` and `LICENSE-APACHE`, copied unchanged from the repository.
 - `THIRD_PARTY_NOTICES.html`, generated from the locked macOS dependencies and
   the additional font notices recorded in the license audit.
-- `Rust/`, containing seven runtime copyright/license resources from the
-  inspected Rust 1.88.0 toolchain and its pinned sources. The
+- `Rust/`, containing runtime copyright/license resources from the
+  inspected pinned Rust toolchain (`rust-toolchain.toml`) and its pinned sources. The
   [audit's runtime table](../packaging/licenses/AUDIT.md#rust-runtime-resources)
   records their provenance, including backtrace and compiler-builtins notices.
 
@@ -160,7 +159,7 @@ Before packaging, the notice freshness check must pass:
 
 This check establishes that the checked-in notice artifact matches its recorded
 inputs. It does not establish that every attribution question has been resolved.
-The locked ARM64/Rust 1.88.0 inventory has a recorded source review.
+The locked ARM64 `quarry-gpui` inventory has a recorded source review.
 `./scripts/generate-notices.sh --release-check` checks freshness and requires
 the exact manifest hash recorded in `packaging/licenses/reviewed.sha256`.
 Regeneration never renews this review record. This is an inventory gate,
@@ -200,7 +199,13 @@ The initial evidence is recorded in the
 
 ## Rollback
 
-For the most controlled rollback, install a known-good commit from a separate
+To restore the previous verified installation archive (`Quarry-previous.zip`) directly:
+
+```bash
+./scripts/macos-app.sh rollback
+```
+
+For the most controlled rollback to a specific Git revision, install a known-good commit from a separate
 worktree. This keeps the current development checkout untouched:
 
 ```bash
