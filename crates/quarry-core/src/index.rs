@@ -1319,6 +1319,7 @@ fn run_indexer(
             section_base,
             section_end,
             strip_bom_at_zero,
+            true,
             delimiter,
             encoding,
             config,
@@ -1367,6 +1368,7 @@ fn run_indexer(
                 &file,
                 0,
                 file_size,
+                true,
                 false,
                 delimiter,
                 encoding,
@@ -1413,7 +1415,7 @@ fn run_indexer(
     }
 
     let paused = run_sequential_indexer_range(
-        &file, 0, file_size, false, delimiter, encoding, config, tuning, None, shared,
+        &file, 0, file_size, true, false, delimiter, encoding, config, tuning, None, shared,
     )?;
     Ok((file, paused))
 }
@@ -1424,6 +1426,7 @@ fn run_sequential_indexer_range(
     range_start: u64,
     range_end: u64,
     strip_bom_at_zero: bool,
+    is_section: bool,
     delimiter: u8,
     encoding: Encoding,
     config: IndexConfig,
@@ -1442,7 +1445,7 @@ fn run_sequential_indexer_range(
         index.telemetry.simd_backend = backend;
     }
 
-    if strip_bom_at_zero && range_start == 0 && resume_from.is_none() {
+    if is_section && strip_bom_at_zero && range_start == 0 && resume_from.is_none() {
         let bom = encoding.bom();
         if !bom.is_empty() && range_end == bom.len() as u64 {
             let mut probe = [0u8; 3];
