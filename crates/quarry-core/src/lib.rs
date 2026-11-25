@@ -1473,7 +1473,12 @@ fn read_rows_from_index(
     if encoding.is_utf16() {
         file.seek(SeekFrom::Start(checkpoint.offset))?;
     }
-    let mut scanner = RecordScanner::at_offset(delimiter, checkpoint.offset, encoding)?;
+    let mut scanner = RecordScanner::at_offset_with_bom_handling(
+        delimiter,
+        checkpoint.offset,
+        encoding,
+        strip_bom_at_zero,
+    )?;
     let mut chunk = vec![0; encoding.chunk_size(DEFAULT_READ_CHUNK)];
     let mut absolute_start = checkpoint.offset;
     let mut row_number = checkpoint.row;

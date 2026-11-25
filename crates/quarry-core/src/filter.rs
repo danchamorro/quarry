@@ -1232,12 +1232,21 @@ fn run_filter(
         .source
         .as_ref()
         .map_or(Encoding::Utf8, |source| source.encoding);
+    let strip_bom_at_zero = index
+        .source
+        .as_ref()
+        .is_none_or(|source| source.strip_bom_at_zero);
     drop(index);
     let matchers = compile_matchers(query)?;
     let groups = predicate_groups(query);
     let max_column = query.predicates.iter().map(|p| p.column).max().unwrap_or(0);
     let mut field_ranges = Vec::with_capacity((max_column + 1).min(64));
-    let mut scanner = RecordScanner::at_offset(delimiter, shared.section_base, encoding)?;
+    let mut scanner = RecordScanner::at_offset_with_bom_handling(
+        delimiter,
+        shared.section_base,
+        encoding,
+        strip_bom_at_zero,
+    )?;
     if shared.section_base > 0 {
         file.seek(SeekFrom::Start(shared.section_base))?;
     }
@@ -2700,7 +2709,12 @@ fn run_filtered_read(
         .is_none_or(|source| source.strip_bom_at_zero);
     let matchers = compile_matchers(&plan.query)?;
     let groups = predicate_groups(&plan.query);
-    let mut scanner = RecordScanner::at_offset(delimiter, plan.checkpoint.offset, encoding)?;
+    let mut scanner = RecordScanner::at_offset_with_bom_handling(
+        delimiter,
+        plan.checkpoint.offset,
+        encoding,
+        strip_bom_at_zero,
+    )?;
     let mut chunk = vec![0; encoding.chunk_size(config.chunk_bytes)];
     let mut absolute_start = plan.checkpoint.offset;
     let mut row_number = plan.checkpoint.row;

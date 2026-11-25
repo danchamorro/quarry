@@ -279,13 +279,15 @@ fn detect_encoded_line_ending(
     read_end: u64,
     delimiter: u8,
     encoding: Encoding,
+    max_record_bytes: usize,
 ) -> Result<&'static [u8], QuarryError> {
     if read_base >= read_end {
         return Ok(b"\n");
     }
-    const MAX_PROBE_BYTES: u64 = 256 * 1024;
-    let probe_end = read_end.min(read_base.saturating_add(MAX_PROBE_BYTES));
-    let mut scanner = crate::encoding::RecordScanner::at_offset(delimiter, read_base, encoding)?;
+    let probe_end = read_end.min(read_base.saturating_add(max_record_bytes as u64));
+    let mut scanner = crate::encoding::RecordScanner::at_offset_with_bom_handling(
+        delimiter, read_base, encoding, false,
+    )?;
     let mut chunk = vec![0u8; encoding.chunk_size(64 * 1024)];
     let mut cursor = read_base;
     let mut first_record_end: Option<u64> = None;
@@ -442,12 +444,20 @@ fn serialize_section_to_stage(
         read_base
     };
     let wrote_leading_bom = scan_start > read_base;
-    let default_ending =
-        detect_encoded_line_ending(source, scan_start, read_end, delimiter, encoding)?;
+    let default_ending = detect_encoded_line_ending(
+        source,
+        scan_start,
+        read_end,
+        delimiter,
+        encoding,
+        config.max_record_bytes,
+    )?;
     if encoding.is_utf16() {
         source.seek(SeekFrom::Start(scan_start))?;
     }
-    let mut scanner = crate::encoding::RecordScanner::at_offset(delimiter, scan_start, encoding)?;
+    let mut scanner = crate::encoding::RecordScanner::at_offset_with_bom_handling(
+        delimiter, scan_start, encoding, false,
+    )?;
     let mut chunk = vec![0u8; encoding.chunk_size(config.chunk_bytes)];
     let mut cursor = scan_start;
     let mut local_row = 0u64;
@@ -1572,6 +1582,7 @@ fn run_section_working_copy_op(
         read_end,
         delimiter,
         config.source_encoding,
+        config.max_record_bytes,
     )?;
     let blank_row_utf8: Option<Vec<u8>> = match &op {
         SectionWorkingOp::InsertRows(ins) => {
@@ -1594,8 +1605,12 @@ fn run_section_working_copy_op(
     if config.source_encoding.is_utf16() {
         source.seek(SeekFrom::Start(scan_start))?;
     }
-    let mut scanner =
-        crate::encoding::RecordScanner::at_offset(delimiter, scan_start, config.source_encoding)?;
+    let mut scanner = crate::encoding::RecordScanner::at_offset_with_bom_handling(
+        delimiter,
+        scan_start,
+        config.source_encoding,
+        false,
+    )?;
     let mut chunk = vec![0u8; config.source_encoding.chunk_size(config.chunk_bytes)];
     let mut cursor = scan_start;
     let mut local_row = 0u64;
@@ -3116,5 +3131,101 @@ mod tests {
             fs::read(&wc).unwrap(),
             b"\"first\nline\",x\r\n,\r\nnext,y\r\n"
         );
+
+        // Also verify a record exceeding 256 KiB with a quoted LF still detects CRLF at the
+        // first complete record boundary.
+        let mut wide = Vec::from(&b"\"first\n"[..]);
+        wide.extend(std::iter::repeat_n(b'A', 300 * 1024));
+        wide.extend_from_slice(b"\",x\r\nnext,y\r\n");
+        let wide_path = write_fixture(&dir, "wide_quoted_lf_crlf.csv", &wide);
+        let wide_sec = open_verified_section(
+            &wide_path,
+            ByteWindow::new(0, wide.len() as u64).unwrap(),
+            None,
+            HeaderMode::NoHeader,
+        );
+        let wide_wc = dir.path().join("wide_wc_crlf.csv");
+        let SaveAsOutcome::Complete(_) = wide_sec
+            .start_create_working_copy_inserting_rows(
+                BTreeMap::new(),
+                BTreeMap::new(),
+                RowInsertion {
+                    position: 1,
+                    count: 1,
+                    width: 2,
+                },
+                &wide_wc,
+            )
+            .unwrap()
+            .wait()
+            .unwrap()
+        else {
+            panic!("expected wide row insert complete");
+        };
+        let wide_out = fs::read(&wide_wc).unwrap();
+        assert!(
+            wide_out.ends_with(b"\",x\r\n,\r\nnext,y\r\n"),
+            "wide CRLF record must insert CRLF-terminated blank row"
+        );
+    }
+
+    #[test]
+    fn interior_working_copy_preserves_unterminated_sole_literal_feff_field_across_read_index_and_splice()
+     {
+        let dir = TempDir::new().unwrap();
+        let initial = b"0,x\n1,a\n\xEF\xBB\xBF";
+        let path = write_fixture(&dir, "interior_sole_feff.csv", initial);
+        // Interior section starting right after "0,x\n" covering "1,a\n\xEF\xBB\xBF".
+        let sec = open_verified_section(
+            &path,
+            ByteWindow::new(4, (initial.len() - 4) as u64).unwrap(),
+            None,
+            HeaderMode::NoHeader,
+        );
+        let wc = dir.path().join("wc_sole_feff.csv");
+        let SaveAsOutcome::Complete(_) = sec
+            .start_create_working_copy_deleting_rows(
+                BTreeMap::new(),
+                BTreeMap::new(),
+                std::iter::once(0..=0).collect(),
+                &wc,
+            )
+            .unwrap()
+            .wait()
+            .unwrap()
+        else {
+            panic!("expected working copy delete");
+        };
+        assert_eq!(fs::read(&wc).unwrap(), b"\xEF\xBB\xBF");
+
+        let wc_session =
+            Session::open_section_working_copy(&wc, &sec, OpenOptions::default()).unwrap();
+        assert_eq!(wc_session.first_rows.len(), 1);
+        assert_eq!(
+            wc_session.first_rows[0].fields,
+            vec![b"\xEF\xBB\xBF".to_vec()]
+        );
+
+        let wc_idx = wc_session
+            .start_indexing(IndexConfig::default())
+            .unwrap()
+            .wait()
+            .unwrap();
+        assert_eq!(wc_idx.indexed_rows(), 1);
+        let read_back = wc_session.read_rows(&wc_idx, 0, 1).unwrap();
+        assert_eq!(read_back.len(), 1);
+        assert_eq!(read_back[0].fields, vec![b"\xEF\xBB\xBF".to_vec()]);
+
+        let SaveAsOutcome::Complete(saved) = wc_session
+            .start_save_to_original(BTreeMap::new(), BTreeMap::new(), &sec)
+            .unwrap()
+            .wait()
+            .unwrap()
+        else {
+            panic!("expected splice save complete");
+        };
+        let sp = saved.splice.unwrap();
+        assert_eq!(sp.rows_written, 1);
+        assert_eq!(fs::read(&path).unwrap(), b"0,x\n\xEF\xBB\xBF");
     }
 }

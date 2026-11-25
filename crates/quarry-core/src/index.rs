@@ -1463,10 +1463,11 @@ fn run_sequential_indexer_range(
         Some((cursor, scanner)) => (cursor, scanner),
         None => (
             range_start,
-            Box::new(EncodedScanner::<true>::at_offset(
+            Box::new(EncodedScanner::<true>::at_offset_with_bom_handling(
                 delimiter,
                 range_start,
                 encoding,
+                strip_bom_at_zero,
             )?),
         ),
     };

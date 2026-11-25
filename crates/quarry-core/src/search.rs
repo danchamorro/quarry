@@ -651,7 +651,12 @@ fn scan_search_stripe(
     let can_prefilter = encoding == Encoding::Utf8 && !needle.contains(&b'"');
     let raw_stripe_has_hit = !can_prefilter || matcher.find(&buf).is_some();
 
-    let mut scanner = match RecordScanner::at_offset(delimiter, stripe.start_offset, encoding) {
+    let mut scanner = match RecordScanner::at_offset_with_bom_handling(
+        delimiter,
+        stripe.start_offset,
+        encoding,
+        strip_bom_at_zero,
+    ) {
         Ok(scanner) => scanner,
         Err(error) => {
             earliest_hit_stripe.fetch_min(stripe.id, Ordering::AcqRel);
@@ -861,7 +866,12 @@ fn scan_search_stripe_streaming(
 ) -> Option<StripeResult> {
     let matcher = ByteMatcher::new(needle, case_sensitivity);
     let can_prefilter = encoding == Encoding::Utf8 && !needle.contains(&b'"');
-    let mut scanner = match RecordScanner::at_offset(delimiter, stripe.start_offset, encoding) {
+    let mut scanner = match RecordScanner::at_offset_with_bom_handling(
+        delimiter,
+        stripe.start_offset,
+        encoding,
+        strip_bom_at_zero,
+    ) {
         Ok(scanner) => scanner,
         Err(error) => {
             earliest_hit_stripe.fetch_min(stripe.id, Ordering::AcqRel);
@@ -1382,7 +1392,12 @@ fn run_search_bounded(
     let matcher = ByteMatcher::new(needle, case_sensitivity);
     let can_prefilter = encoding == Encoding::Utf8 && !needle.contains(&b'"');
     let edited_rows: BTreeSet<u64> = cell_edits.keys().map(|(row, _)| *row).collect();
-    let mut scanner = RecordScanner::at_offset(delimiter, checkpoint.offset, encoding)?;
+    let mut scanner = RecordScanner::at_offset_with_bom_handling(
+        delimiter,
+        checkpoint.offset,
+        encoding,
+        strip_bom_at_zero,
+    )?;
     let mut chunk = vec![0; encoding.chunk_size(DEFAULT_READ_CHUNK)];
     let mut absolute_start = checkpoint.offset;
     let mut row_number = checkpoint.row;

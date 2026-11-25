@@ -1993,7 +1993,12 @@ pub(crate) fn read_section_initial_rows(
         }
     }
     let max_bytes = (section_end - section_start).min(limit as u64);
-    let mut scanner = EncodedScanner::<false>::at_offset(delimiter, section_start, encoding)?;
+    let mut scanner = EncodedScanner::<false>::at_offset_with_bom_handling(
+        delimiter,
+        section_start,
+        encoding,
+        strip_bom_at_zero,
+    )?;
     let chunk_cap = encoding.chunk_size(limit.clamp(16 * 1024, 256 * 1024));
     let mut chunk = vec![0u8; chunk_cap];
     let mut cursor = section_start;
