@@ -3034,6 +3034,7 @@ impl Document {
 
     pub fn can_verify_section_boundary(&self) -> bool {
         self.is_section()
+            && !self.session.section_backed_by_working_copy()
             && !self.source_changed
             && self.section_verify_job.is_none()
             && self.section_bounds().is_some_and(|bounds| {
@@ -3064,6 +3065,11 @@ impl Document {
         if !self.is_section() {
             return Err(AppMessage::warning(
                 "Verify Boundary is only available for section documents.",
+            ));
+        }
+        if self.session.section_backed_by_working_copy() {
+            return Err(AppMessage::warning(
+                "Save or discard structural section edits before verifying global row numbers.",
             ));
         }
         if self.source_changed {

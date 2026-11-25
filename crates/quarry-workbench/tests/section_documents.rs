@@ -1377,3 +1377,90 @@ fn sibling_invalidation_releases_unrelated_export_write_destination() {
     let _ = fs::remove_file(&path);
     let _ = fs::remove_file(&export_dest);
 }
+
+#[test]
+fn quote_free_materialized_section_disables_verify_boundary_and_still_splice_saves() {
+    let path = temp_csv("quotefree-wc-verify", b"1,a\n2,b\n3,c\n4,d\n");
+    let mut scheduler = WorkbenchScheduler::new(WorkbenchSchedulerConfig::default());
+    scheduler.register_window(WindowId::PRIMARY);
+
+    let sec_id = match scheduler
+        .open_section(
+            WindowId::PRIMARY,
+            path.clone(),
+            ByteWindow::new(4, 8).unwrap(), // "2,b\n3,c\n"
+            SectionOpenOptions {
+                open: OpenOptions {
+                    delimiter: Some(b','),
+                    header_mode: quarry_core::HeaderMode::NoHeader,
+                    ..OpenOptions::default()
+                },
+                quote_free_confirmed: true,
+                ..SectionOpenOptions::default()
+            },
+        )
+        .unwrap()
+    {
+        WakeOutcome::Ready { document_id, .. } => document_id,
+        other => panic!("unexpected section open: {other:?}"),
+    };
+    wait_for_index(&mut scheduler, sec_id);
+
+    // QuoteFreeConfirmed is Verified with unknown global row, so Verify Boundary is available
+    // before structural edits.
+    {
+        let doc = scheduler.tab(sec_id).unwrap().document.as_ref().unwrap();
+        assert_eq!(doc.section_trust(), Some(BoundaryTrust::Verified));
+        assert!(doc.can_verify_section_boundary());
+    }
+
+    // Delete all rows in the section -> materializes an empty section working copy.
+    scheduler
+        .tab_mut(sec_id)
+        .unwrap()
+        .document
+        .as_mut()
+        .unwrap()
+        .start_delete_rows(std::iter::once(0..=1).collect())
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let done = scheduler.poll_structural_edits();
+        if let Some(comp) = done.into_iter().find(|c| c.document_id == sec_id) {
+            comp.result.unwrap();
+            break;
+        }
+        assert!(Instant::now() < deadline, "timed out waiting for delete");
+        thread::sleep(Duration::from_millis(10));
+    }
+    wait_for_index(&mut scheduler, sec_id);
+
+    // While backed by a structural working copy, Verify Boundary must be disabled/rejected so it
+    // never scans the temp working copy with parent offsets, while splice-save still succeeds!
+    {
+        let doc = scheduler
+            .tab_mut(sec_id)
+            .unwrap()
+            .document
+            .as_mut()
+            .unwrap();
+        assert!(doc.session.section_backed_by_working_copy());
+        assert!(!doc.can_verify_section_boundary());
+        assert!(doc.start_verify_section_boundary(None).is_err());
+        assert!(doc.is_save_ready());
+        doc.start_save().unwrap();
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let saves = scheduler.poll_saves();
+        if let Some(c) = saves.into_iter().find(|s| s.document_id == sec_id) {
+            c.result.unwrap();
+            break;
+        }
+        assert!(Instant::now() < deadline, "timed out waiting for splice");
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    assert_eq!(fs::read(&path).unwrap(), b"1,a\n4,d\n");
+    let _ = fs::remove_file(&path);
+}

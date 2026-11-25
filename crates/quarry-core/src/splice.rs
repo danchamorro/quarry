@@ -896,6 +896,24 @@ fn run_section_splice(
             "spliced file size overflows 64-bit byte range",
         ))?;
 
+    // Guard against promoting a surviving suffix row that begins with a literal U+FEFF (BOM)
+    // to byte 0 of a BOM-less file when every row in a byte-0 section was deleted.
+    if aligned_start == 0 && !source_had_bom && new_section_len == 0 && suffix_len > 0 {
+        let bom = config.source_encoding.bom();
+        if !bom.is_empty() && suffix_len >= bom.len() as u64 {
+            let mut probe = [0u8; 3];
+            let read = read_at_exact_or_eof(&parent_file, aligned_end, &mut probe[..bom.len()])?;
+            if read < bom.len() {
+                return Err(QuarryError::SourceChanged);
+            }
+            if &probe[..bom.len()] == bom {
+                return Err(QuarryError::InvalidOption(
+                    "Deleting every row in this byte-0 section would promote a surviving row starting with a literal U+FEFF (BOM) to byte 0 of a BOM-less file. Keep at least one row or use Save Section As New.",
+                ));
+            }
+        }
+    }
+
     // Revalidate remaining disk headroom using the exact materialized `new_section_len` now that
     // `section.stage` is on disk and before allocating `output.stage` blocks.
     let remaining_required = if cow_supported {
@@ -2884,5 +2902,45 @@ mod tests {
         // External write right after splice invalidates `published_guard`.
         fs::write(&path, b"id,val\n1,EXT\n2,bbb\n3,ccc\n").unwrap();
         assert!(!sp.published_guard.matches_path(&path).unwrap());
+    }
+
+    #[test]
+    fn deleting_all_rows_in_bomless_byte_zero_section_rejects_suffix_starting_with_literal_feff() {
+        let dir = TempDir::new().unwrap();
+        let initial = b"1,a\n\xEF\xBB\xBF2,b\n3,c\n";
+        let path = write_fixture(&dir, "suffix_feff_promotion.csv", initial);
+        let sec = open_verified_section(
+            &path,
+            ByteWindow::new(0, 4).unwrap(), // "1,a\n"
+            None,
+            HeaderMode::NoHeader,
+        );
+        let wc = dir.path().join("wc_empty.csv");
+        let SaveAsOutcome::Complete(_) = sec
+            .start_create_working_copy_deleting_rows(
+                BTreeMap::new(),
+                BTreeMap::new(),
+                std::iter::once(0..=0).collect(),
+                &wc,
+            )
+            .unwrap()
+            .wait()
+            .unwrap()
+        else {
+            panic!("expected delete working copy");
+        };
+        let wc_session =
+            Session::open_section_working_copy(&wc, &sec, OpenOptions::default()).unwrap();
+        let err = wc_session
+            .start_save_to_original(BTreeMap::new(), BTreeMap::new(), &sec)
+            .unwrap()
+            .wait()
+            .unwrap_err();
+        assert!(
+            matches!(err, QuarryError::InvalidOption(_)),
+            "expected InvalidOption guarding literal BOM suffix promotion, got {err:?}"
+        );
+        // Parent file must remain completely untouched.
+        assert_eq!(fs::read(&path).unwrap(), initial);
     }
 }

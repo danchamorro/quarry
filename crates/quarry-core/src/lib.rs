@@ -1038,6 +1038,11 @@ impl Session {
                 "Verify Boundary is only available for bounded section documents",
             ));
         };
+        if meta.backed_by_working_copy {
+            return Err(QuarryError::InvalidOption(
+                "Save or discard structural section edits before verifying section boundaries.",
+            ));
+        }
         VerifyBoundaryJob::start(
             self.path.clone(),
             self.source_stamp.clone(),
