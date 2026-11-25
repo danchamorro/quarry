@@ -1395,8 +1395,37 @@ pub(crate) fn start_section_replace_all(
     Ok(ReplaceAllJob::from_inner(inner))
 }
 
-fn row_is_deleted(row: u64, deleted: &[RangeInclusive<u64>]) -> bool {
-    deleted.iter().any(|r| r.contains(&row))
+fn normalize_deleted_ranges(ranges: Vec<RangeInclusive<u64>>) -> Vec<RangeInclusive<u64>> {
+    let mut valid: Vec<(u64, u64)> = ranges
+        .into_iter()
+        .filter(|r| !r.is_empty())
+        .map(|r| (*r.start(), *r.end()))
+        .collect();
+    valid.sort_unstable_by_key(|&(start, _)| start);
+    let mut merged: Vec<RangeInclusive<u64>> = Vec::with_capacity(valid.len());
+    for (start, end) in valid {
+        if let Some(last) = merged.last_mut()
+            && start <= last.end().saturating_add(1)
+        {
+            *last = *last.start()..=(*last.end()).max(end);
+        } else {
+            merged.push(start..=end);
+        }
+    }
+    merged
+}
+
+fn advance_row_deleted(row: u64, deleted: &[RangeInclusive<u64>], cursor: &mut usize) -> bool {
+    while let Some(range) = deleted.get(*cursor) {
+        if row < *range.start() {
+            return false;
+        }
+        if row <= *range.end() {
+            return true;
+        }
+        *cursor += 1;
+    }
+    false
 }
 
 fn replace_literal_in_field(
@@ -1459,6 +1488,12 @@ fn run_section_working_copy_op(
     if shared.cancel_requested.load(Ordering::Acquire) {
         return Ok(SaveWorkerOutcome::Cancelled);
     }
+    let op = match op {
+        SectionWorkingOp::DeleteRows(ranges) => {
+            SectionWorkingOp::DeleteRows(normalize_deleted_ranges(ranges))
+        }
+        other => other,
+    };
     let section_len = read_end.saturating_sub(read_base);
     let extra_est = match &op {
         SectionWorkingOp::InsertRows(ins) => ins
@@ -1551,6 +1586,7 @@ fn run_section_working_copy_op(
     let mut last_written_had_lf = true;
     let mut record = Vec::new();
     let mut next_cell_edit_row = cell_edits.first_key_value().map(|((row, _), _)| *row);
+    let mut delete_cursor = 0usize;
 
     let write_inserted_rows = |output: &mut ExportTarget,
                                rows_written: &mut u64,
@@ -1598,7 +1634,7 @@ fn run_section_working_copy_op(
             });
         }
         if let SectionWorkingOp::DeleteRows(deleted) = &op
-            && row_is_deleted(row_idx, deleted)
+            && advance_row_deleted(row_idx, deleted, &mut delete_cursor)
         {
             return Ok(());
         }
@@ -2942,5 +2978,43 @@ mod tests {
         );
         // Parent file must remain completely untouched.
         assert_eq!(fs::read(&path).unwrap(), initial);
+    }
+
+    #[test]
+    fn section_delete_rows_merges_and_advances_cursor_over_many_disjoint_ranges() {
+        let dir = TempDir::new().unwrap();
+        let mut content = Vec::from(&b"id,val\n"[..]);
+        for i in 0..2000u64 {
+            content.extend_from_slice(format!("{i},v{i}\n").as_bytes());
+        }
+        let path = write_fixture(&dir, "many_disjoint_deletes.csv", &content);
+        let sec = open_verified_section(
+            &path,
+            ByteWindow::new(7, (content.len() - 7) as u64).unwrap(),
+            None,
+            HeaderMode::FirstRow,
+        );
+        // Delete all even rows using unsorted & overlapping single-row/short ranges.
+        let mut ranges: Vec<std::ops::RangeInclusive<u64>> =
+            (0..1000u64).rev().map(|k| (k * 2)..=(k * 2)).collect();
+        ranges.push(10..=12);
+        let wc = dir.path().join("wc_disjoint.csv");
+        let SaveAsOutcome::Complete(_) = sec
+            .start_create_working_copy_deleting_rows(BTreeMap::new(), BTreeMap::new(), ranges, &wc)
+            .unwrap()
+            .wait()
+            .unwrap()
+        else {
+            panic!("expected working copy delete");
+        };
+        let out = String::from_utf8(fs::read(&wc).unwrap()).unwrap();
+        let kept_ids: Vec<u64> = out
+            .lines()
+            .map(|line| line.split(',').next().unwrap().parse::<u64>().unwrap())
+            .collect();
+        let expected: Vec<u64> = (0..2000u64)
+            .filter(|&r| r % 2 == 1 && !(10..=12).contains(&r))
+            .collect();
+        assert_eq!(kept_ids, expected);
     }
 }
