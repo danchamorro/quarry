@@ -24,7 +24,6 @@ use gpui_kit::{
     component::{
         ActiveTheme, Disableable, Root, Sizable, Theme, ThemeMode, WindowExt,
         button::{Button, ButtonVariants},
-        dialog::{Cancel as DialogCancel, Confirm as DialogConfirm},
         input::{Input, InputEvent, InputState, Textarea, TextareaState},
         table::{DataTable, TableEvent, TableState},
     },
@@ -1020,6 +1019,7 @@ impl QuarryWindow {
         let focus_input = input.clone();
         let apply = cx.weak_entity();
         let close = cx.weak_entity();
+        let anchor = operations::DialogAnchor::new(cx);
         if self.snapshot(cx).is_some() {
             self.table.focus_handle(cx).focus(window, cx);
         }
@@ -1030,6 +1030,9 @@ impl QuarryWindow {
             let close = close.clone();
             let error = status.read(cx).error.clone();
             let apply_status = status.clone();
+            let anchor_el = anchor.clone();
+            let anchor_cancel = anchor.clone();
+            let anchor_ok = anchor.clone();
             dialog
                 .title(format!("{} · source row {}", title, row + 1))
                 .w(px(480.))
@@ -1038,28 +1041,23 @@ impl QuarryWindow {
                 .keyboard(true)
                 .footer(
                     div()
+                        .relative()
                         .flex()
                         .justify_end()
                         .gap_2()
+                        .child(anchor_el.element())
                         .child(
                             Button::new("cancel-cell-edit")
                                 .label("Cancel")
                                 .small()
-                                .on_click(|_, window, cx| {
-                                    window.dispatch_action(Box::new(DialogCancel), cx)
-                                }),
+                                .on_click(move |_, window, cx| anchor_cancel.cancel(window, cx)),
                         )
                         .child(
                             Button::new("apply-cell-edit")
                                 .label("Apply edit")
                                 .primary()
                                 .small()
-                                .on_click(|_, window, cx| {
-                                    window.dispatch_action(
-                                        Box::new(DialogConfirm { secondary: false }),
-                                        cx,
-                                    )
-                                }),
+                                .on_click(move |_, window, cx| anchor_ok.confirm(window, cx)),
                         ),
                 )
                 .content(move |content, _, cx| {
@@ -1180,6 +1178,7 @@ impl QuarryWindow {
         let apply = cx.weak_entity();
         let close = cx.weak_entity();
         let status = cx.new(|_| CellEditStatus::default());
+        let anchor = operations::DialogAnchor::new(cx);
         self.table.focus_handle(cx).focus(window, cx);
         window.open_dialog(cx, move |dialog, _, cx| {
             let input_value = input.clone();
@@ -1188,6 +1187,9 @@ impl QuarryWindow {
             let close = close.clone();
             let error = status.read(cx).error.clone();
             let apply_status = status.clone();
+            let anchor_el = anchor.clone();
+            let anchor_cancel = anchor.clone();
+            let anchor_ok = anchor.clone();
             dialog
                 .title(format!("Rename column {}", source_col + 1))
                 .w(px(400.))
@@ -1196,28 +1198,23 @@ impl QuarryWindow {
                 .keyboard(true)
                 .footer(
                     div()
+                        .relative()
                         .flex()
                         .justify_end()
                         .gap_2()
+                        .child(anchor_el.element())
                         .child(
                             Button::new("cancel-header-rename")
                                 .label("Cancel")
                                 .small()
-                                .on_click(|_, window, cx| {
-                                    window.dispatch_action(Box::new(DialogCancel), cx)
-                                }),
+                                .on_click(move |_, window, cx| anchor_cancel.cancel(window, cx)),
                         )
                         .child(
                             Button::new("apply-header-rename")
                                 .label("Rename")
                                 .primary()
                                 .small()
-                                .on_click(|_, window, cx| {
-                                    window.dispatch_action(
-                                        Box::new(DialogConfirm { secondary: false }),
-                                        cx,
-                                    )
-                                }),
+                                .on_click(move |_, window, cx| anchor_ok.confirm(window, cx)),
                         ),
                 )
                 .content(move |content, _, cx| {
@@ -1610,6 +1607,7 @@ impl QuarryWindow {
         let save_handled = std::sync::Arc::clone(&handled);
         let discard_handled = std::sync::Arc::clone(&handled);
         let close_handled = std::sync::Arc::clone(&handled);
+        let anchor = operations::DialogAnchor::new(cx);
         window.open_dialog(cx, move |dialog, _, _| {
             let filename_msg = filename.clone();
             let save_weak = save_weak.clone();
@@ -1618,6 +1616,10 @@ impl QuarryWindow {
             let save_handled = std::sync::Arc::clone(&save_handled);
             let discard_handled = std::sync::Arc::clone(&discard_handled);
             let close_handled = std::sync::Arc::clone(&close_handled);
+            let anchor_el = anchor.clone();
+            let anchor_cancel = anchor.clone();
+            let anchor_save = anchor.clone();
+            let anchor_discard = anchor.clone();
             dialog
                 .title(format!("Discard unsaved edits to {filename}?"))
                 .w(px(480.))
@@ -1631,16 +1633,18 @@ impl QuarryWindow {
                 })
                 .footer(
                     div()
+                        .relative()
                         .flex()
                         .items_center()
                         .justify_end()
                         .gap_2()
+                        .child(anchor_el.element())
                         .child(
                             Button::new("section-reopen-cancel")
                                 .label("Keep Editing")
                                 .small()
-                                .on_click(|_, window, cx| {
-                                    window.dispatch_action(Box::new(DialogCancel), cx);
+                                .on_click(move |_, window, cx| {
+                                    anchor_cancel.cancel(window, cx);
                                 }),
                         )
                         .child(
@@ -1649,7 +1653,7 @@ impl QuarryWindow {
                                 .small()
                                 .on_click(move |_, window, cx| {
                                     save_handled.store(true, std::sync::atomic::Ordering::SeqCst);
-                                    window.dispatch_action(Box::new(DialogCancel), cx);
+                                    anchor_save.cancel(window, cx);
                                     let _ = save_weak.update(cx, |this, cx| {
                                         this.confirming = false;
                                         this.set_editing(false, cx);
@@ -1671,7 +1675,7 @@ impl QuarryWindow {
                                 .on_click(move |_, window, cx| {
                                     discard_handled
                                         .store(true, std::sync::atomic::Ordering::SeqCst);
-                                    window.dispatch_action(Box::new(DialogCancel), cx);
+                                    anchor_discard.cancel(window, cx);
                                     let _ = discard_weak.update(cx, |this, cx| {
                                         this.confirming = false;
                                         this.set_editing(false, cx);
@@ -3863,11 +3867,16 @@ pub(crate) fn apply_resolved_theme(resolved: &ResolvedTheme, cx: &mut App) {
     theme.colors.table_head_foreground = rgb(tokens.text_secondary.to_rgb_hex()).into();
     theme.colors.table_row_border = rgb(tokens.grid_line.to_rgb_hex()).into();
     theme.colors.table_hover = rgb(tokens.hover.to_rgb_hex()).into();
-    theme.colors.table_active = rgb(tokens.selection.to_rgb_hex()).into();
+    // `gpui-component` paints `table_active` and `list_active` as absolute
+    // overlays on top of cell/row text, so keep them translucent (matching
+    // `ThemeConfig::apply_config`'s 0.2 alpha cap) or active cells blank out
+    // their own text.
+    let active_overlay: gpui_kit::Hsla = rgb(tokens.selection_strong.to_rgb_hex()).into();
+    theme.colors.table_active = active_overlay.opacity(0.22);
     theme.colors.table_active_border = rgb(tokens.selection_strong.to_rgb_hex()).into();
     theme.colors.list = rgb(tokens.canvas.to_rgb_hex()).into();
     theme.colors.list_hover = rgb(tokens.hover.to_rgb_hex()).into();
-    theme.colors.list_active = rgb(tokens.selection.to_rgb_hex()).into();
+    theme.colors.list_active = active_overlay.opacity(0.22);
     theme.colors.list_active_border = rgb(tokens.selection_strong.to_rgb_hex()).into();
     theme.colors.popover = rgb(tokens.canvas.to_rgb_hex()).into();
     theme.colors.popover_foreground = rgb(tokens.text.to_rgb_hex()).into();

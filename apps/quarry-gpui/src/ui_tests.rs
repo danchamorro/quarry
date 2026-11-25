@@ -3575,3 +3575,173 @@ fn verified_section_edits_and_splice_save_invalidates_parent_and_blocks_sibling_
         "parent tab must immediately reflect source_changed after section splice-save"
     );
 }
+
+#[gpui_kit::test]
+fn sort_dialog_confirm_and_cancel_work_after_changing_select_mode(cx: &mut TestAppContext) {
+    let directory = tempfile::tempdir().unwrap();
+    let source = directory.path().join("numeric_sort.csv");
+    std::fs::write(&source, "id,note\n10,ten\n2,two\n100,hundred\n1,one\n").unwrap();
+    let controller = init_test_app(cx);
+    let (handle, view) = open_test_window(cx, &controller);
+    let win_id = cx.update(|cx| view.read(cx).window_id);
+
+    cx.update_window(handle.into(), |_, window, cx| {
+        view.update(cx, |quarry, cx| {
+            quarry.open_paths_direct(
+                vec![source.clone()],
+                OpenOptions {
+                    header_mode: HeaderMode::FirstRow,
+                    ..OpenOptions::default()
+                },
+                None,
+                window,
+                cx,
+            );
+        });
+    })
+    .unwrap();
+    wait_for_ui(cx, handle, &controller, &view, |quarry, _, cx| {
+        quarry
+            .snapshot(cx)
+            .is_some_and(|i| i.index_done && i.total_rows == 4)
+    });
+
+    // Open Sort Rows, change mode Select from Text -> Number (leaving focus on the Select),
+    // and click Sort once: the dialog must close and sort numerically (1, 2, 10, 100).
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.click("toolbar-sort", cx);
+        window.render_frame(cx);
+        assert!(window.find("apply-sort").visible());
+        window.click(("sort-mode", 1usize), cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.press("down", cx);
+        window.render_frame(cx);
+        window.press("enter", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert!(
+            window.focused(cx).is_some(),
+            "Select keeps focus after choosing Number"
+        );
+        window.click("apply-sort", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert!(
+            !gpui_kit::component::WindowExt::has_active_dialog(window, cx),
+            "clicking Sort while a Select holds focus must submit and close the dialog on the first click"
+        );
+    })
+    .unwrap();
+
+    wait_for_ui(cx, handle, &controller, &view, |q, _, cx| {
+        q.snapshot(cx)
+            .is_some_and(|i| !i.structural_running && i.index_done)
+            && controller
+                .read(cx)
+                .active_document(win_id)
+                .and_then(|d| d.effective_cell(1, 0))
+                == Some(b"1".as_slice())
+    });
+
+    cx.update(|cx| {
+        let doc = controller.read(cx).active_document(win_id).unwrap();
+        let ordered: Vec<String> = (1..=4)
+            .map(|r| {
+                String::from_utf8_lossy(doc.effective_cell(r, 0).unwrap_or_default()).into_owned()
+            })
+            .collect();
+        assert_eq!(
+            ordered,
+            vec!["1", "2", "10", "100"],
+            "Sort by Number must produce numeric order rather than lexicographic order"
+        );
+    });
+
+    // Re-open Sort Rows, focus a Select again, and verify Cancel closes on the first click.
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.click("toolbar-sort", cx);
+        window.render_frame(cx);
+        window.click(("sort-mode", 1usize), cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.press("down", cx);
+        window.render_frame(cx);
+        window.press("enter", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("cancel-sort", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert!(
+            !gpui_kit::component::WindowExt::has_active_dialog(window, cx),
+            "clicking Cancel while a Select holds focus must close the dialog on the first click"
+        );
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn active_table_and_list_overlays_stay_translucent_in_light_and_dark_themes(
+    cx: &mut TestAppContext,
+) {
+    let _controller = init_test_app(cx);
+    cx.update(|cx| {
+        for (preference, appearance, palette) in [
+            (
+                quarry_workbench::ThemePreference::Light,
+                quarry_workbench::ThemeAppearance::Light,
+                quarry_workbench::LIGHT,
+            ),
+            (
+                quarry_workbench::ThemePreference::Dark,
+                quarry_workbench::ThemeAppearance::Dark,
+                quarry_workbench::DARK,
+            ),
+        ] {
+            let resolved = quarry_workbench::ResolvedTheme {
+                preference,
+                appearance,
+                palette,
+                source_label: "Built-in".into(),
+                warning: None,
+            };
+            super::apply_resolved_theme(&resolved, cx);
+            let theme = gpui_kit::component::Theme::global(cx);
+            assert!(
+                theme.colors.table_active.a > 0.0 && theme.colors.table_active.a <= 0.30,
+                "table_active overlay must stay translucent for {appearance:?} so selected cell text remains readable (got alpha={})",
+                theme.colors.table_active.a
+            );
+            assert!(
+                theme.colors.list_active.a > 0.0 && theme.colors.list_active.a <= 0.30,
+                "list_active overlay must stay translucent for {appearance:?} so selected list text remains readable (got alpha={})",
+                theme.colors.list_active.a
+            );
+        }
+    });
+}

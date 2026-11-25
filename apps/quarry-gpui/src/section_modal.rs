@@ -5,11 +5,11 @@
 use std::path::PathBuf;
 use std::rc::Rc;
 
+use crate::operations::DialogAnchor;
 use gpui_kit::component::{
     ActiveTheme, Disableable, IndexPath, Sizable, WindowExt,
     button::{Button, ButtonVariants},
     checkbox::Checkbox,
-    dialog::Cancel as DialogCancel,
     input::{Input, InputEvent, InputState},
     select::{SearchableVec, Select, SelectEvent, SelectItem, SelectState},
 };
@@ -165,6 +165,7 @@ enum LastEditedField {
 
 struct OpenSectionDialogState {
     on_open_section: OpenSectionSubmitFn,
+    close_anchor: DialogAnchor,
     path: Option<PathBuf>,
     file_size: u64,
     unit: ByteUnit,
@@ -512,7 +513,7 @@ impl OpenSectionDialogState {
         let res = (self.on_open_section)(path, byte_window, options, window, cx);
         match res {
             Ok(()) => {
-                window.dispatch_action(Box::new(DialogCancel), cx);
+                self.close_anchor.cancel(window, cx);
                 true
             }
             Err(message) => {
@@ -636,6 +637,8 @@ pub fn open_section_dialog(
         s
     });
 
+    let close_anchor = DialogAnchor::new(cx);
+    let state_anchor = close_anchor.clone();
     let state = cx.new(|cx| {
         let subs = vec![
             cx.subscribe_in(
@@ -729,6 +732,7 @@ pub fn open_section_dialog(
         ];
         OpenSectionDialogState {
             on_open_section: Box::new(on_open_section),
+            close_anchor: state_anchor,
             path: initial_path,
             file_size: initial_size,
             unit: display_unit,
@@ -760,6 +764,8 @@ pub fn open_section_dialog(
         let on_closed_cb = on_closed.clone();
         let state_body = state.clone();
         let state_ok = state.clone();
+        let anchor_el = close_anchor.clone();
+        let anchor_cancel = close_anchor.clone();
         let can_open = {
             let st = state.read(cx);
             st.path.is_some() && st.error.is_none()
@@ -1135,15 +1141,17 @@ pub fn open_section_dialog(
             })
             .footer(
                 div()
+                    .relative()
                     .flex()
                     .items_center()
                     .justify_end()
                     .gap_2()
+                    .child(anchor_el.element())
                     .child(
                         Button::new("section-cancel")
                             .label("Cancel")
-                            .on_click(|_, window, cx| {
-                                window.dispatch_action(Box::new(DialogCancel), cx);
+                            .on_click(move |_, window, cx| {
+                                anchor_cancel.cancel(window, cx);
                             }),
                     )
                     .child(
