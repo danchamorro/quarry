@@ -3883,10 +3883,11 @@ fn run_section_filtered_export(
         if config.source_encoding.is_utf16() {
             source.seek(SeekFrom::Start(section_base))?;
         }
-        let mut scanner = crate::encoding::RecordScanner::at_offset(
+        let mut scanner = crate::encoding::RecordScanner::at_offset_with_bom_handling(
             delimiter,
             section_base,
             config.source_encoding,
+            !section_is_interior && source_had_bom,
         )?;
         let mut chunk = vec![0u8; config.source_encoding.chunk_size(config.chunk_bytes)];
         let mut cursor = section_base;

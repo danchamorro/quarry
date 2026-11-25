@@ -3216,6 +3216,26 @@ mod tests {
         assert_eq!(read_back.len(), 1);
         assert_eq!(read_back[0].fields, vec![b"\xEF\xBB\xBF".to_vec()]);
 
+        // Filtered section export must also preserve the sole literal U+FEFF row.
+        let filtered_out = dir.path().join("wc_sole_feff_filtered.csv");
+        let query = FilterQuery::single(0, FilterOperator::Equals, b"\xEF\xBB\xBF".to_vec());
+        let crate::FilterExportOutcome::Complete(export_summary) = wc_session
+            .start_filtered_export_with_edits_and_threads(
+                query,
+                Arc::new(BTreeMap::new()),
+                BTreeMap::new(),
+                &filtered_out,
+                None,
+            )
+            .unwrap()
+            .wait()
+            .unwrap()
+        else {
+            panic!("expected filtered export complete");
+        };
+        assert_eq!(export_summary.rows_written, 1);
+        assert!(!fs::read(&filtered_out).unwrap().is_empty());
+
         let SaveAsOutcome::Complete(saved) = wc_session
             .start_save_to_original(BTreeMap::new(), BTreeMap::new(), &sec)
             .unwrap()
