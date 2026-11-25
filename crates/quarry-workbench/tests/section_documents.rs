@@ -1464,3 +1464,183 @@ fn quote_free_materialized_section_disables_verify_boundary_and_still_splice_sav
     assert_eq!(fs::read(&path).unwrap(), b"1,a\n4,d\n");
     let _ = fs::remove_file(&path);
 }
+
+#[test]
+fn dormant_clean_section_retaining_redo_does_not_block_sibling_edits() {
+    let path = temp_csv("dormant-redo-sibling", b"id,val\n1,a\n2,b\n3,c\n");
+    let other_path = temp_csv("dormant-redo-other", b"k,v\n10,x\n");
+    let mut scheduler = WorkbenchScheduler::new(WorkbenchSchedulerConfig {
+        max_hydrated_tabs: 2,
+        ..WorkbenchSchedulerConfig::default()
+    });
+    scheduler.register_window(WindowId::PRIMARY);
+
+    let parent_id = match scheduler
+        .open_path(
+            WindowId::PRIMARY,
+            path.clone(),
+            OpenOptions::default(),
+            None,
+        )
+        .unwrap()
+    {
+        WakeOutcome::Ready { document_id, .. } => document_id,
+        other => panic!("unexpected open: {other:?}"),
+    };
+    wait_for_index(&mut scheduler, parent_id);
+
+    let sec_id = match scheduler
+        .open_section(
+            WindowId::PRIMARY,
+            path.clone(),
+            ByteWindow::new(7, 8).unwrap(), // "1,a\n2,b\n"
+            SectionOpenOptions {
+                quote_free_confirmed: true,
+                ..SectionOpenOptions::default()
+            },
+        )
+        .unwrap()
+    {
+        WakeOutcome::Ready { document_id, .. } => document_id,
+        other => panic!("unexpected section open: {other:?}"),
+    };
+    wait_for_index(&mut scheduler, sec_id);
+
+    // Delete a row in the section -> materializes working copy, then undo back to original file.
+    scheduler
+        .tab_mut(sec_id)
+        .unwrap()
+        .document
+        .as_mut()
+        .unwrap()
+        .start_delete_rows(std::iter::once(0..=0).collect())
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let done = scheduler.poll_structural_edits();
+        if let Some(c) = done.into_iter().find(|c| c.document_id == sec_id) {
+            c.result.unwrap();
+            break;
+        }
+        assert!(Instant::now() < deadline, "timed out waiting for insert");
+        thread::sleep(Duration::from_millis(10));
+    }
+    wait_for_index(&mut scheduler, sec_id);
+    scheduler.apply_undo_redo(sec_id, false).unwrap();
+    assert!(!scheduler.tab_is_dirty(sec_id));
+
+    // Activate parent, then open a third file to force the clean-with-Redo section dormant!
+    scheduler
+        .activate_tab(WindowId::PRIMARY, parent_id)
+        .unwrap();
+    let other_id = match scheduler
+        .open_path(
+            WindowId::PRIMARY,
+            other_path.clone(),
+            OpenOptions::default(),
+            None,
+        )
+        .unwrap()
+    {
+        WakeOutcome::Ready { document_id, .. } => document_id,
+        other => panic!("unexpected other open: {other:?}"),
+    };
+    wait_for_index(&mut scheduler, other_id);
+    scheduler
+        .activate_tab(WindowId::PRIMARY, parent_id)
+        .unwrap();
+
+    // The dormant section only retains Redo history — it is clean and must NOT block parent edits!
+    assert!(!scheduler.tab_is_dirty(sec_id));
+    assert!(
+        scheduler.sibling_dirty_conflict(parent_id).is_none(),
+        "dormant clean section retaining only Redo must not block sibling edits"
+    );
+
+    let _ = fs::remove_file(&path);
+    let _ = fs::remove_file(&other_path);
+}
+
+#[test]
+fn intact_section_working_copy_allows_save_section_as_new_recovery_after_parent_changes() {
+    let path = temp_csv("wc-recovery-parent", b"id,val\n1,a\n2,b\n3,c\n");
+    let recovery_dest = path.with_extension("recovered.csv");
+    let _ = fs::remove_file(&recovery_dest);
+
+    let mut scheduler = WorkbenchScheduler::new(WorkbenchSchedulerConfig::default());
+    scheduler.register_window(WindowId::PRIMARY);
+
+    let sec_id = match scheduler
+        .open_section(
+            WindowId::PRIMARY,
+            path.clone(),
+            ByteWindow::new(7, 8).unwrap(), // "1,a\n2,b\n"
+            SectionOpenOptions {
+                quote_free_confirmed: true,
+                ..SectionOpenOptions::default()
+            },
+        )
+        .unwrap()
+    {
+        WakeOutcome::Ready { document_id, .. } => document_id,
+        other => panic!("unexpected section open: {other:?}"),
+    };
+    wait_for_index(&mut scheduler, sec_id);
+
+    // Delete row 0 -> backed by intact private section working copy ("2,b\n").
+    scheduler
+        .tab_mut(sec_id)
+        .unwrap()
+        .document
+        .as_mut()
+        .unwrap()
+        .start_delete_rows(std::iter::once(0..=0).collect())
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let done = scheduler.poll_structural_edits();
+        if let Some(c) = done.into_iter().find(|c| c.document_id == sec_id) {
+            c.result.unwrap();
+            break;
+        }
+        assert!(Instant::now() < deadline, "timed out waiting for insert");
+        thread::sleep(Duration::from_millis(10));
+    }
+    wait_for_index(&mut scheduler, sec_id);
+
+    // Mutate the parent externally and mark the tab `source_changed`.
+    fs::write(&path, b"id,val\n9,external\n").unwrap();
+    {
+        let doc = scheduler
+            .tab_mut(sec_id)
+            .unwrap()
+            .document
+            .as_mut()
+            .unwrap();
+        doc.invalidate_changed_source();
+        // In-place Save must stay blocked, while Save Section As New recovery is allowed!
+        assert!(!doc.is_save_ready());
+        assert!(doc.start_save().is_err());
+        assert!(doc.is_save_as_ready());
+        doc.start_save_as(recovery_dest.clone()).unwrap();
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let saves = scheduler.poll_saves();
+        if let Some(c) = saves.into_iter().find(|s| s.document_id == sec_id) {
+            let (dest, in_place) = c.result.unwrap();
+            assert_eq!(dest, recovery_dest);
+            assert!(!in_place);
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for recovery export"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(fs::read(&recovery_dest).unwrap(), b"id,val\n2,b\n");
+
+    let _ = fs::remove_file(&path);
+    let _ = fs::remove_file(&recovery_dest);
+}

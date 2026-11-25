@@ -1982,6 +1982,16 @@ pub(crate) fn read_section_initial_rows(
     if section_start >= section_end || wanted == 0 {
         return Ok((Vec::new(), 0));
     }
+    if strip_bom_at_zero && section_start == 0 {
+        let bom = encoding.bom();
+        if !bom.is_empty() && section_end == bom.len() as u64 {
+            let mut probe = [0u8; 3];
+            let read = read_at_exact_or_eof(file, 0, &mut probe[..bom.len()])?;
+            if read == bom.len() && &probe[..bom.len()] == bom {
+                return Ok((Vec::new(), read as u64));
+            }
+        }
+    }
     let max_bytes = (section_end - section_start).min(limit as u64);
     let mut scanner = EncodedScanner::<false>::at_offset(delimiter, section_start, encoding)?;
     let chunk_cap = encoding.chunk_size(limit.clamp(16 * 1024, 256 * 1024));

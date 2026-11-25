@@ -3902,7 +3902,9 @@ fn slot_is_dirty(slot: &ManagedTab) -> bool {
         SlotResidency::Hydrated { .. } => slot.tab.is_dirty(),
         SlotResidency::Dormant(dormant) => match &dormant.kind {
             DormantKind::Dirty(dirty) => {
-                dirty.original_session.is_some()
+                let reading_working_copy =
+                    !dirty.session.is_compressed() && dirty.session.path() != dormant.logical_path;
+                reading_working_copy
                     || !dirty.cell_edits.is_empty()
                     || !dirty.header_renames.is_empty()
             }
@@ -3952,7 +3954,9 @@ fn slot_edit_revision(slot: &ManagedTab) -> u64 {
             }
         }
         SlotResidency::Dormant(dormant) => {
-            if let DormantKind::Dirty(dirty) = &dormant.kind {
+            if let DormantKind::Dirty(dirty) = &dormant.kind
+                && slot_is_dirty(slot)
+            {
                 1u8.hash(&mut hasher);
                 dirty.session.path().hash(&mut hasher);
                 dirty.original_session.is_some().hash(&mut hasher);

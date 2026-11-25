@@ -258,8 +258,14 @@ pub(crate) fn estimate_splice_preflight(
         None,
     );
     let suffix_len = parent_file_size.saturating_sub(aligned_end);
-    let estimated_required_bytes =
-        splice_peak_required_bytes(uses_cow, aligned_start, section_est, suffix_len);
+    let old_section_len = aligned_end.saturating_sub(aligned_start);
+    let estimated_required_bytes = if uses_cow && section_est == old_section_len {
+        // Same-length CoW splice (`CowInPlace`) only writes the section blocks without streaming
+        // the suffix.
+        section_est.saturating_mul(2)
+    } else {
+        splice_peak_required_bytes(uses_cow, aligned_start, section_est, suffix_len)
+    };
     Ok(SpliceDiskPreflight {
         available_bytes,
         estimated_required_bytes,
@@ -271,59 +277,61 @@ fn detect_encoded_line_ending(
     file: &File,
     read_base: u64,
     read_end: u64,
+    delimiter: u8,
     encoding: Encoding,
 ) -> Result<&'static [u8], QuarryError> {
     if read_base >= read_end {
         return Ok(b"\n");
     }
-    let sample_len = (read_end - read_base).min(64 * 1024) as usize;
-    let sample_len = if encoding.is_utf16() {
-        sample_len & !1
-    } else {
-        sample_len
+    const MAX_PROBE_BYTES: u64 = 256 * 1024;
+    let probe_end = read_end.min(read_base.saturating_add(MAX_PROBE_BYTES));
+    let mut scanner = crate::encoding::RecordScanner::at_offset(delimiter, read_base, encoding)?;
+    let mut chunk = vec![0u8; encoding.chunk_size(64 * 1024)];
+    let mut cursor = read_base;
+    let mut first_record_end: Option<u64> = None;
+
+    while cursor < probe_end && first_record_end.is_none() {
+        let remaining = probe_end - cursor;
+        let mut limit = chunk
+            .len()
+            .min(usize::try_from(remaining).unwrap_or(usize::MAX));
+        if encoding.is_utf16() {
+            limit &= !1;
+        }
+        if limit == 0 {
+            break;
+        }
+        let read = read_at_exact_or_eof(file, cursor, &mut chunk[..limit])?;
+        if read == 0 {
+            break;
+        }
+        scanner.scan_chunk(&chunk[..read], cursor, |abs_end| {
+            if first_record_end.is_none() {
+                first_record_end = Some(abs_end);
+            }
+        })?;
+        cursor += read as u64;
+    }
+
+    let Some(end) = first_record_end else {
+        return Ok(b"\n");
     };
-    if sample_len == 0 {
+    let tail_len = if encoding.is_utf16() { 4u64 } else { 2u64 };
+    if end.saturating_sub(read_base) < tail_len {
         return Ok(b"\n");
     }
-    let mut buf = vec![0u8; sample_len];
-    let read = read_at_exact_or_eof(file, read_base, &mut buf)?;
-    let slice = &buf[..read];
+    let mut tail = [0u8; 4];
+    let read = read_at_exact_or_eof(file, end - tail_len, &mut tail[..tail_len as usize])?;
+    if read < tail_len as usize {
+        return Ok(b"\n");
+    }
     match encoding {
-        Encoding::Utf16Le => {
-            let mut i = 0usize;
-            while i + 2 <= slice.len() {
-                if slice[i] == b'\n' && slice[i + 1] == 0 {
-                    if i >= 2 && slice[i - 2] == b'\r' && slice[i - 1] == 0 {
-                        return Ok(b"\r\n");
-                    }
-                    return Ok(b"\n");
-                }
-                i += 2;
-            }
-            Ok(b"\n")
+        Encoding::Utf16Le if tail == [b'\r', 0, b'\n', 0] => Ok(b"\r\n"),
+        Encoding::Utf16Be if tail == [0, b'\r', 0, b'\n'] => Ok(b"\r\n"),
+        Encoding::Utf8 | Encoding::Windows1252 | Encoding::Latin1 if &tail[..2] == b"\r\n" => {
+            Ok(b"\r\n")
         }
-        Encoding::Utf16Be => {
-            let mut i = 0usize;
-            while i + 2 <= slice.len() {
-                if slice[i] == 0 && slice[i + 1] == b'\n' {
-                    if i >= 2 && slice[i - 2] == 0 && slice[i - 1] == b'\r' {
-                        return Ok(b"\r\n");
-                    }
-                    return Ok(b"\n");
-                }
-                i += 2;
-            }
-            Ok(b"\n")
-        }
-        _ => {
-            if let Some(pos) = memchr::memchr(b'\n', slice)
-                && pos > 0
-                && slice[pos - 1] == b'\r'
-            {
-                return Ok(b"\r\n");
-            }
-            Ok(b"\n")
-        }
+        _ => Ok(b"\n"),
     }
 }
 
@@ -434,7 +442,8 @@ fn serialize_section_to_stage(
         read_base
     };
     let wrote_leading_bom = scan_start > read_base;
-    let default_ending = detect_encoded_line_ending(source, scan_start, read_end, encoding)?;
+    let default_ending =
+        detect_encoded_line_ending(source, scan_start, read_end, delimiter, encoding)?;
     if encoding.is_utf16() {
         source.seek(SeekFrom::Start(scan_start))?;
     }
@@ -837,8 +846,8 @@ fn run_section_splice(
         .map_err(|error| storage_error(parent_dir, error))?;
     let cow_supported = cow_output.is_some();
 
-    // 2. Advisory disk preflight before writing payload bytes (accounting for concurrent
-    //    `section.stage` + `output.stage` residency before `section.stage` is released).
+    // 2. Check the section-stage allowance before serialization. Do NOT budget for suffix copying
+    //    yet because a same-length CoW edit (`CowInPlace`) only writes the section blocks.
     let section_est = crate::estimate_edited_output_bytes_from_values(
         read_end.saturating_sub(read_base),
         0,
@@ -847,12 +856,10 @@ fn run_section_splice(
         None,
         None,
     );
-    let required =
-        splice_peak_required_bytes(cow_supported, aligned_start, section_est, suffix_len);
     shared
         .estimated_output_bytes
-        .store(required, Ordering::Release);
-    check_storage(parent_dir, required)?;
+        .store(section_est, Ordering::Release);
+    check_storage(parent_dir, section_est)?;
 
     if shared.cancel_requested.load(Ordering::Acquire) {
         return Ok(SaveWorkerOutcome::Cancelled);
@@ -914,8 +921,8 @@ fn run_section_splice(
         }
     }
 
-    // Revalidate remaining disk headroom using the exact materialized `new_section_len` now that
-    // `section.stage` is on disk and before allocating `output.stage` blocks.
+    // Revalidate remaining disk headroom using the exact materialized `new_section_len` and
+    // selected strategy now that `section.stage` is on disk and before allocating `output.stage`.
     let remaining_required = if cow_supported {
         if new_section_len == old_section_len {
             new_section_len
@@ -925,6 +932,10 @@ fn run_section_splice(
     } else {
         aligned_start.saturating_add(new_section_len.max(suffix_len))
     };
+    shared.estimated_output_bytes.store(
+        new_section_len.saturating_add(remaining_required),
+        Ordering::Release,
+    );
     check_storage(parent_dir, remaining_required)?;
 
     // 4. Assemble `output.stage` using CoW (in-place or consistent-snapshot clone) or streaming.
@@ -1095,6 +1106,9 @@ fn run_section_splice(
     }
     if !source_matches_stamp(&parent_file, &parent_path, &parent_stamp)? {
         return Err(QuarryError::SourceChanged);
+    }
+    if shared.cancel_requested.load(Ordering::Acquire) {
+        return Ok(SaveWorkerOutcome::Cancelled);
     }
     fs::rename(&output_stage_path, &parent_path)
         .map_err(|error| storage_error(parent_dir, error))?;
@@ -1552,8 +1566,13 @@ fn run_section_working_copy_op(
     };
     let wrote_leading_bom = scan_start > read_base;
 
-    let default_ending =
-        detect_encoded_line_ending(&source, scan_start, read_end, config.source_encoding)?;
+    let default_ending = detect_encoded_line_ending(
+        &source,
+        scan_start,
+        read_end,
+        delimiter,
+        config.source_encoding,
+    )?;
     let blank_row_utf8: Option<Vec<u8>> = match &op {
         SectionWorkingOp::InsertRows(ins) => {
             let mut row = Vec::with_capacity(ins.width.saturating_sub(1) + default_ending.len());
@@ -2716,6 +2735,20 @@ mod tests {
 
         let wc_session =
             Session::open_section_working_copy(&wc_del_all, &sec, OpenOptions::default()).unwrap();
+        assert!(
+            wc_session.first_rows.is_empty(),
+            "BOM-only section working copy must bootstrap with 0 rows"
+        );
+        let wc_idx = wc_session
+            .start_indexing(IndexConfig::default())
+            .unwrap()
+            .wait()
+            .unwrap();
+        assert_eq!(
+            wc_idx.indexed_rows(),
+            0,
+            "BOM-only section working copy must index 0 rows"
+        );
         let SaveAsOutcome::Complete(saved) = wc_session
             .start_save_to_original(BTreeMap::new(), BTreeMap::new(), &sec)
             .unwrap()
@@ -2728,6 +2761,38 @@ mod tests {
         assert_eq!(sp.rows_written, 0);
         assert_eq!(sp.section_bytes_written, 3);
         assert_eq!(fs::read(&path).unwrap(), b"\xEF\xBB\xBFgamma,3\n");
+
+        // Reopening the spliced BOM-only section `[0, 3)` must also report 0 bootstrap & indexed rows.
+        let reopened = Session::open_section_preserved(
+            &path,
+            sp.new_bounds,
+            &sp.published_guard,
+            b',',
+            Encoding::Utf8,
+            SectionOpenOptions {
+                open: OpenOptions {
+                    delimiter: Some(b','),
+                    header_mode: HeaderMode::NoHeader,
+                    ..OpenOptions::default()
+                },
+                ..SectionOpenOptions::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            reopened.first_rows.is_empty(),
+            "reopened BOM-only spliced section must bootstrap with 0 rows"
+        );
+        let reopened_idx = reopened
+            .start_indexing(IndexConfig::default())
+            .unwrap()
+            .wait()
+            .unwrap();
+        assert_eq!(
+            reopened_idx.indexed_rows(),
+            0,
+            "reopened BOM-only spliced section must index 0 rows"
+        );
     }
 
     #[test]
@@ -3016,5 +3081,40 @@ mod tests {
             .filter(|&r| r % 2 == 1 && !(10..=12).contains(&r))
             .collect();
         assert_eq!(kept_ids, expected);
+    }
+
+    #[test]
+    fn section_row_insert_detects_crlf_at_record_boundary_ignoring_quoted_lf() {
+        let dir = TempDir::new().unwrap();
+        let content = b"\"first\nline\",x\r\nnext,y\r\n";
+        let path = write_fixture(&dir, "quoted_lf_crlf.csv", content);
+        let sec = open_verified_section(
+            &path,
+            ByteWindow::new(0, content.len() as u64).unwrap(),
+            None,
+            HeaderMode::NoHeader,
+        );
+        let wc = dir.path().join("wc_crlf.csv");
+        let SaveAsOutcome::Complete(_) = sec
+            .start_create_working_copy_inserting_rows(
+                BTreeMap::new(),
+                BTreeMap::new(),
+                RowInsertion {
+                    position: 1,
+                    count: 1,
+                    width: 2,
+                },
+                &wc,
+            )
+            .unwrap()
+            .wait()
+            .unwrap()
+        else {
+            panic!("expected row insert complete");
+        };
+        assert_eq!(
+            fs::read(&wc).unwrap(),
+            b"\"first\nline\",x\r\n,\r\nnext,y\r\n"
+        );
     }
 }

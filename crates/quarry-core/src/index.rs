@@ -579,6 +579,7 @@ struct JobResumeContext {
     path: PathBuf,
     file_size: u64,
     section_range: Option<(u64, u64)>,
+    strip_bom_at_zero: bool,
     delimiter: u8,
     encoding: Encoding,
     config: IndexConfig,
@@ -864,6 +865,7 @@ impl IndexJob {
             path: session.path.clone(),
             file_size: session.file_size,
             section_range,
+            strip_bom_at_zero: !session.section_is_interior(),
             delimiter: session.dialect.delimiter,
             encoding: session.encoding,
             config,
@@ -999,6 +1001,7 @@ impl IndexJob {
                         file,
                         ctx.file_size,
                         ctx.section_range,
+                        ctx.strip_bom_at_zero,
                         ctx.delimiter,
                         ctx.encoding,
                         ctx.config,
@@ -1297,6 +1300,7 @@ fn run_indexer(
     file: File,
     file_size: u64,
     section_range: Option<(u64, u64)>,
+    strip_bom_at_zero: bool,
     delimiter: u8,
     encoding: Encoding,
     config: IndexConfig,
@@ -1314,6 +1318,7 @@ fn run_indexer(
             &file,
             section_base,
             section_end,
+            strip_bom_at_zero,
             delimiter,
             encoding,
             config,
@@ -1362,6 +1367,7 @@ fn run_indexer(
                 &file,
                 0,
                 file_size,
+                false,
                 delimiter,
                 encoding,
                 config,
@@ -1407,7 +1413,7 @@ fn run_indexer(
     }
 
     let paused = run_sequential_indexer_range(
-        &file, 0, file_size, delimiter, encoding, config, tuning, None, shared,
+        &file, 0, file_size, false, delimiter, encoding, config, tuning, None, shared,
     )?;
     Ok((file, paused))
 }
@@ -1417,6 +1423,7 @@ fn run_sequential_indexer_range(
     file: &File,
     range_start: u64,
     range_end: u64,
+    strip_bom_at_zero: bool,
     delimiter: u8,
     encoding: Encoding,
     config: IndexConfig,
@@ -1433,6 +1440,23 @@ fn run_sequential_indexer_range(
         let mut index = shared.index.write().unwrap();
         index.telemetry.effective_workers = 1;
         index.telemetry.simd_backend = backend;
+    }
+
+    if strip_bom_at_zero && range_start == 0 && resume_from.is_none() {
+        let bom = encoding.bom();
+        if !bom.is_empty() && range_end == bom.len() as u64 {
+            let mut probe = [0u8; 3];
+            let read = read_at_exact_or_eof(file, 0, &mut probe[..bom.len()])?;
+            if read == bom.len() && &probe[..bom.len()] == bom {
+                let bom_len = read as u64;
+                shared.bytes_read.fetch_add(bom_len, Ordering::Relaxed);
+                shared.bytes_scanned.store(bom_len, Ordering::Release);
+                let mut index = shared.index.write().unwrap();
+                index.indexed_bytes = bom_len;
+                index.last_record_end = bom_len;
+                return Ok(None);
+            }
+        }
     }
 
     let (mut absolute_start, mut scanner) = match resume_from {

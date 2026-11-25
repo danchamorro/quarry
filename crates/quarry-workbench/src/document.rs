@@ -3257,11 +3257,19 @@ impl Document {
     }
 
     pub fn is_save_as_ready(&self) -> bool {
-        (self.is_dirty()
-            || self.has_reordered_columns()
-            || self.compressed_save_as_ready()
-            || self.is_section())
-            && self.save_operations_ready()
+        let recoverable_section_copy = self.source_changed
+            && self.is_section()
+            && self.session.section_backed_by_working_copy()
+            && !self.join_reserved()
+            && self.save_job.is_none()
+            && self.export_job.is_none()
+            && self.structural_job.is_none();
+        recoverable_section_copy
+            || ((self.is_dirty()
+                || self.has_reordered_columns()
+                || self.compressed_save_as_ready()
+                || self.is_section())
+                && self.save_operations_ready())
     }
 
     pub fn save_operations_ready(&self) -> bool {
@@ -3294,7 +3302,13 @@ impl Document {
             return Err(AppMessage::warning(JOIN_INPUT_RESERVED));
         }
         if self.source_changed {
-            return Err(AppMessage::warning(SOURCE_CHANGED_NOTICE));
+            let recoverable_section_copy = destination.is_some()
+                && self.is_section()
+                && self.session.section_backed_by_working_copy()
+                && self.session.ensure_source_unchanged().is_ok();
+            if !recoverable_section_copy {
+                return Err(AppMessage::warning(SOURCE_CHANGED_NOTICE));
+            }
         }
         if self.structural_job.is_some() {
             return Err(AppMessage::warning(
