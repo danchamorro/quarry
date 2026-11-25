@@ -184,6 +184,20 @@ impl Grid {
         doc.columns.visible.get(column - 1).copied()
     }
 
+    /// Maps a physical `source_row` to its rendered `table_row` index (including under filters).
+    pub fn display_row_for_source(&self, source_row: u64, cx: &App) -> Option<usize> {
+        let controller = self.controller.read(cx);
+        let doc = controller.active_document(self.window_id)?;
+        if doc.filter_active() {
+            doc.filtered_rows
+                .iter()
+                .position(|r| r.row == source_row)
+                .map(|rel| (doc.filter_buffer_start as usize).saturating_add(rel))
+        } else {
+            usize::try_from(source_row.checked_sub(doc.data_start)?).ok()
+        }
+    }
+
     /// Maps a physical `(source_row, source_column)` to rendered `(table_row, table_column)` when visible.
     pub fn display_position_for_source(
         &self,
@@ -191,6 +205,7 @@ impl Grid {
         source_col: usize,
         cx: &App,
     ) -> Option<(usize, usize)> {
+        let table_row = self.display_row_for_source(source_row, cx)?;
         let controller = self.controller.read(cx);
         let doc = controller.active_document(self.window_id)?;
         let table_col = doc
@@ -199,14 +214,6 @@ impl Grid {
             .iter()
             .position(|&c| c == source_col)
             .map(|ix| ix + 1)?;
-        let table_row = if doc.filter_active() {
-            doc.filtered_rows
-                .iter()
-                .position(|r| r.row == source_row)
-                .map(|rel| (doc.filter_buffer_start as usize).saturating_add(rel))?
-        } else {
-            usize::try_from(source_row.checked_sub(doc.data_start)?).ok()?
-        };
         Some((table_row, table_col))
     }
 

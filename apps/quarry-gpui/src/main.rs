@@ -1625,7 +1625,7 @@ impl QuarryWindow {
                 table_row,
                 source_row,
                 position,
-            } => self.open_row_context_menu(table_row, source_row, position, window, cx),
+            } => self.open_row_context_menu(Some(table_row), source_row, position, window, cx),
             GridAction::CellContextMenu {
                 table_row,
                 table_col,
@@ -1674,13 +1674,11 @@ impl QuarryWindow {
                 })
         };
         if let Some(source_row) = target_row {
-            let table_row = {
-                let controller = self.controller.read(cx);
-                controller
-                    .active_document(self.window_id)
-                    .map(|doc| source_row.saturating_sub(doc.data_start) as usize)
-                    .unwrap_or(0)
-            };
+            let table_row = self
+                .table
+                .read(cx)
+                .delegate()
+                .display_row_for_source(source_row, cx);
             self.open_row_context_menu(table_row, source_row, default_pos, window, cx);
             return;
         }
@@ -1859,7 +1857,7 @@ impl QuarryWindow {
 
     fn open_row_context_menu(
         &mut self,
-        table_row: usize,
+        table_row: Option<usize>,
         source_row: u64,
         position: Point<Pixels>,
         window: &mut Window,
@@ -1868,20 +1866,19 @@ impl QuarryWindow {
         self.controller.update(cx, |controller, cx| {
             controller.ensure_row_selected_for_context_menu(self.window_id, source_row, cx);
         });
-        self.table.update(cx, |table, cx| {
-            table.delegate().record_gutter_mouse_selection(table_row);
-            table.set_selected_cell(table_row, 0, cx);
-        });
+        if let Some(table_row) = table_row {
+            self.table.update(cx, |table, cx| {
+                table.delegate().record_gutter_mouse_selection(table_row);
+                table.set_selected_cell(table_row, 0, cx);
+            });
+        }
         let Some((bookmarked, can_insert_rows, can_delete_rows, display_row)) = ({
             let controller = self.controller.read(cx);
             controller.active_document(self.window_id).map(|doc| {
                 let row_structural_ok = doc.row_structural_edit_disabled_reason().is_none()
                     && doc.structural_job.is_none()
                     && doc.pending_materialization.is_none();
-                let data_row_1based = source_row
-                    .saturating_sub(doc.data_start)
-                    .saturating_add(1)
-                    .max((table_row as u64).saturating_add(1));
+                let data_row_1based = source_row.saturating_sub(doc.data_start).saturating_add(1);
                 (
                     doc.bookmarks.contains_row(source_row),
                     doc.insertion_disabled_reason(true).is_none() && row_structural_ok,

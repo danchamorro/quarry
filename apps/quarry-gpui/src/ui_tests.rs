@@ -4074,6 +4074,14 @@ fn row_copy_works_after_cell_selection_and_under_active_filter(cx: &mut TestAppC
             controller.update(cx, |c, cx| {
                 c.select_row_active(win_id, 3, false, false, cx);
             });
+            q.open_context_menu_action(&crate::OpenContextMenu, window, cx);
+            assert!(q.grid_context_menu.is_some());
+            assert_eq!(
+                q.table.read(cx).selected_cell(),
+                Some((1, 0)),
+                "Shift+F10 on filtered source row 3 (match index 1) must select table row 1, not source offset 2"
+            );
+            q.close_grid_context_menu(cx);
             q.copy_action(&crate::CopySelection, window, cx);
         });
     })
