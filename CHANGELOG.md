@@ -15,6 +15,11 @@ parentheses are GitHub pull requests.
 - Added in-place guarded **Save** (`Cmd+S` / `Ctrl+S`) for verified sections, splicing edited section bytes back into the parent file using copy-on-write cloning on APFS and supported Linux filesystems (with streaming fallback elsewhere), advisory disk-space checks, and automatic parent reload notices in open sibling tabs. Documented in [ADR 0015](docs/adr/0015-guarded-section-splice-save.md). (#213)
 - Added section-scoped **Insert Rows…**, **Delete Selected Rows**, **Replace All**, and **Undo** / **Redo** for verified sections while keeping header edits, column schema changes, **Sort**, **Find Duplicates**, and **Join Files** routed to **Save Section As New…**. (#213)
 
+### Fixed
+
+- Fixed modal dialog confirm and cancel buttons (**Sort Rows**, **Clean Selected Columns**, **Split Column**, **Open Section…**, and other dialogs) so clicking the primary action or **Cancel** works on the first click even when a dropdown or text input still holds focus. (#216)
+- Fixed active grid cell and list selection highlights so selected cell text remains clearly readable in both Light and Dark themes instead of being obscured by an opaque selection fill. (#216)
+
 ## [2026-11-24]
 
 ### Added
