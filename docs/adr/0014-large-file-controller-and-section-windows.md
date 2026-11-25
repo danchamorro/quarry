@@ -2,7 +2,7 @@
 
 **Status:** Accepted (`2026-11-24`, Owner sign-off `T11`)
 **Date:** 2026-11-24
-**Related:** [ADR 0001: Initial engine architecture](0001-initial-engine.md), [ADR 0005: Editing and safe saving](0005-editing-and-safe-saving.md), [ADR 0007: Document tabs and dormancy](0007-document-tabs.md)
+**Related:** [ADR 0001: Initial engine architecture](0001-initial-engine.md), [ADR 0005: Temporary storage](0005-temporary-storage.md), [ADR 0007: Document tabs and dormancy](0007-document-tabs.md)
 
 ## Context
 

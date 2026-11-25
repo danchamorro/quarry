@@ -1,64 +1,37 @@
 # Quarry Roadmap
 
-The [Quarry Roadmap project](https://github.com/users/danchamorro/projects/1) is
-the authoritative home for **all future roadmap items**, including exploratory
-ideas, engineering investigations, planned features, priorities, and release
-targets. Each item has a linked [issue](https://github.com/danchamorro/quarry/issues)
-for its problem, scope, design questions, and acceptance or discovery criteria.
+Quarry's live backlog, open issues, and current priorities are tracked on GitHub:
 
-Create and update roadmap items there. Do not maintain a separate future-work
-list or ordered backlog in this file, the Wiki, or another repository document.
+- [Quarry GitHub Project](https://github.com/users/danchamorro/projects/1)
+- [Open GitHub Issues](https://github.com/danchamorro/quarry/issues)
+- [Changelog](../CHANGELOG.md)
+- [v1.0 Claim Contract Ledger](V1_CLAIM_LEDGER.md)
 
-## Product focus
+## Product Direction
 
-Quarry focuses on correct, responsive editing of delimited files larger than RAM.
-New workflows must preserve bounded memory, explicit progress and cancellation,
-source safety, and useful keyboard and accessibility behavior. The existing egui
-desktop application remains the main application.
+Quarry is a free, open-source (`MIT OR Apache-2.0`), 100% local-first desktop and CLI editor for multi-gigabyte CSV, TSV, and delimited text files on **macOS** and **Linux / Omarchy**.
 
-## Using the roadmap
+The production desktop application is built with Rust and **GPUI** (`apps/quarry-gpui`, [ADR 0013](adr/0013-adopt-gpui-desktop-frontend.md)) on top of the shared headless engine (`crates/quarry-core`, `crates/quarry-delimited`, `crates/quarry-workbench`). The earlier `egui` desktop prototype (`apps/quarry-egui`) was retired after GPUI reached full feature parity and cut over as the shipping application.
 
-- **Backlog:** all tracked work, including ideas awaiting prioritization or design.
-- **Ideas:** exploratory issues labeled `idea`; recording an idea is not a promise
-  to implement it. Agree on scope before moving it to Ready, and remove the label
-  when it becomes an accepted implementation item.
-- **Active work:** the workflow board from Backlog through Done.
-- **Releases:** work grouped by Target release. **Unscheduled** means no release
-  commitment; a merged change may ship in a later packaged release.
+## Shipped Highlights (on `main`)
 
-The project's Priority, Area, Target release, and Status fields hold current
-planning decisions. Maintainers triage new issues, split broad investigations
-into focused implementation issues, and link pull requests to the work they
-complete. See [Contributing](CONTRIBUTING.md#proposing-and-tracking-work).
+- **Core streaming engine & CLI (`quarry-cli`):** Parallel positional `pread`/`seek_read` I/O (no `mmap` on user source files), 64-byte SIMD structural indexing (Apple Silicon NEON and x86_64 AVX2), privacy-preserving persistent sidecar index cache, and multi-encoding + `.csv.gz` support.
+- **Parallel out-of-core transforms:** Adaptive 300 MB in-RAM fast path with automatic bounded disk spilling, persisted scratch directory, multi-threaded stable Sort (1–16 columns including Natural and Date/time), parallel Find & Remove Duplicates (key columns or whole rows), parallel Replace All, and partitioned multi-threaded Hash-Join with sort-merge skew fallback.
+- **GPU-accelerated desktop workbench (`quarry-gpui`):** Native macOS and Linux/Omarchy Wayland/Hyprland UI, Light / WCAG AA Dark / System / live Omarchy theme sync, multi-window support for up to 200 open tabs with automatic dormant-tab eviction (`< 128` open FDs), AccessKit (macOS) and AT-SPI (Linux) accessibility, and zero network/telemetry dependencies.
+- **Large-file controls, sections & bookmarks:** Pause/Resume Indexing, Live Resource HUD (`phys_footprint` / `VmRSS` and free disk), **Open Section…** (`Bytes`–`TiB`, verified on a 20 TiB sparse file) with outward boundary snapping, `Verified` vs `Speculative` boundary verification, **Save Section As New File**, **Guarded Section Splice-Save** (APFS CoW / Linux `FICLONE` with streaming fallback), and **Session Row Bookmarks**.
 
-## Documentation and evidence
+## Upcoming Toward v1.0
 
-The [User Guide](USER_GUIDE.md) documents current-source behavior, and
-[GitHub Releases](https://github.com/danchamorro/quarry/releases) defines what is
-included in each packaged build. Architecture documents and ADRs retain design
-rationale and link to issues when future investigation is relevant. Release
-acceptance evidence remains in the [beta checklist](BETA_RELEASE_CHECKLIST.md).
+Upcoming milestones are broken into issues just-in-time on the [GitHub Project](https://github.com/users/danchamorro/projects/1):
 
-[Roadmap history](ROADMAP_HISTORY.md) preserves the earlier phase checklists and
-benchmark evidence as an archival snapshot. Its unfinished items and later ideas
-have been captured in Projects; the archive is not an active planning list.
+1. **Large-file ergonomics & live streaming:** Adaptive word wrap with automatic scale-back on large files, and opt-in append-only **Live Watch Mode** for actively growing files.
+2. **Power-user UX & querying:** Interactive `/` regex & expression query bar, keyboard-first navigation (`hjkl`, `gg`, `G`), fuzzy Command Palette (`Cmd/Ctrl+K`), Cell Inspector Drawer (JSON, stack traces, Markdown), Smart Copy (`CSV`, `Markdown`, `JSON`, `SQL IN`), multi-row freeze & column pinning, async column summary headers, Focus Mode, and custom TOML themes.
+3. **Splitting, combining & format conversion:** Guided File Splitter (every N rows or at bookmarked rows with header/footer injection), Combine Files v2 (opt-in column alignment, schema-drift flagging, `_source_file` column), `.csv.zst` support, format converters (`CSV`/`TSV`/`PSV`/`JSON`/`NDJSON`/`Markdown`), and reusable custom CSV format profiles.
+4. **Analysis & data tools:** Out-of-core Pivot Tables (`SUM`, `AVG`, `COUNT`, `MIN`, `MAX`), Autofill (series/dates) & Flash Fill by example, Combine Lines rollup, Transpose, and Extract Frequent Strings.
+5. **Cross-platform packaging & release verification:** Signed/notarized macOS builds (Apple Silicon and Intel), Linux distribution packages, hardware-verified 120 Hz frame pacing and accessibility checks, and full [v1.0 Claim Contract Ledger](V1_CLAIM_LEDGER.md) reconciliation.
 
-## Post-beta sequence
+## Governance
 
-Follow priorities and dependencies in the [live project](https://github.com/users/danchamorro/projects/1).
-This section remains a navigation destination for older links, not a second
-ordered feature list.
-
-<a id="phase-6d-date-and-time-sorting-planned"></a>
-
-### Former Phase 6D: Date and time sorting
-
-The former Phase 6D is tracked in [issue #56](https://github.com/danchamorro/quarry/issues/56).
-Its scope, parsing decisions, and acceptance criteria belong in that issue.
-
-## Platform direction
-
-Platform investigations and scheduling are tracked in the
-[project](https://github.com/users/danchamorro/projects/1). The
-[beta platform matrix](BETA_RELEASE_CHECKLIST.md#platform-matrix) records what
-has actually been validated; a roadmap item does not establish platform support.
+- Use GitHub Issues and the Project board to track concrete bugs, features, and PR progress.
+- Every shipped claim in public release documentation is reconciled against empirical evidence in [`docs/V1_CLAIM_LEDGER.md`](V1_CLAIM_LEDGER.md).
+- Keep all source builds and official releases completely free and open source under `MIT OR Apache-2.0` with zero telemetry and zero network calls.

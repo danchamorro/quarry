@@ -1,269 +1,94 @@
-# Quarry Design Guide
+# Quarry Design System
 
-This guide covers how Quarry looks and behaves on screen. Follow it when you add
-or change any UI in `apps/quarry-gpui` or semantic palette tokens in
-`crates/quarry-workbench/src/theme.rs`. It explains where things go and which
-shared pieces to use, so new features look like they belong.
+Quarry is a calm, high-density desktop tool for inspecting and editing massive delimited files on **macOS** and **Linux / Omarchy**. The data grid is the centerpiece; chrome stays quiet so numbers, text, and selection stand out immediately.
 
-The code is the source of truth for exact values:
+## Architecture and Source of Truth
 
-| File | Owns |
-|---|---|
-| `crates/quarry-workbench/src/theme.rs` | UI-neutral Light, Dark, and Omarchy semantic palette tokens & WCAG AA contrast checks |
-| `apps/quarry-gpui/src/menus.rs` | Native macOS menu bar and Linux `AppMenuBar` menu actions |
-| `apps/quarry-gpui/src/workbench.rs` | Process-wide `WorkbenchController` over `WorkbenchScheduler` |
-| `apps/quarry-gpui/src/main.rs` | Window chrome, tab strip, toolbar, virtualized grid, status bar, Live Resource HUD |
-| `apps/quarry-gpui/src/find_bar.rs`, `operations.rs`, `workflows_ui.rs` | Find & Replace bar, operation modals, multi-file workflows |
+| Layer | Location | Responsibility |
+|---|---|---|
+| **Design tokens & palettes** | [`crates/quarry-workbench/src/theme.rs`](../crates/quarry-workbench/src/theme.rs) | Frontend-neutral RGBA semantic palettes (**Light**, WCAG AA **Dark**, and derived **Omarchy** palettes), contrast guards, theme preference persistence, and numeric-alignment classification. |
+| **GPUI theme bridge, window & dialogs** | [`apps/quarry-gpui/src/main.rs`](../apps/quarry-gpui/src/main.rs), `panels.rs`, `operations.rs`, `section_modal.rs`, `workflows_ui.rs`, `find_bar.rs` | Maps `quarry_workbench::theme::Palette` onto `gpui-kit` tokens and renders Quarry's window chrome, toolbar, popovers, modals, banners, and find/replace controls. |
+| **Menus & shortcuts** | [`apps/quarry-gpui/src/menus.rs`](../apps/quarry-gpui/src/menus.rs) | Native macOS application menu bar, Linux in-window `AppMenuBar`, and platform keybindings (`Command` on macOS, `Ctrl` on Linux). |
+| **Workbench shell & GPU grid** | [`apps/quarry-gpui/src/workbench.rs`](../apps/quarry-gpui/src/workbench.rs), [`apps/quarry-gpui/src/grid.rs`](../apps/quarry-gpui/src/grid.rs) | Multi-window GPUI tab/document orchestration, virtualized GPU grid, `#` row gutter (selection + bookmark dots), status bar, and Live Resource HUD. |
+| **Frontend ADR** | [ADR 0013](adr/0013-adopt-gpui-desktop-frontend.md) | Adopts GPUI (`gpui-kit`) for macOS and Linux/Omarchy, superseding the historical egui bake-off ([ADR 0003](adr/0003-select-egui-ui.md)). |
 
-## Principles
+Never hardcode ad-hoc RGB colors in views or dialogs. Always read semantic roles from `Palette` so every control renders legibly across **Light**, **Dark**, **System**, and **Omarchy** themes.
 
-1. **The data is the interface.** The grid gets the most space and the most
-   contrast. Chrome (toolbar, tabs, status bar) stays quiet and neutral.
-2. **Native first.** Quarry should feel native on macOS and Linux/Omarchy: system
-   fonts (`CoreText` / `cosmic-text`), native menu bars, platform-native
-   shortcuts, and OS accessibility (`accesskit_macos` / `accesskit_unix`).
-3. **Calm, high-contrast palettes.** Quarry ships WCAG AA Light, Dark, and
-   hardened local Omarchy theme sync (`View → Theme`), all drawn from shared
-   semantic tokens in `crates/quarry-workbench/src/theme.rs`.
-4. **Amber means "this one."** The brand amber marks selection, focus, the
-   active filter, unsaved work, and the single primary action in a dialog.
-   Don't use it for decoration.
-5. **One way to do each thing.** Use the shared components below. Don't style a
-   button, frame, or color inline.
-6. **Calm under load.** Progress, cancel, and status messages live in the status
-   bar. Only warnings and errors interrupt, as a banner.
+---
 
-## Color
+## Color System
 
-Every color comes from `theme::Palette`. Get the palette and use its semantic
-names:
+Quarry ships four theme modes under **View → Theme**:
 
-```rust
-let palette = theme::ui_palette(ui);      // inside a Ui
-let palette = theme::ctx_palette(ctx);    // with only a Context
-ui.colored_label(palette.text_secondary, "Detected: Comma");
-```
+1. **System** — follows macOS or Linux dark/light appearance automatically.
+2. **Light** — warm paper neutrals with brand amber (`#E9C46A`) reserved for selection, focus, bookmarks, and primary accents.
+3. **Dark** — deep slate charcoal surfaces (`#131417` canvas, `#1A1B1E` chrome) engineered for WCAG AA contrast with brand amber accents.
+4. **Omarchy** — hardened live local theme sync on Linux/Omarchy (reading `~/.config/omarchy`, `~/.local/share/omarchy`, `~/.local/state/omarchy` within a strict symlink allowlist and 64 KiB file cap; falls back to Dark if unavailable).
 
-**Never write `Color32::from_rgb(...)` outside `theme.rs`.** Hard-coded colors
-drift from the palette. If no token fits, add one to `Palette` and give it a
-value in `LIGHT`.
+### Semantic Palette Roles (`quarry_workbench::theme::Palette`)
 
-`theme::configure` sets egui's theme to Light. `install_light_appearance` in
-`main.rs` sets AppKit's appearance to Aqua, so native windows such as the file
-picker stay light too. Menu-bar menus still follow macOS, because the system
-draws them.
+| Role | Light (`rgb`) | Dark (`rgb`) | Usage |
+|---|---|---|---|
+| `chrome` | `246, 245, 243` | `26, 27, 30` | Title bar, tab bar, toolbar, status bar |
+| `separator` | `222, 220, 216` | `52, 54, 60` | Hairlines separating chrome bands and panels |
+| `canvas` | `255, 255, 255` | `19, 20, 23` | Grid cells, modals, and popover backgrounds |
+| `zebra` | `250, 249, 247` | `24, 25, 29` | Alternating grid rows |
+| `grid_line` | `236, 234, 230` | `37, 39, 44` | Subtle cell gridlines |
+| `header_fill` | `248, 247, 245` | `29, 30, 34` | Column header band and row-number gutter |
+| `text` | `29, 29, 27` | `236, 235, 231` | Primary cell and UI copy |
+| `text_secondary` | `104, 102, 97` | `168, 166, 160` | Column headers, status metadata, helper text |
+| `text_tertiary` | `150, 147, 141` | `122, 120, 115` | Placeholders, disabled controls |
+| `hover` / `pressed` | `232,230,226` / `220,218,213` | `39,41,46` / `49,51,58` | Borderless toolbar and menu interaction states |
+| `control` / `control_border` | `255,255,255` / `211,209,204` | `31,33,38` / `66,69,77` | Inputs, dropdown triggers, secondary buttons |
+| `selection` | `252, 238, 200` | `66, 54, 27` | Selected cells, rows, and columns |
+| `selection_strong` | `233, 196, 106` (`ACCENT`) | `233, 196, 106` (`ACCENT`) | Primary action fills, focus rings, selected header accents |
+| `on_accent` | `43, 33, 10` | `33, 25, 8` | High-contrast label text rendered over `selection_strong` |
+| `accent_text` | `138, 96, 10` | `239, 206, 122` | Row numbers, bookmark markers, unsaved indicators, links |
+| `error_text` / `error_fill` | `178,45,35` / `253,236,233` | `255,146,138` / `64,25,23` | Error banners, invalid inputs, destructive confirmation |
+| `warning_text` / `warning_fill` | `128,84,0` / `255,245,219` | `245,201,102` / `59,44,16` | Speculative section trust badges, storage/conflict warnings |
+| `success_text` | `29, 120, 74` | `110, 214, 152` | Verified section badges, completion confirmation |
+| `mark` | `150, 147, 141` | `122, 120, 115` | Inline whitespace dots (`·`) and `[TAB]`/`[LF]` tokens |
+| `indicator_fill` / `indicator_stroke` | `111,145,150` / `57,77,84` | `124,168,174` / `184,216,220` | Clipped-whitespace corner indicator |
 
-| Token | Use for |
-|---|---|
-| `chrome` | Toolbar, tab strip, status bar, find bar |
-| `separator` | Hairlines between chrome and content |
-| `canvas` | Grid and dialog backgrounds |
-| `zebra` | Alternate grid rows; soft inset panels inside dialogs |
-| `grid_line` | Lines between cells |
-| `header_fill` | Column header and row-number gutter; active tab |
-| `text`, `text_secondary`, `text_tertiary` | Primary text; supporting text, including row and column numbers; decorative marks and placeholders only (below 4.5:1, never for text people must read) |
-| `hover`, `pressed` | Fills for borderless controls |
-| `control`, `control_border` | Framed buttons, fields, and combo boxes |
-| `selection` | Selected cells, rows, columns, and segments (soft amber) |
-| `selection_strong` | Focus ring, selected column number, active-filter outline (amber) |
-| `on_accent` | Text on amber fills |
-| `accent_text` | Unsaved marker, links, amber text on neutral backgrounds |
-| `error_text` / `error_fill`, `warning_text` / `warning_fill` | Banners and inline validation |
-| `success_text` | Completed states, such as "Index complete" |
-| `mark` | Whitespace marks inside cells |
-| `indicator_fill`, `indicator_stroke` | The whitespace indicator in a cell's corner |
+All semantic text/fill pairs are validated against WCAG 2.1 AA contrast ratios in unit tests inside `crates/quarry-workbench/src/theme.rs`.
 
-egui's `ui.visuals().error_fg_color` and `warn_fg_color` map to the same tokens,
-so `ui.colored_label(ui.visuals().error_fg_color, message)` is fine for inline
-errors.
+---
 
 ## Typography
 
-Quarry loads the macOS system faces at startup (`theme::install_fonts`): SF Pro
-for text and SF Mono for monospace. On other platforms, or if the files are
-missing, egui's bundled fonts are used.
+- **UI and grid text:** Native platform text shaping via GPUI (`CoreText` on macOS, `cosmic-text` / FreeType on Linux). Default grid cell font size is **`13.0 pt`** (`GRID_FONT_SIZE`).
+- **Tabular numbers (`tnum`):** Numeric values and row numbers render with OpenType `tnum` tabular figures so digits align vertically down every column. Columns classified as numeric right-align automatically for fast visual scanning.
+- **Hierarchy:** Dialog titles, active tab labels, and primary actions use clear weight and contrast separation; secondary metadata (row counts, file sizes, encoding, Live Resource HUD) uses `text_secondary` at compact caption sizes so it never competes with cell content.
 
-| Style | Size | Use for |
-|---|---|---|
-| Heading | 17 | Dialog and popover titles |
-| Body / Button | 13 | Everything else (the macOS default) |
-| Small | 11–11.5 | Status bar, captions |
-| Section label (`theme::section_label`) | 12, secondary | Labels above groups of fields |
-| Grid text (`theme::grid_font`) | 13 proportional | Cell and header text |
-| Grid numbers (`theme::tabular_digits`) | 13 proportional, equal-width digits | Numeric cells, so digits line up in one font |
+---
 
-egui can't render font weights, so build hierarchy from size, color, and
-spacing, not bold. Write labels in sentence case ("Sort rows", "Match case").
-Menu items and buttons that open another step end with an ellipsis ("Save As…").
+## Layout and Chrome Structure
 
-## Layout and sizes
+A Quarry window is organized into five clean horizontal bands separated by 1 px `separator` hairlines:
 
-| Element | Value |
-|---|---|
-| Toolbar (shares the title bar) | 38 px; leaves 72 px for the traffic lights |
-| Tab strip | 34 px |
-| Status bar | 26 px |
-| Grid row | 22 px |
-| Header | 18 px column-number row + 24 px name row |
-| Cell padding | 8 px each side |
-| Control height | 24 px in chrome, 28 px in dialogs |
-| Corner radius | 4 controls (keeps checkboxes square), 10 popovers and windows, 12 modal dialogs |
-| Spacing | 8 × 6 by default; 10 × 10 inside dialogs |
+1. **Menu bar:** Native macOS system menu bar on macOS; compact in-window `AppMenuBar` (`Quarry`, `File`, `Edit`, `Data`, `View`, `Window`) at the top of each window on Linux.
+2. **Tab bar:** Compact document tabs with unsaved markers, close buttons, `Move to Window`, and `+ Window` actions. Supports up to 200 open tabs across multiple windows with automatic background dormancy.
+3. **Toolbar:** Single-row, low-noise action bar containing the active file/section badge (`Verified` / `Speculative` for bounded sections), `Format`, `Row` jump input + `Go`, `Undo`/`Redo`, `Columns`, `Filters`, `Bookmarks`, `Find`, `Sort`, `Duplicates`, `Clean`, `Whitespace`, and right-aligned `Save` / `Save As…`. Borderless controls sit flat on `chrome` and reveal `hover`/`pressed` fills on interaction.
+4. **Main grid canvas:** Sticky numbered column ruler + editable header row, `#` row-number gutter (with amber/accent bookmark dots and range selection), and a GPU-virtualized viewport painting only visible rows and columns. Inline `Find` / `Replace` strips and dismissible status notices dock cleanly above or below the grid without shifting column layout unexpectedly.
+5. **Status bar & Live Resource HUD:** Left side shows row count (or filtered match count), file or section size, visible/total columns, and encoding. Right side shows indexing state (with Pause/Resume or Cancel controls while active), live memory (`phys_footprint` on macOS, `VmRSS` on Linux), free disk space on the active volume, and open/active tab counts.
 
-The layout must work from the minimum window size, 860 × 540. Below 1,000 px
-wide, the toolbar switches to compact mode: icon-only buttons and a shorter
-Format label. Test both sizes.
+### Geometry Constants
 
-## Window structure
+- `CONTROL_RADIUS = 4` — subtle rounding on inputs, buttons, and checkboxes (keeps checkboxes unmistakably square).
+- `WINDOW_RADIUS = 10` — outer corner radius for floating popovers and modal dialogs.
 
-From top to bottom:
+---
 
-1. **Toolbar**, in the title bar. Left to right: File menu, Format, View | Undo,
-   Redo | Insert, Columns, Filters, Find. Row jump and paging sit at the far
-   right. Dragging empty toolbar space moves the window; double-clicking zooms
-   it (`titlebar_drag_area`).
-2. **Tab strip**, shown only when a document is open. The active tab uses
-   `header_fill` so it joins the grid header below.
-3. **Notice banner**, for warnings and errors only. One line: severity mark,
-   message, then actions on the right (`notice_strip_with_details`).
-4. **Find bar**, when open.
-5. **Grid**.
-6. **Status bar.** Left: unsaved marker, row range, column count, size,
-   selection. Right: index status with a colored dot, or the active job's
-   progress and Cancel button.
+## Shared Components & Dialog Patterns
 
-## Where a new feature goes
+- **Floating popovers (`Columns`, `Filters`, `Bookmarks`):** Anchored cleanly below their toolbar button (`DialogAnchor`), keyboard-dismissible (`Esc`), and non-blocking where appropriate so the grid stays visible behind them.
+- **Modal dialogs (`Open Section…`, `Sort Rows…`, `Find & Remove Duplicates…`, `Clean Selected Columns…`, `Combine Files…`, `Join Files…`, `Inspect File & Recovery…`, `Temporary Storage…`, `About Quarry`):** Clear title, concise helper copy, inline validation before execution, explicit storage-allowance preflight for large rewrites (`>= 256 MiB`), and right-aligned action buttons (`Cancel` + primary action).
+- **Direct manipulation & menus:** All file, edit, data, view, and window actions are accessible through the top menu bar (`Quarry`, `File`, `Edit`, `Data`, `View`, `Window`), toolbar buttons, and keyboard shortcuts. Right-clicking a row number in the `#` gutter directly toggles a session row bookmark on that row.
 
-| The feature is… | Put it in… |
-|---|---|
-| Used on most files, most sessions | A toolbar button, plus a menu bar item |
-| A file-level command | The **File** menu (toolbar and menu bar) |
-| About the selected cell, row, or column | The grid's context menu |
-| A setting with a few options | A popover from the toolbar, like Format or Filters |
-| A multi-step or risky operation | A modal dialog |
-| A long-running job | Start it from a dialog; show progress and Cancel in the status bar |
-| A passing confirmation ("Saved") | The status bar's status text |
-| A problem the user must notice | A notice banner |
-
-Every command that has a menu-bar equivalent must appear in `menu.rs` (see
-below). Don't add a second toolbar row.
-
-## Components
-
-Use these instead of building your own.
-
-### Buttons
-
-- **Primary:** `theme::primary_button("Sort")`. Amber fill, dark text. Use at
-  most one per dialog, for the action that finishes it.
-- **Secondary:** `ui.button("Cancel")`. Framed, neutral.
-- **Destructive:** a framed button with `palette.error_text` text, placed at the
-  far left of the footer ("Discard Changes and Close").
-- **Toolbar:** `icons::button(ui, enabled, Icon::Filter, "Filters…", show_label)`.
-  The label is always the accessible name, even when only the icon shows.
-  Call `theme::chrome_controls(ui.style_mut())` in any chrome surface so buttons
-  are borderless until hovered.
-
-### Dialogs
-
-All modals use the shared frame and spacing:
-
-```rust
-egui::Modal::new(id)
-    .frame(tool_dialog_frame(ctx))
-    .show(ctx, |ui| {
-        tool_dialog_style(ui.style_mut());
-        ui.set_width(480.0);
-        ui.heading("Sort Rows");
-        ui.weak("One sentence on what this does.");
-        // fields…
-        ui.separator();
-        // footer: Cancel on the left, the primary action last, on the right
-    });
-```
-
-- Movable windows (Join Files, Inspect File) use `egui::Window` with
-  `.collapsible(false).frame(tool_dialog_frame(ctx))` and `tool_dialog_style`.
-- Toolbar popovers (Filters, Columns, Format) use `compact_tool_frame` and
-  `compact_tool_style`, with `compact_tool_placement` to hang under their
-  button.
-- Put longer explanations behind a collapsed **Details** header, not in the
-  main text.
-- Dialogs that group panels side-by-side or show a conditional review section
-  (such as Join Files) use `theme::inset_card(ui, ...)`. Show the review or
-  confirmation panel only when the user asks for a preview or a safety gate
-  needs confirmation, and lead it with `theme::stat` headline numbers.
-- Footers: the dismiss button (Close, Cancel) on the left; the current step's
-  actions on the right with the primary last. Right-align them with
-  `theme::push_right(ui, theme::buttons_width(ui, &labels))` so Tab order
-  still runs left to right.
-- Show why an action is disabled with `.on_disabled_hover_text(...)`.
-
-### Choices
-
-- Two or three exclusive options in a row: `theme::segmented(ui, &mut value, &options)`.
-- Four or more, or long labels: `ui.radio_value` in a vertical list.
-- Many options, or options that need little space: `egui::ComboBox`.
-- On/off: `ui.checkbox`.
-
-### Grid
-
-- Text aligns left; values that `looks_numeric` accepts align right, with
-  equal-width digits from `theme::tabular_digits`. Use one font in the grid;
-  don't switch numbers to monospace. Keep `looks_numeric` cheap, since it runs
-  for every visible cell.
-- Cells are square and borderless. Hover is a faint tint, selection is
-  `selection`, and the focused cell gets a `selection_strong` ring.
-- Keep 100-row viewport reads and `MAX_RENDERED_COLUMNS`. Visual changes must
-  not add per-row work that grows with file size.
-
-### Icons
-
-Add an `Icon` variant in `icons.rs` and draw it with strokes on a 0–1 grid,
-using the stroke width already computed there. Icons are 14 px, one color, and
-follow the text color. Don't add image assets for UI icons.
-
-## Native menu bar
-
-`menu.rs` builds the macOS menu bar. Commands reach the app in two ways:
-
-- A command with a standard shortcut (⌘S, ⌘Z, ⌘C, ⌘F…) becomes the same egui
-  event that shortcut produces (`menu::route`). The existing keyboard handling
-  then decides what happens, including text-field undo and copy.
-- Any other command becomes an `Action` that passes through the same gate as a
-  toolbar click.
-
-To add a command: add a `MenuCommand` variant, route it in `route`, place it
-in the right menu in `install`, and add its availability in
-`QuarryApp::menu_state`. File command availability comes from `FileCommands`,
-so the toolbar File menu and the menu bar always agree.
-
-Call AppKit APIs that the enabled `objc2-app-kit` features don't cover through
-`msg_send!`, with a `SAFETY` comment, as `menu.rs` does. Adding features changes
-the workspace manifests, which makes the audited third-party notice inventory
-stale (`./scripts/macos-app.sh self-test` fails). Regenerating and reviewing
-that inventory needs the owner's approval.
+---
 
 ## Accessibility
 
-VoiceOver regressions are release blockers ([ADR 0003](adr/0003-select-egui-ui.md)).
-
-- Every interactive control needs an accessible name. Icon-only controls get
-  one through `icons::button`, or through `widget_info` when built by hand.
-- Keep left-to-right creation order equal to visual order, so Tab focus moves
-  predictably. Don't use `right_to_left` layouts for focusable controls;
-  reserve the space and lay them out left to right (see the toolbar's row
-  jump).
-- Don't rely on color alone. The unsaved state is a dot and text; the active
-  filter is an outline and a count.
-- Text and background tokens are chosen to meet 4.5:1 contrast where people
-  read text. Keep that true when you add tokens.
-
-## Checking your change
-
-1. `cargo test -p quarry-gpui --locked` and `cargo test -p quarry-workbench --locked`.
-2. `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`.
-3. Run the app inside the test VM and check the change at the minimum window size
-   and at full screen, including accessibility tree verification.
-4. Update `docs/USER_GUIDE.md` when a visible label, location, or shortcut
-   changes.
+- **macOS (`accesskit_macos`):** Every window maintains its own AccessKit tree with labeled controls, grid cells, dialogs, and state-transition announcements (`Role::Status` / `Role::Alert`).
+- **Linux (`accesskit_unix` / AT-SPI):** Exposes the same semantic tree over the session AT-SPI bus on Wayland/Hyprland and standard Linux desktops.
+- **Quiet telemetry:** The Live Resource HUD updates off-thread (`<= 2 Hz`) inside a non-live `Role::Group` so screen readers are never flooded by periodic memory/disk ticks; only real state transitions (indexing complete, errors, bookmark updates, operation completion) emit live announcements.

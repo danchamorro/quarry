@@ -15,9 +15,15 @@ parentheses are GitHub pull requests.
 - Added session-only row bookmarks via **Edit → Toggle Bookmark** (`Cmd+B` / `Ctrl+B`), **Next Bookmark** (`Cmd+]` / `Ctrl+]`), **Previous Bookmark** (`Cmd+[` / `Ctrl+[`), **Clear Bookmarks**, right-clicking the `#` row gutter, and the toolbar **Bookmarks** popover (**View → Bookmarks…**). Bookmarks survive cell edits, filters, saves, and tab dormancy, shift across row insertions and deletions, and restore via **Undo** if cleared by sort or duplicate removal. (#215)
 - Added in-place guarded **Save** (`Cmd+S` / `Ctrl+S`) for verified sections, splicing edited section bytes back into the parent file using copy-on-write cloning on APFS and supported Linux filesystems (with streaming fallback elsewhere), advisory disk-space checks, and automatic parent reload notices in open sibling tabs. Documented in [ADR 0015](docs/adr/0015-guarded-section-splice-save.md). (#213)
 - Added section-scoped **Insert Rows…**, **Delete Selected Rows**, **Replace All**, and **Undo** / **Redo** for verified sections while keeping header edits, column schema changes, **Sort**, **Find Duplicates**, and **Join Files** routed to **Save Section As New…**. (#213)
+- Added a dedicated [Linux & Omarchy Guide](docs/LINUX_AND_OMARCHY.md) and fresh macOS Light, macOS Dark, and Omarchy native Wayland screenshots under `docs/images/`. (#217)
+
+### Changed
+
+- Refreshed `README.md`, the User Guide, Design System, Architecture, Roadmap, Contributing, and macOS Packaging documentation to reflect the GPUI desktop app on macOS and Linux/Omarchy, Light/Dark/System/Omarchy themes, 200-tab multi-window workspaces, section windows, row bookmarks, verified multi-core benchmarks, and free open-source (`MIT OR Apache-2.0`, zero-telemetry) terms. (#217)
 
 ### Fixed
 
+- Fixed broken cross-file documentation links and heading anchors across `docs/`, including the `ADR 0014` reference to `ADR 0005`. (#217)
 - Fixed modal dialog confirm and cancel buttons (**Sort Rows**, **Clean Selected Columns**, **Split Column**, **Open Section…**, and other dialogs) so clicking the primary action or **Cancel** works on the first click even when a dropdown or text input still holds focus. (#216)
 - Fixed active grid cell and list selection highlights so selected cell text remains clearly readable in both Light and Dark themes instead of being obscured by an opaque selection fill. (#216)
 
