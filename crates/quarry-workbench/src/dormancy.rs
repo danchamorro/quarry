@@ -2469,6 +2469,9 @@ impl WorkbenchScheduler {
 
     /// Applies one value-edit or structural-working-copy undo/redo step on hydrated tab `id`.
     pub fn apply_undo_redo(&mut self, id: DocumentId, redo: bool) -> Result<String, AppMessage> {
+        if let Some(conflict) = self.sibling_dirty_conflict(id) {
+            return Err(AppMessage::warning(conflict));
+        }
         let Some(slot) = self.tabs.get_mut(&id) else {
             return Err(AppMessage::warning("Open a file before undoing a change."));
         };
@@ -2821,26 +2824,27 @@ impl WorkbenchScheduler {
                     let prior_encoding_mode = slot.tab.encoding_mode;
 
                     let reload = if let Some(splice) = splice_summary {
-                        SourceGuard::capture_path(&destination)
-                            .map_err(|error| error.to_string())
-                            .and_then(|new_guard| {
-                                let sec_opts = SectionOpenOptions {
-                                    open: options,
-                                    encoding: Some(output_encoding),
-                                    parent_index: None,
-                                    quote_free_confirmed: section_quote_free,
-                                    ..SectionOpenOptions::default()
-                                };
-                                Document::prepare_section_preserved(
-                                    &destination,
-                                    splice.new_bounds,
-                                    &new_guard,
-                                    dialect.delimiter,
-                                    output_encoding,
-                                    sec_opts,
-                                )
-                                .map_err(|error| error.to_string())
-                            })
+                        let sec_opts = SectionOpenOptions {
+                            open: options,
+                            encoding: Some(output_encoding),
+                            parent_index: None,
+                            quote_free_confirmed: section_quote_free,
+                            ..SectionOpenOptions::default()
+                        };
+                        Document::prepare_section_preserved(
+                            &destination,
+                            splice.new_bounds,
+                            &splice.published_guard,
+                            dialect.delimiter,
+                            output_encoding,
+                            sec_opts,
+                        )
+                        .map_err(|error| match error {
+                            QuarryError::SourceChanged => {
+                                "the file was modified externally right after saving".to_string()
+                            }
+                            other => other.to_string(),
+                        })
                     } else {
                         Document::prepare_with_encoding(
                             &destination,
@@ -2939,13 +2943,24 @@ impl WorkbenchScheduler {
                 match &mut other_slot.residency {
                     SlotResidency::Hydrated { .. } => {
                         if let Some(other_doc) = other_slot.tab.document.as_mut() {
+                            if other_doc
+                                .export_job
+                                .as_ref()
+                                .is_some_and(|job| job.progress().done)
+                            {
+                                let _ = other_doc.poll_filtered_export();
+                            }
                             other_doc.invalidate_changed_source();
+                            other_slot.tab.write_destination = None;
+                            other_slot.tab.close_after_save = false;
                             other_slot.tab.notice =
                                 Some(AppMessage::warning(SOURCE_CHANGED_NOTICE));
                         }
                     }
                     SlotResidency::Dormant(dormant) => {
                         dormant.source_changed = true;
+                        other_slot.tab.write_destination = None;
+                        other_slot.tab.close_after_save = false;
                         other_slot.tab.notice = Some(AppMessage::warning(SOURCE_CHANGED_NOTICE));
                     }
                     SlotResidency::Stub(_) => {}
@@ -3984,11 +3999,20 @@ fn doc_non_filter_job_fds(doc: &Document) -> usize {
     // filtered export, save, and running structural workers each hold up to 2 FDs
     // (source + destination); gzip decompression holds up to 4 FDs; DuplicatePreview holds no
     // running worker FDs.
+    let save_fds = if doc.save_job.is_some() {
+        if doc.saving_in_place && doc.is_section() {
+            5
+        } else {
+            2
+        }
+    } else {
+        0
+    };
     usize::from(doc.job.is_some())
         + usize::from(doc.section_verify_job.is_some())
         + usize::from(doc.search_job.is_some()) * 2
         + usize::from(doc.export_job.is_some()) * 2
-        + usize::from(doc.save_job.is_some()) * 2
+        + save_fds
         + usize::from(doc.decompression_running()) * 4
         + usize::from(
             doc.structural_job

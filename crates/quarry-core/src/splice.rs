@@ -65,6 +65,9 @@ pub struct SpliceSaveSummary {
     pub section_bytes_written: u64,
     pub total_bytes_written: u64,
     pub strategy: SpliceStrategy,
+    /// Guard captured from the exact published file descriptor right after `fsync` and before
+    /// atomic rename, so post-save reload binds `new_bounds` only to this generation.
+    pub published_guard: crate::SourceGuard,
 }
 
 /// Section-scoped working-copy mutation kind.
@@ -119,13 +122,50 @@ fn cow_clone_file(src: &File, dst_dir: &Path, dst_name: &str) -> io::Result<Opti
         };
     }
     let dst_path = dst_dir.join(dst_name);
-    let file = OpenOptions::new()
+    // `fclonefileat` preserves the source file's mode (e.g. `0444`), so open read-only first,
+    // chmod the clone descriptor to `0600` to make it writable during staging, then reopen R/W.
+    // Fall back cleanly to streaming if permissions prevent modifying or opening the clone.
+    let ro_file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&dst_path)
+    {
+        Ok(file) => file,
+        Err(err) => {
+            let _ = fs::remove_file(&dst_path);
+            return if err.kind() == io::ErrorKind::PermissionDenied {
+                Ok(None)
+            } else {
+                Err(err)
+            };
+        }
+    };
+    if let Err(err) = ro_file.set_permissions(fs::Permissions::from_mode(0o600)) {
+        drop(ro_file);
+        let _ = fs::remove_file(&dst_path);
+        return if err.kind() == io::ErrorKind::PermissionDenied {
+            Ok(None)
+        } else {
+            Err(err)
+        };
+    }
+    drop(ro_file);
+    match OpenOptions::new()
         .read(true)
         .write(true)
         .custom_flags(libc::O_NOFOLLOW)
-        .open(&dst_path)?;
-    file.set_permissions(fs::Permissions::from_mode(0o600))?;
-    Ok(Some(file))
+        .open(&dst_path)
+    {
+        Ok(file) => Ok(Some(file)),
+        Err(err) => {
+            let _ = fs::remove_file(&dst_path);
+            if err.kind() == io::ErrorKind::PermissionDenied {
+                Ok(None)
+            } else {
+                Err(err)
+            }
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -165,7 +205,7 @@ fn cow_clone_file(_src: &File, _dst_dir: &Path, _dst_name: &str) -> io::Result<O
 
 /// Probe whether `parent_path`'s volume supports CoW cloning without leaving any artifacts on disk.
 pub(crate) fn probe_cow_support(parent_path: &Path) -> bool {
-    let Ok(parent_file) = File::open(parent_path) else {
+    let Ok(parent_file) = crate::source_stamp::open_regular_file_nofollow(parent_path) else {
         return false;
     };
     let parent_dir = output_parent(parent_path);
@@ -176,6 +216,25 @@ pub(crate) fn probe_cow_support(parent_path: &Path) -> bool {
         cow_clone_file(&parent_file, dir.path(), "probe.stage"),
         Ok(Some(_))
     )
+}
+
+/// Peak temporary disk space needed on the parent's volume during a splice-save.
+///
+/// `section.stage` (`section_bytes`) coexists with `output.stage` while writing the section
+/// payload and is dropped + unlinked before suffix streaming begins.
+fn splice_peak_required_bytes(
+    uses_cow: bool,
+    aligned_start: u64,
+    section_bytes: u64,
+    suffix_len: u64,
+) -> u64 {
+    if uses_cow {
+        section_bytes.saturating_add(section_bytes.max(suffix_len))
+    } else {
+        aligned_start
+            .saturating_add(section_bytes)
+            .saturating_add(section_bytes.max(suffix_len))
+    }
 }
 
 /// Estimate advisory disk preflight for splicing a `Verified` section back into `parent_path`.
@@ -199,13 +258,8 @@ pub(crate) fn estimate_splice_preflight(
         None,
     );
     let suffix_len = parent_file_size.saturating_sub(aligned_end);
-    let estimated_required_bytes = if uses_cow {
-        section_est.saturating_add(suffix_len)
-    } else {
-        aligned_start
-            .saturating_add(section_est)
-            .saturating_add(suffix_len)
-    };
+    let estimated_required_bytes =
+        splice_peak_required_bytes(uses_cow, aligned_start, section_est, suffix_len);
     Ok(SpliceDiskPreflight {
         available_bytes,
         estimated_required_bytes,
@@ -288,6 +342,7 @@ fn serialize_utf8_fields_record(
     fields: &[Vec<u8>],
     delimiter: u8,
     ending: &[u8],
+    is_first_output_record: bool,
     max_record_bytes: usize,
 ) -> Result<Vec<u8>, QuarryError> {
     let mut out = Vec::with_capacity(prefix.len() + ending.len() + fields.len() * 8);
@@ -296,9 +351,15 @@ fn serialize_utf8_fields_record(
         if idx > 0 {
             out.push(delimiter);
         }
-        let needs_quotes = field
-            .iter()
-            .any(|&b| b == delimiter || b == b'"' || b == b'\n' || b == b'\r');
+        let force_quotes = (is_first_output_record
+            && prefix.is_empty()
+            && idx == 0
+            && field.starts_with(UTF8_BOM))
+            || (fields.len() == 1 && field.is_empty() && ending.is_empty());
+        let needs_quotes = force_quotes
+            || field
+                .iter()
+                .any(|&b| b == delimiter || b == b'"' || b == b'\n' || b == b'\r');
         if needs_quotes {
             out.push(b'"');
             for &b in field {
@@ -342,6 +403,7 @@ fn serialize_section_to_stage(
     read_base: u64,
     read_end: u64,
     section_is_interior: bool,
+    source_had_bom: bool,
     has_trailing_suffix: bool,
     delimiter: u8,
     encoding: Encoding,
@@ -350,16 +412,37 @@ fn serialize_section_to_stage(
     writer: &mut BufWriter<File>,
     shared: &SharedState,
 ) -> Result<Option<(u64, u64)>, QuarryError> {
-    let default_ending = detect_encoded_line_ending(source, read_base, read_end, encoding)?;
+    let mut bytes_written = 0u64;
+    let bom = encoding.bom();
+    let scan_start = if !section_is_interior && source_had_bom && !bom.is_empty() {
+        let bom_len = bom.len() as u64;
+        if read_end.saturating_sub(read_base) >= bom_len {
+            let mut probe = [0u8; 3];
+            let read = read_at_exact_or_eof(source, read_base, &mut probe[..bom.len()])?;
+            if read == bom.len() && &probe[..bom.len()] == bom {
+                writer.write_all(bom)?;
+                bytes_written += bom_len;
+                shared.bytes_written.store(bytes_written, Ordering::Release);
+                read_base + bom_len
+            } else {
+                read_base
+            }
+        } else {
+            read_base
+        }
+    } else {
+        read_base
+    };
+    let wrote_leading_bom = scan_start > read_base;
+    let default_ending = detect_encoded_line_ending(source, scan_start, read_end, encoding)?;
     if encoding.is_utf16() {
-        source.seek(SeekFrom::Start(read_base))?;
+        source.seek(SeekFrom::Start(scan_start))?;
     }
-    let mut scanner = crate::encoding::RecordScanner::at_offset(delimiter, read_base, encoding)?;
+    let mut scanner = crate::encoding::RecordScanner::at_offset(delimiter, scan_start, encoding)?;
     let mut chunk = vec![0u8; encoding.chunk_size(config.chunk_bytes)];
-    let mut cursor = read_base;
+    let mut cursor = scan_start;
     let mut local_row = 0u64;
     let mut rows_written = 0u64;
-    let mut bytes_written = 0u64;
     let mut record = Vec::new();
     let mut last_record_had_lf = true;
     let mut next_cell_edit_row = cell_edits.first_key_value().map(|((row, _), _)| *row);
@@ -378,13 +461,7 @@ fn serialize_section_to_stage(
             let decoded = encoding
                 .decode(raw, config.max_record_bytes)
                 .map_err(|error| crate::record_encoding_error(row_idx.saturating_add(1), error))?;
-            let text = decoded.as_ref();
-            let (prefix, body) = if !section_is_interior && row_idx == 0 {
-                text.strip_prefix(UTF8_BOM)
-                    .map_or((&[][..], text), |rest| (UTF8_BOM, rest))
-            } else {
-                (&[][..], text)
-            };
+            let body = decoded.as_ref();
             let ending = if body.ends_with(b"\r\n") {
                 b"\r\n".as_slice()
             } else if body.ends_with(b"\n") {
@@ -411,11 +488,13 @@ fn serialize_section_to_stage(
             for ((_, col), value) in row_edits {
                 fields[*col] = value.clone();
             }
+            let is_first_output_record = !section_is_interior && !wrote_leading_bom && row_idx == 0;
             let utf8_rec = serialize_utf8_fields_record(
-                prefix,
+                &[],
                 &fields,
                 delimiter,
                 ending,
+                is_first_output_record,
                 config.max_record_bytes,
             )?;
             let encoded = encode_utf8_bytes(&utf8_rec, encoding, config.max_record_bytes)?;
@@ -581,6 +660,7 @@ pub(crate) fn start_section_splice(
     parent_stamp: crate::SourceStamp,
     parent_file_size: u64,
     parent_bounds: SectionBounds,
+    source_had_bom: bool,
     section_source_path: PathBuf,
     section_source_stamp: crate::SourceStamp,
     read_base: u64,
@@ -639,26 +719,35 @@ pub(crate) fn start_section_splice(
             "saving through a symbolic link is not supported; use Save As instead",
         ));
     }
-    let parent_file = File::open(&parent_path).map_err(|error| {
-        if error.kind() == io::ErrorKind::NotFound {
-            QuarryError::SourceChanged
-        } else {
-            error.into()
-        }
-    })?;
+    let parent_file =
+        crate::source_stamp::open_regular_file_nofollow(&parent_path).map_err(|error| {
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::InvalidInput
+            ) {
+                QuarryError::SourceChanged
+            } else {
+                error.into()
+            }
+        })?;
     if !source_matches_stamp(&parent_file, &parent_path, &parent_stamp)? {
         return Err(QuarryError::SourceChanged);
     }
 
     let is_working_copy = section_source_path != parent_path;
     let section_file = if is_working_copy {
-        let f = File::open(&section_source_path).map_err(|error| {
-            if error.kind() == io::ErrorKind::NotFound {
-                QuarryError::SourceChanged
-            } else {
-                error.into()
-            }
-        })?;
+        let f = crate::source_stamp::open_regular_file_nofollow(&section_source_path).map_err(
+            |error| {
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::InvalidInput
+                ) {
+                    QuarryError::SourceChanged
+                } else {
+                    error.into()
+                }
+            },
+        )?;
         if !source_matches_stamp(&f, &section_source_path, &section_source_stamp)? {
             return Err(QuarryError::SourceChanged);
         }
@@ -680,6 +769,7 @@ pub(crate) fn start_section_splice(
                 parent_stamp,
                 parent_file_size,
                 parent_bounds,
+                source_had_bom,
                 section_source_path,
                 section_file,
                 section_source_stamp,
@@ -712,6 +802,7 @@ fn run_section_splice(
     parent_stamp: crate::SourceStamp,
     parent_file_size: u64,
     parent_bounds: SectionBounds,
+    source_had_bom: bool,
     section_source_path: PathBuf,
     mut section_file: File,
     section_source_stamp: crate::SourceStamp,
@@ -746,7 +837,8 @@ fn run_section_splice(
         .map_err(|error| storage_error(parent_dir, error))?;
     let cow_supported = cow_output.is_some();
 
-    // 2. Advisory disk preflight before writing payload bytes.
+    // 2. Advisory disk preflight before writing payload bytes (accounting for concurrent
+    //    `section.stage` + `output.stage` residency before `section.stage` is released).
     let section_est = crate::estimate_edited_output_bytes_from_values(
         read_end.saturating_sub(read_base),
         0,
@@ -755,13 +847,8 @@ fn run_section_splice(
         None,
         None,
     );
-    let required = if cow_supported {
-        section_est.saturating_add(suffix_len)
-    } else {
-        aligned_start
-            .saturating_add(section_est)
-            .saturating_add(suffix_len)
-    };
+    let required =
+        splice_peak_required_bytes(cow_supported, aligned_start, section_est, suffix_len);
     shared
         .estimated_output_bytes
         .store(required, Ordering::Release);
@@ -786,6 +873,7 @@ fn run_section_splice(
         read_base,
         read_end,
         aligned_start > 0,
+        source_had_bom,
         aligned_end < parent_file_size,
         delimiter,
         config.source_encoding,
@@ -807,6 +895,19 @@ fn run_section_splice(
         .ok_or(QuarryError::InvalidOption(
             "spliced file size overflows 64-bit byte range",
         ))?;
+
+    // Revalidate remaining disk headroom using the exact materialized `new_section_len` now that
+    // `section.stage` is on disk and before allocating `output.stage` blocks.
+    let remaining_required = if cow_supported {
+        if new_section_len == old_section_len {
+            new_section_len
+        } else {
+            new_section_len.max(suffix_len)
+        }
+    } else {
+        aligned_start.saturating_add(new_section_len.max(suffix_len))
+    };
+    check_storage(parent_dir, remaining_required)?;
 
     // 4. Assemble `output.stage` using CoW (in-place or consistent-snapshot clone) or streaming.
     let (output_file, strategy, total_bytes_written) = if let Some(mut output_file) =
@@ -861,7 +962,7 @@ fn run_section_splice(
                     return Ok(SaveWorkerOutcome::Cancelled);
                 };
                 // Free `section.stage` before suffix streaming so peak disk usage stays at
-                // `section + suffix` on CoW volumes.
+                // `section + max(section, suffix)` on CoW volumes.
                 drop(section_stage_file);
                 let _ = fs::remove_file(&section_stage_path);
 
@@ -896,11 +997,12 @@ fn run_section_splice(
                 // Unexpectedly lost CoW on second clone; clean up and fall back to full stream.
                 drop(output_file);
                 let _ = fs::remove_file(&output_stage_path);
-                let full_required = new_file_size;
-                check_storage(parent_dir, full_required)?;
+                let streaming_remaining =
+                    aligned_start.saturating_add(new_section_len.max(suffix_len));
+                check_storage(parent_dir, streaming_remaining)?;
                 let Some((out, total)) = assemble_streaming_splice(
                     &parent_file,
-                    &section_stage_file,
+                    section_stage_file,
                     &section_stage_path,
                     &output_stage_path,
                     aligned_start,
@@ -919,7 +1021,7 @@ fn run_section_splice(
     } else {
         let Some((out, total)) = assemble_streaming_splice(
             &parent_file,
-            &section_stage_file,
+            section_stage_file,
             &section_stage_path,
             &output_stage_path,
             aligned_start,
@@ -935,7 +1037,8 @@ fn run_section_splice(
         (out, SpliceStrategy::StreamingRewrite, total)
     };
 
-    // 5. Restore parent permissions + macOS ACLs, fsync, revalidate stamps, and atomically rename.
+    // 5. Restore parent permissions + macOS ACLs, fsync, capture exact published generation guard,
+    //    revalidate stamps right before rename, and atomically replace parent.
     if shared.cancel_requested.load(Ordering::Acquire) {
         return Ok(SaveWorkerOutcome::Cancelled);
     }
@@ -948,8 +1051,15 @@ fn run_section_splice(
     output_file
         .sync_all()
         .map_err(|error| storage_error(parent_dir, error))?;
+    let pre_rename_stamp = crate::SourceStamp::from_file(&output_file)?;
+    #[cfg(not(unix))]
     drop(output_file);
 
+    if is_working_copy
+        && !source_matches_stamp(&section_file, &section_source_path, &section_source_stamp)?
+    {
+        return Err(QuarryError::SourceChanged);
+    }
     if shared.cancel_requested.load(Ordering::Acquire) {
         return Ok(SaveWorkerOutcome::Cancelled);
     }
@@ -968,16 +1078,32 @@ fn run_section_splice(
     if !source_matches_stamp(&parent_file, &parent_path, &parent_stamp)? {
         return Err(QuarryError::SourceChanged);
     }
-    if is_working_copy
-        && !source_matches_stamp(&section_file, &section_source_path, &section_source_stamp)?
-    {
-        return Err(QuarryError::SourceChanged);
-    }
-    if shared.cancel_requested.load(Ordering::Acquire) {
-        return Ok(SaveWorkerOutcome::Cancelled);
-    }
     fs::rename(&output_stage_path, &parent_path)
         .map_err(|error| storage_error(parent_dir, error))?;
+
+    // Capture the post-rename stamp (rename updates `ctime` on Linux and `ChangeTime` on Windows)
+    // ONLY when `publication_match` confirms the file identity and content metadata still match
+    // the exact file we synced before rename.
+    #[cfg(unix)]
+    let published_stamp = {
+        let post = crate::SourceStamp::from_file(&output_file).ok();
+        drop(output_file);
+        match post {
+            Some(post) if pre_rename_stamp.publication_match(&post) != Some(false) => post,
+            _ => pre_rename_stamp,
+        }
+    };
+    #[cfg(not(unix))]
+    let published_stamp = {
+        let post = crate::source_stamp::open_regular_file_nofollow(&parent_path)
+            .and_then(|file| crate::SourceStamp::from_file(&file))
+            .ok();
+        match post {
+            Some(post) if pre_rename_stamp.publication_match(&post) != Some(false) => post,
+            _ => pre_rename_stamp,
+        }
+    };
+    let published_guard = crate::SourceGuard::from_stamp(published_stamp);
 
     let new_snapped = ByteWindow::new(aligned_start, new_section_len).ok_or(
         QuarryError::InvalidOption("spliced section bounds overflow"),
@@ -996,12 +1122,13 @@ fn run_section_splice(
         section_bytes_written: new_section_len,
         total_bytes_written,
         strategy,
+        published_guard,
     };
     Ok(SaveWorkerOutcome::Complete {
         summary: SaveAsSummary {
             destination: parent_path,
             bytes_written: total_bytes_written,
-            splice: Some(splice_summary),
+            splice: Some(Box::new(splice_summary)),
         },
         replacements: 0,
         output_index: None,
@@ -1012,7 +1139,7 @@ fn run_section_splice(
 #[allow(clippy::too_many_arguments)]
 fn assemble_streaming_splice(
     parent_file: &File,
-    section_stage_file: &File,
+    section_stage_file: File,
     section_stage_path: &Path,
     output_stage_path: &Path,
     aligned_start: u64,
@@ -1043,7 +1170,7 @@ fn assemble_streaming_splice(
         return Ok(None);
     };
     let Some(section_copied) = copy_file_range_streaming(
-        section_stage_file,
+        &section_stage_file,
         0,
         new_section_len,
         &mut output_file,
@@ -1054,6 +1181,8 @@ fn assemble_streaming_splice(
     else {
         return Ok(None);
     };
+    // Close AND unlink `section.stage` before suffix streaming so its disk blocks are reclaimed.
+    drop(section_stage_file);
     let _ = fs::remove_file(section_stage_path);
     let Some(suffix_copied) = copy_file_range_streaming(
         parent_file,
@@ -1081,6 +1210,7 @@ pub(crate) fn start_section_working_copy_op(
     source_path: PathBuf,
     source_stamp: crate::SourceStamp,
     parent_bounds: SectionBounds,
+    source_had_bom: bool,
     read_base: u64,
     read_end: u64,
     delimiter: u8,
@@ -1158,13 +1288,17 @@ pub(crate) fn start_section_working_copy_op(
         }
     }
 
-    let source = File::open(&source_path).map_err(|error| {
-        if error.kind() == io::ErrorKind::NotFound {
-            QuarryError::SourceChanged
-        } else {
-            error.into()
-        }
-    })?;
+    let source =
+        crate::source_stamp::open_regular_file_nofollow(&source_path).map_err(|error| {
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::InvalidInput
+            ) {
+                QuarryError::SourceChanged
+            } else {
+                error.into()
+            }
+        })?;
     let mut output =
         ExportTarget::new_private_guarded(&source_path, destination, &source, source_stamp)?;
     output.configure(
@@ -1187,6 +1321,7 @@ pub(crate) fn start_section_working_copy_op(
                 read_base,
                 read_end,
                 section_is_interior,
+                source_had_bom,
                 data_start,
                 delimiter,
                 &cell_edits,
@@ -1213,6 +1348,7 @@ pub(crate) fn start_section_replace_all(
     source_path: PathBuf,
     source_stamp: crate::SourceStamp,
     parent_bounds: SectionBounds,
+    source_had_bom: bool,
     read_base: u64,
     read_end: u64,
     delimiter: u8,
@@ -1227,6 +1363,7 @@ pub(crate) fn start_section_replace_all(
         source_path,
         source_stamp,
         parent_bounds,
+        source_had_bom,
         read_base,
         read_end,
         delimiter,
@@ -1249,7 +1386,9 @@ fn replace_literal_in_field(
     matcher: &ByteMatcher,
     needle_len: usize,
     replacement: &[u8],
-) -> (Vec<u8>, u64) {
+    max_bytes: usize,
+    limit: usize,
+) -> Result<(Vec<u8>, u64), QuarryError> {
     let mut out = Vec::new();
     let mut cursor = 0usize;
     let mut count = 0u64;
@@ -1258,8 +1397,16 @@ fn replace_literal_in_field(
             break;
         };
         let hit = cursor + rel;
+        let prefix_len = hit - cursor;
+        let next_len = out
+            .len()
+            .saturating_add(prefix_len)
+            .saturating_add(replacement.len());
+        if next_len > max_bytes {
+            return Err(QuarryError::RecordTooLarge { limit });
+        }
         if count == 0 {
-            out.reserve(field.len());
+            out.reserve(field.len().min(max_bytes));
         }
         out.extend_from_slice(&field[cursor..hit]);
         out.extend_from_slice(replacement);
@@ -1267,9 +1414,13 @@ fn replace_literal_in_field(
         count += 1;
     }
     if count > 0 {
+        let tail_len = field.len() - cursor;
+        if out.len().saturating_add(tail_len) > max_bytes {
+            return Err(QuarryError::RecordTooLarge { limit });
+        }
         out.extend_from_slice(&field[cursor..]);
     }
-    (out, count)
+    Ok((out, count))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1279,6 +1430,7 @@ fn run_section_working_copy_op(
     read_base: u64,
     read_end: u64,
     section_is_interior: bool,
+    source_had_bom: bool,
     data_start: u64,
     delimiter: u8,
     cell_edits: &BTreeMap<(u64, usize), Vec<u8>>,
@@ -1321,8 +1473,34 @@ fn run_section_working_copy_op(
         .estimated_output_bytes
         .store(required, Ordering::Release);
 
+    // Emit the physical BOM once at byte 0 for BOM-bearing byte-0 sections before any rows or
+    // row-0 insertions, and start record scanning past the BOM bytes so row-0 inserts, row-0
+    // deletes, and deleting all rows preserve the BOM cleanly.
+    let bom = config.source_encoding.bom();
+    let scan_start = if !section_is_interior && source_had_bom && !bom.is_empty() {
+        let bom_len = bom.len() as u64;
+        if read_end.saturating_sub(read_base) >= bom_len {
+            let mut probe = [0u8; 3];
+            let read = read_at_exact_or_eof(&source, read_base, &mut probe[..bom.len()])?;
+            if read == bom.len() && &probe[..bom.len()] == bom {
+                output.write_all(UTF8_BOM)?;
+                shared
+                    .bytes_written
+                    .store(output.bytes_written(), Ordering::Release);
+                read_base + bom_len
+            } else {
+                read_base
+            }
+        } else {
+            read_base
+        }
+    } else {
+        read_base
+    };
+    let wrote_leading_bom = scan_start > read_base;
+
     let default_ending =
-        detect_encoded_line_ending(&source, read_base, read_end, config.source_encoding)?;
+        detect_encoded_line_ending(&source, scan_start, read_end, config.source_encoding)?;
     let blank_row_utf8: Option<Vec<u8>> = match &op {
         SectionWorkingOp::InsertRows(ins) => {
             let mut row = Vec::with_capacity(ins.width.saturating_sub(1) + default_ending.len());
@@ -1342,12 +1520,12 @@ fn run_section_working_copy_op(
     };
 
     if config.source_encoding.is_utf16() {
-        source.seek(SeekFrom::Start(read_base))?;
+        source.seek(SeekFrom::Start(scan_start))?;
     }
     let mut scanner =
-        crate::encoding::RecordScanner::at_offset(delimiter, read_base, config.source_encoding)?;
+        crate::encoding::RecordScanner::at_offset(delimiter, scan_start, config.source_encoding)?;
     let mut chunk = vec![0u8; config.source_encoding.chunk_size(config.chunk_bytes)];
-    let mut cursor = read_base;
+    let mut cursor = scan_start;
     let mut local_row = 0u64;
     let mut rows_written = 0u64;
     let mut replacements = 0u64;
@@ -1407,19 +1585,17 @@ fn run_section_working_copy_op(
             return Ok(());
         }
 
+        let is_first_output_record =
+            !section_is_interior && !wrote_leading_bom && rows_written == 0;
+        let promoted_literal_bom =
+            is_first_output_record && !config.source_encoding.strip_bom(raw).0.is_empty();
         let maybe_replace = matches!(op, SectionWorkingOp::ReplaceAll(_)) && row_idx >= data_start;
-        if has_cell_edit || maybe_replace {
+        if has_cell_edit || maybe_replace || promoted_literal_bom {
             let decoded = config
                 .source_encoding
                 .decode(raw, config.max_record_bytes)
                 .map_err(|error| crate::record_encoding_error(row_idx.saturating_add(1), error))?;
-            let text = decoded.as_ref();
-            let (prefix, body) = if !section_is_interior && row_idx == 0 {
-                text.strip_prefix(UTF8_BOM)
-                    .map_or((&[][..], text), |rest| (UTF8_BOM, rest))
-            } else {
-                (&[][..], text)
-            };
+            let body = decoded.as_ref();
             let ending = if body.ends_with(b"\r\n") {
                 b"\r\n".as_slice()
             } else if body.ends_with(b"\n") {
@@ -1450,24 +1626,40 @@ fn run_section_working_copy_op(
             if let (SectionWorkingOp::ReplaceAll(repl), Some(m)) = (&op, &matcher)
                 && row_idx >= data_start
             {
+                let mut remaining_budget = config
+                    .max_record_bytes
+                    .saturating_sub(fields.len().saturating_sub(1))
+                    .saturating_sub(ending.len());
                 for field in &mut fields {
-                    let (replaced, hits) =
-                        replace_literal_in_field(field, m, repl.needle.len(), &repl.replacement);
+                    let (replaced, hits) = replace_literal_in_field(
+                        field,
+                        m,
+                        repl.needle.len(),
+                        &repl.replacement,
+                        remaining_budget,
+                        config.max_record_bytes,
+                    )?;
                     if hits > 0 {
                         *field = replaced;
                         row_replacements += hits;
                     }
+                    if field.len() > remaining_budget {
+                        return Err(QuarryError::RecordTooLarge {
+                            limit: config.max_record_bytes,
+                        });
+                    }
+                    remaining_budget -= field.len();
                 }
                 replacements += row_replacements;
             }
-            if has_cell_edit || row_replacements > 0 {
+            if has_cell_edit || row_replacements > 0 || promoted_literal_bom {
                 write_serialized_fields(
                     output,
-                    prefix,
+                    &[],
                     &fields,
                     delimiter,
                     ending,
-                    false,
+                    is_first_output_record,
                     config.max_record_bytes,
                 )?;
                 last_written_had_lf = !ending.is_empty();
@@ -2392,5 +2584,305 @@ mod tests {
             &after2[prefix.len()..sp2.new_bounds.snapped_end() as usize],
             expected_mid.as_slice()
         );
+    }
+
+    #[test]
+    fn bom_bearing_headerless_byte_zero_section_preserves_bom_across_row_insert_delete_and_delete_all()
+     {
+        let dir = TempDir::new().unwrap();
+        let initial = b"\xEF\xBB\xBFalpha,1\nbeta,2\ngamma,3\n";
+        let path = write_fixture(&dir, "bom_headerless.csv", initial);
+        // Byte-0 section covering only the first two rows ("alpha,1\nbeta,2\n"), leaving "gamma,3\n" as suffix.
+        let sec_len = b"\xEF\xBB\xBFalpha,1\nbeta,2\n".len() as u64;
+        let sec = open_verified_section(
+            &path,
+            ByteWindow::new(0, sec_len).unwrap(),
+            None,
+            HeaderMode::NoHeader,
+        );
+
+        // 1. Insert 1 blank row at row 0 -> BOM must stay at byte 0 before the blank row.
+        let wc_ins = dir.path().join("wc_ins.csv");
+        let SaveAsOutcome::Complete(_) = sec
+            .start_create_working_copy_inserting_rows(
+                BTreeMap::new(),
+                BTreeMap::new(),
+                RowInsertion {
+                    position: 0,
+                    count: 1,
+                    width: 2,
+                },
+                &wc_ins,
+            )
+            .unwrap()
+            .wait()
+            .unwrap()
+        else {
+            panic!("expected working copy insert");
+        };
+        assert_eq!(
+            fs::read(&wc_ins).unwrap(),
+            b"\xEF\xBB\xBF,\nalpha,1\nbeta,2\n"
+        );
+
+        // 2. Delete row 0 -> BOM must stay at byte 0 before "beta,2\n".
+        let wc_del0 = dir.path().join("wc_del0.csv");
+        let SaveAsOutcome::Complete(_) = sec
+            .start_create_working_copy_deleting_rows(
+                BTreeMap::new(),
+                BTreeMap::new(),
+                std::iter::once(0..=0).collect(),
+                &wc_del0,
+            )
+            .unwrap()
+            .wait()
+            .unwrap()
+        else {
+            panic!("expected working copy delete row 0");
+        };
+        assert_eq!(fs::read(&wc_del0).unwrap(), b"\xEF\xBB\xBFbeta,2\n");
+
+        // 3. Delete ALL rows in the section -> BOM must still remain at byte 0, and splicing back
+        //    into the parent file with trailing suffix must NOT insert a phantom empty row!
+        let wc_del_all = dir.path().join("wc_del_all.csv");
+        let SaveAsOutcome::Complete(_) = sec
+            .start_create_working_copy_deleting_rows(
+                BTreeMap::new(),
+                BTreeMap::new(),
+                std::iter::once(0..=1).collect(),
+                &wc_del_all,
+            )
+            .unwrap()
+            .wait()
+            .unwrap()
+        else {
+            panic!("expected working copy delete all");
+        };
+        assert_eq!(fs::read(&wc_del_all).unwrap(), b"\xEF\xBB\xBF");
+
+        let wc_session =
+            Session::open_section_working_copy(&wc_del_all, &sec, OpenOptions::default()).unwrap();
+        let SaveAsOutcome::Complete(saved) = wc_session
+            .start_save_to_original(BTreeMap::new(), BTreeMap::new(), &sec)
+            .unwrap()
+            .wait()
+            .unwrap()
+        else {
+            panic!("expected splice save complete");
+        };
+        let sp = saved.splice.unwrap();
+        assert_eq!(sp.rows_written, 0);
+        assert_eq!(sp.section_bytes_written, 3);
+        assert_eq!(fs::read(&path).unwrap(), b"\xEF\xBB\xBFgamma,3\n");
+    }
+
+    #[test]
+    fn cleared_single_column_unterminated_final_row_persists_as_empty_quoted_record() {
+        let dir = TempDir::new().unwrap();
+        let path = write_fixture(&dir, "one_col_no_lf.csv", b"col\nfirst\nx");
+        let sec = open_verified_section(
+            &path,
+            ByteWindow::new(0, 11).unwrap(),
+            None,
+            HeaderMode::FirstRow,
+        );
+        let mut edits = BTreeMap::new();
+        edits.insert((2, 0), Vec::new());
+        let SaveAsOutcome::Complete(_) = sec
+            .start_save_with_edits(BTreeMap::new(), edits)
+            .unwrap()
+            .wait()
+            .unwrap()
+        else {
+            panic!("expected complete splice");
+        };
+        assert_eq!(fs::read(&path).unwrap(), b"col\nfirst\n\"\"");
+    }
+
+    #[test]
+    fn bomless_byte_zero_section_quotes_literal_feff_on_edit_and_row_delete_promotion() {
+        let dir = TempDir::new().unwrap();
+        // 1. Direct cell edit introducing literal U+FEFF at byte 0 of a BOM-less file.
+        let p1 = write_fixture(&dir, "bomless_edit.csv", b"alpha,1\nbeta,2\n");
+        let sec1 = open_verified_section(
+            &p1,
+            ByteWindow::new(0, 15).unwrap(),
+            None,
+            HeaderMode::NoHeader,
+        );
+        let mut edits = BTreeMap::new();
+        edits.insert((0, 0), b"\xEF\xBB\xBFalpha".to_vec());
+        let SaveAsOutcome::Complete(_) = sec1
+            .start_save_with_edits(BTreeMap::new(), edits)
+            .unwrap()
+            .wait()
+            .unwrap()
+        else {
+            panic!("expected complete splice");
+        };
+        assert_eq!(fs::read(&p1).unwrap(), b"\"\xEF\xBB\xBFalpha\",1\nbeta,2\n");
+        // Reopening must preserve literal U+FEFF in cell (0, 0), NOT strip it as a BOM.
+        let reopened = Session::open(
+            &p1,
+            OpenOptions {
+                delimiter: Some(b','),
+                header_mode: HeaderMode::NoHeader,
+                ..OpenOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(reopened.first_rows[0].fields[0], b"\xEF\xBB\xBFalpha");
+
+        // 2. Deleting row 0 promotes row 1 starting with literal unquoted U+FEFF to byte 0.
+        let p2 = write_fixture(&dir, "bomless_del.csv", b"drop,0\n\xEF\xBB\xBFkeep,1\n");
+        let sec2 = open_verified_section(
+            &p2,
+            ByteWindow::new(0, fs::metadata(&p2).unwrap().len()).unwrap(),
+            None,
+            HeaderMode::NoHeader,
+        );
+        let wc = dir.path().join("wc_promoted.csv");
+        let SaveAsOutcome::Complete(_) = sec2
+            .start_create_working_copy_deleting_rows(
+                BTreeMap::new(),
+                BTreeMap::new(),
+                std::iter::once(0..=0).collect(),
+                &wc,
+            )
+            .unwrap()
+            .wait()
+            .unwrap()
+        else {
+            panic!("expected delete working copy");
+        };
+        assert_eq!(fs::read(&wc).unwrap(), b"\"\xEF\xBB\xBFkeep\",1\n");
+    }
+
+    #[test]
+    fn section_replace_all_rejects_oversized_expansion_before_unbounded_growth() {
+        let dir = TempDir::new().unwrap();
+        // 200 occurrences of 'a' replaced by 500_000 bytes each would be 100 MiB (> 64 MiB default
+        // `DEFAULT_MAX_RECORD_BYTES` limit).
+        let mut content = Vec::from(&b"id,text\n1,"[..]);
+        content.extend(std::iter::repeat_n(b'a', 200));
+        content.push(b'\n');
+        let path = write_fixture(&dir, "replace_oversize.csv", &content);
+        let sec = open_verified_section(
+            &path,
+            ByteWindow::new(0, content.len() as u64).unwrap(),
+            None,
+            HeaderMode::FirstRow,
+        );
+        let wc = dir.path().join("wc_oversize.csv");
+        let err = sec
+            .start_create_replaced_working_copy_with_options(
+                BTreeMap::new(),
+                BTreeMap::new(),
+                LiteralReplacement {
+                    needle: b"a".to_vec(),
+                    replacement: vec![b'X'; 500_000],
+                    case_sensitivity: CaseSensitivity::Sensitive,
+                },
+                &wc,
+                ReplaceAllOptions::default(),
+            )
+            .unwrap()
+            .wait()
+            .unwrap_err();
+        assert!(
+            matches!(err, QuarryError::RecordTooLarge { .. }),
+            "expected RecordTooLarge, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn mismatched_section_save_to_original_is_rejected() {
+        let dir = TempDir::new().unwrap();
+        let data = b"id,val\n1,aaa\n2,bbb\n3,ccc\n4,ddd\n";
+        let path = write_fixture(&dir, "two_sections.csv", data);
+        let sec_a = open_verified_section(
+            &path,
+            ByteWindow::new(7, 6).unwrap(), // "1,aaa\n"
+            None,
+            HeaderMode::FirstRow,
+        );
+        let sec_b = open_verified_section(
+            &path,
+            ByteWindow::new(13, 6).unwrap(), // "2,bbb\n"
+            None,
+            HeaderMode::FirstRow,
+        );
+        let err = match sec_a.start_save_to_original(BTreeMap::new(), BTreeMap::new(), &sec_b) {
+            Err(err) => err,
+            Ok(_) => panic!("expected mismatched section provenance to be rejected"),
+        };
+        assert!(
+            matches!(err, QuarryError::InvalidOption(_)),
+            "expected InvalidOption for mismatched section bounds, got {err:?}"
+        );
+        assert_eq!(fs::read(&path).unwrap(), data);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn readonly_mode_0444_parent_splice_save_succeeds_and_preserves_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        let path = write_fixture(&dir, "readonly_parent.csv", b"id,val\n1,aaa\n2,bbb\n");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o444)).unwrap();
+
+        let sec = open_verified_section(
+            &path,
+            ByteWindow::new(7, 6).unwrap(),
+            None,
+            HeaderMode::FirstRow,
+        );
+        let mut edits = BTreeMap::new();
+        edits.insert((0, 1), b"ZZZ".to_vec());
+        let SaveAsOutcome::Complete(summary) = sec
+            .start_save_with_edits(BTreeMap::new(), edits)
+            .unwrap()
+            .wait()
+            .unwrap()
+        else {
+            panic!("expected complete splice on 0444 parent");
+        };
+        let sp = summary.splice.unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"id,val\n1,ZZZ\n2,bbb\n");
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o444);
+        assert!(sp.published_guard.matches_path(&path).unwrap());
+
+        // Restore write bit for clean TempDir teardown on strict environments.
+        let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o644));
+    }
+
+    #[test]
+    fn splice_summary_published_guard_matches_published_file_and_rejects_post_save_tamper() {
+        let dir = TempDir::new().unwrap();
+        let path = write_fixture(&dir, "guard_check.csv", b"id,val\n1,aaa\n2,bbb\n");
+        let sec = open_verified_section(
+            &path,
+            ByteWindow::new(7, 6).unwrap(),
+            None,
+            HeaderMode::FirstRow,
+        );
+        let mut edits = BTreeMap::new();
+        edits.insert((0, 1), b"AAA".to_vec());
+        let SaveAsOutcome::Complete(summary) = sec
+            .start_save_with_edits(BTreeMap::new(), edits)
+            .unwrap()
+            .wait()
+            .unwrap()
+        else {
+            panic!("expected complete splice");
+        };
+        let sp = summary.splice.unwrap();
+        assert!(sp.published_guard.matches_path(&path).unwrap());
+
+        // External write right after splice invalidates `published_guard`.
+        fs::write(&path, b"id,val\n1,EXT\n2,bbb\n3,ccc\n").unwrap();
+        assert!(!sp.published_guard.matches_path(&path).unwrap());
     }
 }

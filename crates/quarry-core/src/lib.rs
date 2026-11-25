@@ -838,6 +838,7 @@ impl Session {
                 header_row,
                 bom_len,
                 backed_by_working_copy: false,
+                origin_parent_stamp: None,
             }),
             file_size,
             dialect: Dialect {
@@ -901,6 +902,7 @@ impl Session {
                 header_row: parent_meta.header_row.clone(),
                 bom_len: parent_meta.bom_len,
                 backed_by_working_copy: true,
+                origin_parent_stamp: Some(original_parent.source_stamp.clone()),
             }),
             file_size,
             dialect: original_parent.dialect,

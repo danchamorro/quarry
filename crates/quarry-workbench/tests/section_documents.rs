@@ -1225,3 +1225,155 @@ fn speculative_section_blocks_row_edits_and_splice_save_until_verified_in_place(
 
     let _ = fs::remove_file(&path);
 }
+
+#[test]
+fn undo_redo_enforces_sibling_dirty_exclusion() {
+    let path = temp_csv("undo-redo-sibling", b"id,val\n1,alpha\n2,beta\n");
+    let mut scheduler = WorkbenchScheduler::new(WorkbenchSchedulerConfig::default());
+    scheduler.register_window(WindowId::PRIMARY);
+
+    let parent_id = match scheduler
+        .open_path(
+            WindowId::PRIMARY,
+            path.clone(),
+            OpenOptions::default(),
+            None,
+        )
+        .unwrap()
+    {
+        WakeOutcome::Ready { document_id, .. } => document_id,
+        other => panic!("unexpected parent open: {other:?}"),
+    };
+    wait_for_index(&mut scheduler, parent_id);
+
+    let sec_id = match scheduler
+        .open_section(
+            WindowId::PRIMARY,
+            path.clone(),
+            ByteWindow::new(7, 8).unwrap(),
+            SectionOpenOptions::default(),
+        )
+        .unwrap()
+    {
+        WakeOutcome::Ready { document_id, .. } => document_id,
+        other => panic!("unexpected section open: {other:?}"),
+    };
+    wait_for_index(&mut scheduler, sec_id);
+
+    // Edit section tab -> dirty -> undo until clean.
+    {
+        let doc = scheduler
+            .tab_mut(sec_id)
+            .unwrap()
+            .document
+            .as_mut()
+            .unwrap();
+        doc.begin_cell_edit(0, 1, b"alpha".to_vec()).unwrap();
+        doc.cell_edit.as_mut().unwrap().draft = "ALPHA".into();
+        doc.commit_cell_edit();
+        assert!(doc.is_dirty());
+    }
+    scheduler.apply_undo_redo(sec_id, false).unwrap();
+    assert!(!scheduler.tab_is_dirty(sec_id));
+
+    // Edit parent tab -> now parent is dirty.
+    {
+        let doc = scheduler
+            .tab_mut(parent_id)
+            .unwrap()
+            .document
+            .as_mut()
+            .unwrap();
+        doc.begin_cell_edit(1, 1, b"alpha".to_vec()).unwrap();
+        doc.cell_edit.as_mut().unwrap().draft = "PARENT".into();
+        doc.commit_cell_edit();
+        assert!(doc.is_dirty());
+    }
+
+    // Attempting to Redo in the clean section tab must be blocked while parent is dirty!
+    let err = scheduler.apply_undo_redo(sec_id, true).unwrap_err();
+    assert!(
+        err.text.contains("already has unsaved changes"),
+        "expected sibling dirty conflict on redo, got: {}",
+        err.text
+    );
+    assert!(!scheduler.tab_is_dirty(sec_id));
+
+    let _ = fs::remove_file(&path);
+}
+
+#[test]
+fn sibling_invalidation_releases_unrelated_export_write_destination() {
+    let path = temp_csv("sibling-export-res", b"id,val\n1,alpha\n2,beta\n");
+    let export_dest = path.with_extension("exported.csv");
+    let _ = fs::remove_file(&export_dest);
+
+    let mut scheduler = WorkbenchScheduler::new(WorkbenchSchedulerConfig::default());
+    scheduler.register_window(WindowId::PRIMARY);
+
+    let parent_id = match scheduler
+        .open_path(
+            WindowId::PRIMARY,
+            path.clone(),
+            OpenOptions::default(),
+            None,
+        )
+        .unwrap()
+    {
+        WakeOutcome::Ready { document_id, .. } => document_id,
+        other => panic!("unexpected parent open: {other:?}"),
+    };
+    wait_for_index(&mut scheduler, parent_id);
+
+    let sec_id = match scheduler
+        .open_section(
+            WindowId::PRIMARY,
+            path.clone(),
+            ByteWindow::new(7, 8).unwrap(),
+            SectionOpenOptions::default(),
+        )
+        .unwrap()
+    {
+        WakeOutcome::Ready { document_id, .. } => document_id,
+        other => panic!("unexpected section open: {other:?}"),
+    };
+    wait_for_index(&mut scheduler, sec_id);
+
+    // Simulate an unrelated write_destination reservation on the clean parent tab.
+    scheduler.tab_mut(parent_id).unwrap().write_destination = Some(export_dest.clone());
+
+    // Edit & splice-save the section tab.
+    {
+        let doc = scheduler
+            .tab_mut(sec_id)
+            .unwrap()
+            .document
+            .as_mut()
+            .unwrap();
+        doc.begin_cell_edit(0, 1, b"alpha".to_vec()).unwrap();
+        doc.cell_edit.as_mut().unwrap().draft = "ALPHA".into();
+        doc.commit_cell_edit();
+        doc.start_save().unwrap();
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let saves = scheduler.poll_saves();
+        if let Some(c) = saves.into_iter().find(|s| s.document_id == sec_id) {
+            c.result.unwrap();
+            break;
+        }
+        assert!(Instant::now() < deadline, "timed out waiting for splice");
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    // Parent tab must be invalidated AND its unrelated write_destination reservation cleared.
+    let parent_tab = scheduler.tab(parent_id).unwrap();
+    assert!(parent_tab.document.as_ref().unwrap().source_changed);
+    assert!(
+        parent_tab.write_destination.is_none(),
+        "sibling invalidation must not strand an unrelated export write_destination"
+    );
+
+    let _ = fs::remove_file(&path);
+    let _ = fs::remove_file(&export_dest);
+}

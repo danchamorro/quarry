@@ -289,6 +289,9 @@ pub(crate) struct SectionMetadata {
     /// True when this session reads a private section-only working copy (offsets `[0, file_size)`)
     /// rather than reading `[bounds.snapped.base, bounds.snapped_end())` directly from the parent.
     pub(crate) backed_by_working_copy: bool,
+    /// Stamp of the parent file generation from which a section working copy was derived.
+    /// `None` for direct sections (whose own `Session::source_stamp` is the parent stamp).
+    pub(crate) origin_parent_stamp: Option<SourceStamp>,
 }
 
 /// Live progress snapshot of a background `VerifyBoundaryJob`.

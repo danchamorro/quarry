@@ -3421,7 +3421,7 @@ impl Document {
         self.saving_in_place = false;
         match job.wait() {
             Ok(SaveAsOutcome::Complete(summary)) => {
-                self.last_splice_summary = summary.splice;
+                self.last_splice_summary = summary.splice.map(|boxed| *boxed);
                 Ok(Some((summary.destination, in_place)))
             }
             Ok(SaveAsOutcome::Cancelled) => {

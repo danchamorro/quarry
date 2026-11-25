@@ -83,7 +83,7 @@ pub struct SaveAsSummary {
     pub destination: PathBuf,
     pub bytes_written: u64,
     /// Present when this save completed an in-place guarded section splice-save (ADR 0015).
-    pub splice: Option<crate::SpliceSaveSummary>,
+    pub splice: Option<Box<crate::SpliceSaveSummary>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2205,6 +2205,7 @@ impl Session {
                 self.path.clone(),
                 self.source_stamp.clone(),
                 meta.bounds,
+                meta.bom_len > 0,
                 read_base,
                 read_end,
                 self.dialect.delimiter,
@@ -2255,6 +2256,7 @@ impl Session {
                 self.path.clone(),
                 self.source_stamp.clone(),
                 meta.bounds,
+                meta.bom_len > 0,
                 read_base,
                 read_end,
                 self.dialect.delimiter,
@@ -2351,6 +2353,7 @@ impl Session {
                 self.path.clone(),
                 self.source_stamp.clone(),
                 meta.bounds,
+                meta.bom_len > 0,
                 read_base,
                 read_end,
                 self.dialect.delimiter,
@@ -2409,12 +2412,43 @@ impl Session {
             return Err(QuarryError::CompressedReadOnly);
         }
         if let Some(parent_meta) = &original.section {
+            let Some(self_meta) = &self.section else {
+                return Err(QuarryError::InvalidOption(
+                    "Cannot splice-save a non-section session into a bounded section target.",
+                ));
+            };
+            if parent_meta.backed_by_working_copy {
+                return Err(QuarryError::InvalidOption(
+                    "Original session must be the parent section session, not a working copy.",
+                ));
+            }
+            if self_meta.bounds != parent_meta.bounds
+                || self.encoding != original.encoding
+                || self.dialect.delimiter != original.dialect.delimiter
+                || self.dialect.has_header != original.dialect.has_header
+            {
+                return Err(QuarryError::InvalidOption(
+                    "Section splice source does not match the target section's bounds or framing.",
+                ));
+            }
+            if self_meta.backed_by_working_copy {
+                if self_meta.origin_parent_stamp.as_ref() != Some(&original.source_stamp) {
+                    return Err(QuarryError::InvalidOption(
+                        "Section working copy does not originate from the target parent section.",
+                    ));
+                }
+            } else if self.path != original.path || self.source_stamp != original.source_stamp {
+                return Err(QuarryError::InvalidOption(
+                    "Section splice source does not match the target parent section.",
+                ));
+            }
             let (read_base, read_end) = self.active_byte_range();
             return crate::splice::start_section_splice(
                 original.path.clone(),
                 original.source_stamp.clone(),
                 original.file_size,
                 parent_meta.bounds,
+                parent_meta.bom_len > 0,
                 self.path.clone(),
                 self.source_stamp.clone(),
                 read_base,
@@ -2510,6 +2544,7 @@ impl Session {
                 self.source_stamp.clone(),
                 self.file_size,
                 meta.bounds,
+                meta.bom_len > 0,
                 self.path.clone(),
                 self.source_stamp.clone(),
                 read_base,
