@@ -277,6 +277,7 @@ pub struct Document {
     pub save_status: Option<String>,
     pub save_cancel_requested: bool,
     pub saving_in_place: bool,
+    pub last_splice_summary: Option<quarry_core::SpliceSaveSummary>,
     pub structural_job: Option<StructuralJob>,
     pub structural_status: Option<String>,
     pub structural_cancel_requested: bool,
@@ -439,6 +440,22 @@ impl Document {
         Ok(doc)
     }
 
+    /// Prepares a bounded section document backed by a private section-only working copy,
+    /// preserving the original parent section's bounds, trust, header, and BOM provenance.
+    pub fn prepare_section_working_copy(
+        working_path: &Path,
+        original_parent: &Session,
+        mut options: OpenOptions,
+        quote_free_confirmed: bool,
+    ) -> Result<Self, String> {
+        options.rows = BOOTSTRAP_ROWS + 2 * OVERSCAN_ROWS + 1;
+        let session = Session::open_section_working_copy(working_path, original_parent, options)
+            .map_err(|error| error.to_string())?;
+        let mut doc = Self::from_session(session, original_parent.path());
+        doc.section_quote_free_confirmed = quote_free_confirmed;
+        Ok(doc)
+    }
+
     /// Builds the view over an opened session; no worker starts here.
     pub fn from_session(session: Session, path: &Path) -> Self {
         Self::from_arc_session(Arc::new(session), path)
@@ -447,8 +464,7 @@ impl Document {
     /// Builds the view over a shared session (used when waking dormant dirty or compressed tabs).
     pub fn from_arc_session(session: Arc<Session>, path: &Path) -> Self {
         let buffer_rows = BOOTSTRAP_ROWS + 2 * OVERSCAN_ROWS;
-        let (section_base, _) = session.active_byte_range();
-        let data_start = u64::from(session.dialect.has_header && section_base == 0);
+        let data_start = u64::from(session.dialect.has_header && !session.section_is_interior());
         let header_cols = session
             .section_header_row()
             .map_or(0, |row| row.fields.len());
@@ -527,6 +543,7 @@ impl Document {
             save_status: None,
             save_cancel_requested: false,
             saving_in_place: false,
+            last_splice_summary: None,
             structural_job: None,
             structural_status: None,
             structural_cancel_requested: false,
@@ -580,14 +597,9 @@ impl Document {
         }
     }
 
-    pub fn pending_materialization_confirm_disabled_reason(&self) -> Option<&'static str> {
+    fn common_structural_edit_disabled_reason(&self) -> Option<&'static str> {
         if let Some(reason) = self.compressed_read_only_reason() {
             return Some(reason);
-        }
-        if self.is_section() {
-            return Some(
-                "Structural table rewrites are not enabled for section documents yet; use Save As to export this section as a standalone file first.",
-            );
         }
         if self.join_reserved() {
             return Some(JOIN_INPUT_RESERVED);
@@ -610,6 +622,15 @@ impl Document {
         }
     }
 
+    pub fn pending_materialization_confirm_disabled_reason(&self) -> Option<&'static str> {
+        if self.is_section() {
+            return Some(
+                "Column schema, sort, and deduplicate operations are disabled on section documents. Use Save Section As New to edit a standalone copy.",
+            );
+        }
+        self.common_structural_edit_disabled_reason()
+    }
+
     pub fn structural_edit_disabled_reason(&self) -> Option<&'static str> {
         self.pending_materialization_confirm_disabled_reason()
             .or_else(|| {
@@ -619,8 +640,35 @@ impl Document {
             })
     }
 
+    /// Gating for row-scoped and content-scoped rewrites (`Insert Rows`, `Delete Selected Rows`,
+    /// `Replace All`), which are allowed on `Verified` bounded sections in addition to whole files.
+    pub fn row_structural_edit_disabled_reason(&self) -> Option<&'static str> {
+        if self.is_section() {
+            if self.pending_verified_reopen.is_some() {
+                return Some(
+                    "Reopen this section at the verified boundaries before inserting rows, deleting rows, or running Replace All.",
+                );
+            }
+            if self.section_trust() != Some(BoundaryTrust::Verified) {
+                return Some(
+                    "Verify section boundaries before inserting rows, deleting rows, or running Replace All.",
+                );
+            }
+        }
+        self.common_structural_edit_disabled_reason().or_else(|| {
+            self.pending_materialization
+                .is_some()
+                .then_some("Confirm or cancel the pending split first.")
+        })
+    }
+
     pub fn insertion_disabled_reason(&self, rows: bool) -> Option<&'static str> {
-        self.structural_edit_disabled_reason()
+        let base_reason = if rows {
+            self.row_structural_edit_disabled_reason()
+        } else {
+            self.structural_edit_disabled_reason()
+        };
+        base_reason
             .or_else(|| {
                 let records = self.index.as_ref()?.indexed_rows();
                 if self.data_start > records {
@@ -896,7 +944,7 @@ impl Document {
     }
 
     pub fn start_delete_rows(&mut self, rows: Vec<RangeInclusive<u64>>) -> Result<(), AppMessage> {
-        if let Some(reason) = self.structural_edit_disabled_reason() {
+        if let Some(reason) = self.row_structural_edit_disabled_reason() {
             return Err(AppMessage::warning(reason));
         }
         if rows.is_empty() {
@@ -1242,21 +1290,50 @@ impl Document {
                 }
                 Err(error) => return Err(AppMessage::core_error(error)),
             }
-            let original = match Session::open_with_encoding(
-                &self.logical_path,
-                self.current_open_options(),
-                Some(self.session.encoding()),
-            ) {
-                Ok(original) => original,
-                Err(QuarryError::SourceChanged) => {
-                    self.invalidate_changed_source();
-                    return Err(AppMessage::warning(SOURCE_CHANGED_NOTICE));
+            let original = if let Some(bounds) = self.section_bounds() {
+                let sec_opts = SectionOpenOptions {
+                    open: self.current_open_options(),
+                    encoding: Some(self.session.encoding()),
+                    parent_index: None,
+                    quote_free_confirmed: self.section_quote_free_confirmed,
+                    ..SectionOpenOptions::default()
+                };
+                match Session::open_section_preserved(
+                    &self.logical_path,
+                    bounds,
+                    &self.session.source_guard(),
+                    self.session.dialect.delimiter,
+                    self.session.encoding(),
+                    sec_opts,
+                ) {
+                    Ok(original) => original,
+                    Err(QuarryError::SourceChanged) => {
+                        self.invalidate_changed_source();
+                        return Err(AppMessage::warning(SOURCE_CHANGED_NOTICE));
+                    }
+                    Err(QuarryError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                        self.invalidate_changed_source();
+                        return Err(AppMessage::warning(SOURCE_CHANGED_NOTICE));
+                    }
+                    Err(error) => return Err(AppMessage::core_error(error)),
                 }
-                Err(QuarryError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-                    self.invalidate_changed_source();
-                    return Err(AppMessage::warning(SOURCE_CHANGED_NOTICE));
+            } else {
+                match Session::open_with_encoding(
+                    &self.logical_path,
+                    self.current_open_options(),
+                    Some(self.session.encoding()),
+                ) {
+                    Ok(original) => original,
+                    Err(QuarryError::SourceChanged) => {
+                        self.invalidate_changed_source();
+                        return Err(AppMessage::warning(SOURCE_CHANGED_NOTICE));
+                    }
+                    Err(QuarryError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                        self.invalidate_changed_source();
+                        return Err(AppMessage::warning(SOURCE_CHANGED_NOTICE));
+                    }
+                    Err(error) => return Err(AppMessage::core_error(error)),
                 }
-                Err(error) => return Err(AppMessage::core_error(error)),
             };
             self.original_session = Some(original);
         }
@@ -1418,7 +1495,7 @@ impl Document {
         replacement: &[u8],
         case_sensitivity: CaseSensitivity,
     ) -> Result<(), AppMessage> {
-        if let Some(reason) = self.structural_edit_disabled_reason() {
+        if let Some(reason) = self.row_structural_edit_disabled_reason() {
             return Err(AppMessage::warning(reason));
         }
         if query.is_empty() {
@@ -2957,6 +3034,7 @@ impl Document {
 
     pub fn can_verify_section_boundary(&self) -> bool {
         self.is_section()
+            && !self.session.section_backed_by_working_copy()
             && !self.source_changed
             && self.section_verify_job.is_none()
             && self.section_bounds().is_some_and(|bounds| {
@@ -2987,6 +3065,11 @@ impl Document {
         if !self.is_section() {
             return Err(AppMessage::warning(
                 "Verify Boundary is only available for section documents.",
+            ));
+        }
+        if self.session.section_backed_by_working_copy() {
+            return Err(AppMessage::warning(
+                "Save or discard structural section edits before verifying global row numbers.",
             ));
         }
         if self.source_changed {
@@ -3070,6 +3153,14 @@ impl Document {
                 if !boundary_changed {
                     self.verified_bounds_override = Some(bounds);
                     self.pending_verified_reopen = None;
+                    if let Ok(upgraded) = self.session.with_verified_section_bounds(bounds) {
+                        self.session = Arc::new(upgraded);
+                    }
+                    if let Some(orig) = self.original_session.as_mut()
+                        && let Ok(upgraded) = orig.with_verified_section_bounds(bounds)
+                    {
+                        *orig = upgraded;
+                    }
                     self.section_verify_status = Some(
                         if let Some(first) = self.global_data_row_number(self.data_start) {
                             format!(
@@ -3112,9 +3203,42 @@ impl Document {
         }
     }
 
+    /// Returns an actionable reason when in-place section splice-save is unavailable for this
+    /// document, or `None` when this is a whole file or a `Verified` section ready to splice-save.
+    pub fn section_splice_unavailable_reason(&self) -> Option<&'static str> {
+        if !self.is_section() {
+            return None;
+        }
+        if self.pending_verified_reopen.is_some() {
+            return Some(
+                "Verified boundaries shifted. Reopen at the verified boundaries before saving back to the parent file, or use Save Section As New.",
+            );
+        }
+        if self.section_trust() != Some(BoundaryTrust::Verified) {
+            return Some(
+                "Verify section boundaries before saving changes back to the parent file, or use Save Section As New.",
+            );
+        }
+        if self.has_reordered_columns() {
+            return Some(
+                "Reset the column layout before saving changes back to the parent file, or use Save Section As New.",
+            );
+        }
+        if !self.header_renames.is_empty() {
+            return Some(
+                "Header edits cannot be saved back to the parent file. Use Save Section As New instead.",
+            );
+        }
+        None
+    }
+
+    pub fn can_splice_save_section(&self) -> bool {
+        self.is_section() && self.section_splice_unavailable_reason().is_none()
+    }
+
     pub fn is_save_ready(&self) -> bool {
         !self.is_compressed()
-            && !self.is_section()
+            && self.section_splice_unavailable_reason().is_none()
             && self.is_dirty()
             && self.save_operations_ready()
     }
@@ -3133,11 +3257,19 @@ impl Document {
     }
 
     pub fn is_save_as_ready(&self) -> bool {
-        (self.is_dirty()
-            || self.has_reordered_columns()
-            || self.compressed_save_as_ready()
-            || self.is_section())
-            && self.save_operations_ready()
+        let recoverable_section_copy = self.source_changed
+            && self.is_section()
+            && self.session.section_backed_by_working_copy()
+            && !self.join_reserved()
+            && self.save_job.is_none()
+            && self.export_job.is_none()
+            && self.structural_job.is_none();
+        recoverable_section_copy
+            || ((self.is_dirty()
+                || self.has_reordered_columns()
+                || self.compressed_save_as_ready()
+                || self.is_section())
+                && self.save_operations_ready())
     }
 
     pub fn save_operations_ready(&self) -> bool {
@@ -3170,7 +3302,13 @@ impl Document {
             return Err(AppMessage::warning(JOIN_INPUT_RESERVED));
         }
         if self.source_changed {
-            return Err(AppMessage::warning(SOURCE_CHANGED_NOTICE));
+            let recoverable_section_copy = destination.is_some()
+                && self.is_section()
+                && self.session.section_backed_by_working_copy()
+                && self.session.ensure_source_unchanged().is_ok();
+            if !recoverable_section_copy {
+                return Err(AppMessage::warning(SOURCE_CHANGED_NOTICE));
+            }
         }
         if self.structural_job.is_some() {
             return Err(AppMessage::warning(
@@ -3204,10 +3342,11 @@ impl Document {
                 return Err(AppMessage::warning(reason));
             }
         }
-        if self.is_section() && destination.is_none() {
-            return Err(AppMessage::warning(
-                "In-place save is not enabled for section documents yet. Use Save As to write a new file.",
-            ));
+        if self.is_section()
+            && destination.is_none()
+            && let Some(reason) = self.section_splice_unavailable_reason()
+        {
+            return Err(AppMessage::warning(reason));
         }
         self.commit_edits();
         // A compressed document has no edits; its Save As writes an uncompressed copy.
@@ -3276,7 +3415,12 @@ impl Document {
             self.session.encoding()
         });
         self.save_job = Some(job);
-        self.save_status = Some("Saving edited file…".into());
+        self.last_splice_summary = None;
+        self.save_status = Some(if saving_in_place && self.is_section() {
+            "Splicing edited section into parent file…".into()
+        } else {
+            "Saving edited file…".into()
+        });
         self.save_cancel_requested = false;
         self.saving_in_place = saving_in_place;
         Ok(())
@@ -3296,7 +3440,10 @@ impl Document {
         self.save_cancel_requested = false;
         self.saving_in_place = false;
         match job.wait() {
-            Ok(SaveAsOutcome::Complete(summary)) => Ok(Some((summary.destination, in_place))),
+            Ok(SaveAsOutcome::Complete(summary)) => {
+                self.last_splice_summary = summary.splice.map(|boxed| *boxed);
+                Ok(Some((summary.destination, in_place)))
+            }
             Ok(SaveAsOutcome::Cancelled) => {
                 self.save_status = Some(if in_place {
                     "Save cancelled. Quarry did not replace the current file.".into()
@@ -3594,6 +3741,7 @@ impl Document {
 
     pub fn header_is_editable(&self, column: usize) -> bool {
         !self.is_compressed()
+            && !self.is_section()
             && !self.join_reserved()
             && self.save_job.is_none()
             && self.export_job.is_none()
@@ -3637,6 +3785,11 @@ impl Document {
     pub fn rename_header(&mut self, column: usize, name: String) -> Result<(), String> {
         if let Some(reason) = self.compressed_read_only_reason() {
             return Err(reason.into());
+        }
+        if self.is_section() {
+            return Err(
+                "Header edits are disabled on section documents. Use Save Section As New to rename columns on a standalone copy.".into(),
+            );
         }
         if self.join_reserved() {
             return Err(JOIN_INPUT_RESERVED.into());

@@ -3235,13 +3235,22 @@ fn open_section_modal_verify_boundary_and_save_section_as_new_in_gpui(cx: &mut T
                 .is_some_and(|s| s.section.is_some() && s.index_done)
     });
 
-    // 6. Edit the active section, request tab close, and complete Save-and-Close via Save As.
+    // 6. Edit a data cell in the active section (header rename is disabled on sections),
+    // request tab close, and complete Save-and-Close via Save As.
     let close_save_path = dir.path().join("section_close_save_as.csv");
     let dirty_sec_id = cx.update(|cx| view.read(cx).snapshot(cx).unwrap().document_id);
     cx.update(|cx| {
+        assert!(
+            controller
+                .update(cx, |c, cx| {
+                    c.rename_header_active(win_id, dirty_sec_id, 0, "edited_id".into(), cx)
+                })
+                .is_err(),
+            "header rename must be disabled on section documents"
+        );
         controller
             .update(cx, |c, cx| {
-                c.rename_header_active(win_id, dirty_sec_id, 0, "edited_id".into(), cx)
+                c.apply_cell_edit(win_id, dirty_sec_id, 1, 1, "EDITED_CELL_VAL".into(), cx)
             })
             .unwrap();
     });
@@ -3277,7 +3286,8 @@ fn open_section_modal_verify_boundary_and_save_section_as_new_in_gpui(cx: &mut T
                 .all(|tab| tab.id != dirty_sec_id)
     });
     let close_saved = std::fs::read_to_string(&close_save_path).unwrap();
-    assert!(close_saved.starts_with("edited_id,payload\n"));
+    assert!(close_saved.starts_with("id,payload\n"));
+    assert!(close_saved.contains("EDITED_CELL_VAL"));
 }
 
 #[gpui_kit::test]
@@ -3410,4 +3420,158 @@ fn open_section_dialog_preserves_active_explicit_encoding_for_bomless_utf16le(
         quarry_core::HeaderMode::NoHeader
     );
     assert_eq!(nh_sec.total_rows, 3);
+}
+
+#[gpui_kit::test]
+fn verified_section_edits_and_splice_save_invalidates_parent_and_blocks_sibling_dirty_edits(
+    cx: &mut TestAppContext,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("splice_ui.csv");
+    let prefix = "id,tag,note\n0,old,head\n";
+    let middle = "1,old,one\n2,keep,two\n3,old,three\n";
+    let suffix = "4,old,tail\n";
+    std::fs::write(&path, format!("{prefix}{middle}{suffix}")).unwrap();
+
+    let controller = cx.update(|cx| {
+        gpui_kit::init(cx);
+        crate::apply_light_theme(cx);
+        bind_shortcuts(cx);
+        install_menus(cx);
+        WorkbenchController::reset_for_test(
+            cx,
+            WorkbenchSchedulerConfig {
+                index_cache_enabled: false,
+                ..WorkbenchSchedulerConfig::default()
+            },
+        )
+    });
+    let (handle, view) = open_test_window(cx, &controller);
+    let win_id = cx.update(|cx| view.read(cx).window_id);
+
+    // 1. Open parent file and wait for index.
+    cx.update(|cx| {
+        controller
+            .update(cx, |c, cx| {
+                c.open_paths(win_id, vec![path.clone()], Default::default(), None, cx)
+            })
+            .unwrap();
+    });
+    wait_for_ui(cx, handle, &controller, &view, |q, _, cx| {
+        q.snapshot(cx).is_some_and(|s| s.index_done)
+    });
+    let parent_id = cx.update(|cx| view.read(cx).snapshot(cx).unwrap().document_id);
+
+    // 2. Open verified interior section covering rows 1..=3.
+    let sec_start = prefix.len() as u64;
+    let sec_len = middle.len() as u64;
+    cx.update(|cx| {
+        controller
+            .update(cx, |c, cx| {
+                c.open_section(
+                    win_id,
+                    path.clone(),
+                    quarry_core::ByteWindow::new(sec_start, sec_len).unwrap(),
+                    quarry_core::SectionOpenOptions::default(),
+                    cx,
+                )
+            })
+            .unwrap();
+    });
+    wait_for_ui(cx, handle, &controller, &view, |q, _, cx| {
+        q.snapshot(cx)
+            .is_some_and(|s| s.section.is_some() && s.index_done)
+    });
+    let sec_snap = cx.update(|cx| view.read(cx).snapshot(cx).unwrap());
+    let sec_id = sec_snap.document_id;
+    let sec_meta = sec_snap.section.as_deref().unwrap();
+    assert_eq!(sec_meta.bounds.trust, quarry_core::BoundaryTrust::Verified);
+    assert!(sec_meta.can_splice_save);
+    assert!(cx.update(|cx| controller.read(cx).document_can_splice_save(sec_id)));
+
+    // 3. Edit cell (0, 2) -> "ONE_EDITED" on the Verified section.
+    cx.update(|cx| {
+        controller
+            .update(cx, |c, cx| {
+                c.apply_cell_edit(win_id, sec_id, 0, 2, "ONE_EDITED".into(), cx)
+            })
+            .unwrap();
+    });
+
+    // 4. Switch to parent tab and confirm dirty mutual exclusion rejects editing parent while
+    // section is dirty!
+    cx.update(|cx| {
+        controller
+            .update(cx, |c, cx| c.activate_tab(win_id, parent_id, cx))
+            .unwrap();
+    });
+    let parent_edit_err = cx.update(|cx| {
+        controller
+            .update(cx, |c, cx| {
+                c.apply_cell_edit(win_id, parent_id, 1, 2, "CONFLICT".into(), cx)
+            })
+            .unwrap_err()
+    });
+    assert!(
+        parent_edit_err.to_lowercase().contains("unsaved changes"),
+        "expected dirty mutual exclusion error, got: {parent_edit_err}"
+    );
+
+    // 5. Switch back to section, run Replace All "old" -> "NEW", then Save in-place!
+    cx.update(|cx| {
+        controller
+            .update(cx, |c, cx| c.activate_tab(win_id, sec_id, cx))
+            .unwrap();
+        controller
+            .update(cx, |c, cx| {
+                c.replace_all_active(
+                    win_id,
+                    sec_id,
+                    b"old".to_vec(),
+                    b"NEW".to_vec(),
+                    quarry_core::CaseSensitivity::Sensitive,
+                    cx,
+                )
+            })
+            .unwrap();
+    });
+    wait_for_ui(cx, handle, &controller, &view, |q, _, cx| {
+        q.snapshot(cx)
+            .is_some_and(|s| s.document_id == sec_id && !s.structural_running && s.index_done)
+    });
+
+    cx.update(|cx| {
+        controller
+            .update(cx, |c, cx| {
+                c.start_save_active(win_id, Some(sec_id), None, None, cx)
+            })
+            .unwrap();
+    });
+    wait_for_ui(cx, handle, &controller, &view, |q, _, cx| {
+        q.snapshot(cx)
+            .is_some_and(|s| s.document_id == sec_id && !s.saving && !s.dirty && s.index_done)
+    });
+
+    // Verify parent file bytes: untouched prefix & suffix, updated middle section!
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "id,tag,note\n0,old,head\n1,NEW,ONE_EDITED\n2,keep,two\n3,NEW,three\n4,old,tail\n"
+    );
+
+    // Verify section reloaded Verified and parent tab is immediately marked source_changed!
+    let after_sec = cx.update(|cx| view.read(cx).snapshot(cx).unwrap());
+    assert_eq!(
+        after_sec.section.as_deref().unwrap().bounds.trust,
+        quarry_core::BoundaryTrust::Verified
+    );
+    cx.update(|cx| {
+        controller
+            .update(cx, |c, cx| c.activate_tab(win_id, parent_id, cx))
+            .unwrap();
+    });
+    let parent_snap = cx.update(|cx| view.read(cx).snapshot(cx).unwrap());
+    assert!(
+        parent_snap.source_changed,
+        "parent tab must immediately reflect source_changed after section splice-save"
+    );
 }

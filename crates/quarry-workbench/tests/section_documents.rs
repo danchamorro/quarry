@@ -115,8 +115,12 @@ fn section_borrows_parent_index_and_coexists_with_parent_tab() {
     assert!(bounds.first_global_row().is_some());
     assert_eq!(doc.headers, vec!["id", "val"]);
     assert!(
+        doc.can_splice_save_section(),
+        "verified section must support in-place guarded splice-save"
+    );
+    assert!(
         !doc.is_save_ready(),
-        "in-place Save must be disabled for section documents in 5A-2"
+        "clean verified section has no edits yet"
     );
     assert!(
         doc.is_save_as_ready(),
@@ -665,22 +669,39 @@ fn interior_section_header_rename_uses_captured_header_and_reordered_columns_rej
     };
     wait_for_index(&mut scheduler, sec_id);
 
+    // Verify boundaries so we specifically exercise the reordered-column gate on a Verified section.
+    scheduler.start_verify_section_boundary(sec_id).unwrap();
+    let _ = wait_for_verify(&mut scheduler, sec_id);
+
     let doc = scheduler
         .tab_mut(sec_id)
         .unwrap()
         .document
         .as_mut()
         .unwrap();
-    // 1. Source header name for an interior section must come from byte-0 header ("name"),
-    // NOT the section's first data row ("alice"), so renaming "name" -> "alice" marks dirty.
+    assert_eq!(doc.section_trust(), Some(BoundaryTrust::Verified));
+    // 1. Source header name for an interior section comes from byte-0 header ("name"),
+    // NOT the section's first data row ("alice"), and header editing is disabled on sections.
     assert_eq!(doc.source_header_name(0), Some("name"));
-    doc.rename_header(0, "alice".into()).unwrap();
-    assert!(doc.is_dirty());
-    assert_eq!(doc.headers[0], "alice");
+    assert!(!doc.header_is_editable(0));
+    assert!(doc.rename_header(0, "alice".into()).is_err());
 
-    // 2. Reordering columns on a section must reject Save As rather than silently dropping order,
-    // and instruct the user to reset the column layout in the Columns panel.
+    // Edit a data cell instead so the section is dirty.
+    doc.begin_cell_edit(0, 0, b"alice".to_vec()).unwrap();
+    doc.cell_edit.as_mut().unwrap().draft = "ALICE".into();
+    doc.commit_cell_edit();
+    assert!(doc.is_dirty());
+
+    // 2. Reordering columns on a section must reject BOTH in-place splice-save and Save As
+    // rather than silently dropping column order.
     doc.move_column(1, 0).unwrap();
+    assert!(!doc.is_save_ready());
+    let save_err = doc.start_save().unwrap_err();
+    assert!(
+        save_err.text.to_lowercase().contains("column layout"),
+        "expected column layout reset error, got: {}",
+        save_err.text
+    );
     let err = doc.start_save_as(out_path.clone()).unwrap_err();
     assert!(
         err.text.to_lowercase().contains("reordered") && err.text.contains("Columns panel"),
@@ -851,4 +872,775 @@ fn dormant_section_reopen_tab_resets_view_when_delimiter_changes() {
 
     let _ = fs::remove_file(&path1);
     let _ = fs::remove_file(&path2);
+}
+
+#[test]
+fn verified_section_row_edits_replace_all_undo_splice_save_and_sibling_coordination() {
+    let prefix = b"id,tag,note\n0,old,head\n";
+    let middle = b"1,old,alpha\n2,keep,beta\n3,old,gamma\n";
+    let suffix = b"4,old,tail\n";
+    let mut initial = Vec::new();
+    initial.extend_from_slice(prefix);
+    initial.extend_from_slice(middle);
+    initial.extend_from_slice(suffix);
+    let path = temp_csv("splice-full-flow", &initial);
+
+    let mut scheduler = WorkbenchScheduler::new(WorkbenchSchedulerConfig {
+        max_hydrated_tabs: 4,
+        ..WorkbenchSchedulerConfig::default()
+    });
+    scheduler.register_window(WindowId::PRIMARY);
+
+    // 1. Open parent file and wait for index.
+    let parent_id = match scheduler
+        .open_path(
+            WindowId::PRIMARY,
+            path.clone(),
+            OpenOptions::default(),
+            None,
+        )
+        .unwrap()
+    {
+        WakeOutcome::Ready { document_id, .. } => document_id,
+        other => panic!("unexpected open outcome: {other:?}"),
+    };
+    wait_for_index(&mut scheduler, parent_id);
+
+    // 2. Open verified interior section covering rows 1..=3.
+    let sec_start = prefix.len() as u64;
+    let sec_len = middle.len() as u64;
+    let sec_id = match scheduler
+        .open_section(
+            WindowId::PRIMARY,
+            path.clone(),
+            ByteWindow::new(sec_start, sec_len).unwrap(),
+            SectionOpenOptions::default(),
+        )
+        .unwrap()
+    {
+        WakeOutcome::Ready { document_id, .. } => document_id,
+        other => panic!("unexpected section open outcome: {other:?}"),
+    };
+    wait_for_index(&mut scheduler, sec_id);
+
+    // Verify Insert Rows command is enabled on Verified section while Insert Columns is disabled!
+    {
+        let tab = scheduler.tab(sec_id).unwrap();
+        let ctx = CommandContext {
+            window: WindowId::PRIMARY,
+            active_tab: tab,
+            open_document_count: 2,
+            write_slot_available: true,
+            external_modal_blocked: false,
+            text_field_focused: false,
+            show_all_whitespace: false,
+        };
+        assert!(evaluate_command(CommandId::InsertRows, &ctx).enabled);
+        assert!(!evaluate_command(CommandId::InsertColumns, &ctx).enabled);
+        assert!(!evaluate_command(CommandId::Save, &ctx).enabled);
+    }
+
+    // 3. Edit cell (0, 2) -> "ALPHA", confirm dirty mutual exclusion blocks parent tab!
+    {
+        let doc = scheduler
+            .tab_mut(sec_id)
+            .unwrap()
+            .document
+            .as_mut()
+            .unwrap();
+        doc.begin_cell_edit(0, 2, b"alpha".to_vec()).unwrap();
+        doc.cell_edit.as_mut().unwrap().draft = "ALPHA".into();
+        doc.commit_cell_edit();
+        assert!(doc.is_dirty());
+        assert!(doc.is_save_ready());
+    }
+    assert!(
+        scheduler.sibling_dirty_conflict(parent_id).is_some(),
+        "dirty section must block editing the parent tab for the same file"
+    );
+    assert!(
+        scheduler.sibling_dirty_conflict(sec_id).is_none(),
+        "dirty section must not conflict with itself"
+    );
+
+    // 4. Insert 1 blank row at local position 1 on the Verified section.
+    let dialog = quarry_workbench::StructuralDialog::insert_rows(1);
+    scheduler
+        .tab_mut(sec_id)
+        .unwrap()
+        .document
+        .as_mut()
+        .unwrap()
+        .insert_rows_from_dialog(&dialog)
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let done = scheduler.poll_structural_edits();
+        if let Some(comp) = done.into_iter().find(|c| c.document_id == sec_id) {
+            comp.result.unwrap();
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for insert rows"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    wait_for_index(&mut scheduler, sec_id);
+    assert_eq!(
+        scheduler
+            .tab(sec_id)
+            .unwrap()
+            .document
+            .as_ref()
+            .unwrap()
+            .available_data_rows(),
+        4
+    );
+
+    // 5. Undo then Redo the section structural edit!
+    scheduler.apply_undo_redo(sec_id, false).unwrap();
+    wait_for_index(&mut scheduler, sec_id);
+    assert_eq!(
+        scheduler
+            .tab(sec_id)
+            .unwrap()
+            .document
+            .as_ref()
+            .unwrap()
+            .available_data_rows(),
+        3
+    );
+    scheduler.apply_undo_redo(sec_id, true).unwrap();
+    wait_for_index(&mut scheduler, sec_id);
+    assert_eq!(
+        scheduler
+            .tab(sec_id)
+            .unwrap()
+            .document
+            .as_ref()
+            .unwrap()
+            .available_data_rows(),
+        4
+    );
+
+    // 6. Replace All "old" -> "NEW" inside the section working copy (must NOT touch parent prefix/suffix).
+    scheduler
+        .tab_mut(sec_id)
+        .unwrap()
+        .document
+        .as_mut()
+        .unwrap()
+        .start_replace_all_with_case(b"old", b"NEW", quarry_core::CaseSensitivity::Sensitive)
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let done = scheduler.poll_structural_edits();
+        if let Some(comp) = done.into_iter().find(|c| c.document_id == sec_id) {
+            comp.result.unwrap();
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for replace all"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    wait_for_index(&mut scheduler, sec_id);
+
+    // 7. Delete local row 2 ("2,keep,beta").
+    scheduler
+        .tab_mut(sec_id)
+        .unwrap()
+        .document
+        .as_mut()
+        .unwrap()
+        .start_delete_rows(std::iter::once(2..=2).collect())
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let done = scheduler.poll_structural_edits();
+        if let Some(comp) = done.into_iter().find(|c| c.document_id == sec_id) {
+            comp.result.unwrap();
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for delete rows"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    wait_for_index(&mut scheduler, sec_id);
+
+    // 8. Splice-save back into the parent file!
+    scheduler
+        .tab_mut(sec_id)
+        .unwrap()
+        .document
+        .as_mut()
+        .unwrap()
+        .start_save()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let saves = scheduler.poll_saves();
+        if let Some(comp) = saves.into_iter().find(|s| s.document_id == sec_id) {
+            let (dest, in_place) = comp.result.unwrap();
+            assert_eq!(dest, path);
+            assert!(in_place);
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for splice save"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    wait_for_index(&mut scheduler, sec_id);
+
+    // Verify parent file bytes: untouched prefix & suffix, updated section!
+    assert_eq!(
+        fs::read(&path).unwrap(),
+        b"id,tag,note\n0,old,head\n1,NEW,ALPHA\n,,\n3,NEW,gamma\n4,old,tail\n"
+    );
+
+    // Verify section reloaded cleanly at updated Verified bounds and is now clean!
+    let sec_doc = scheduler.tab(sec_id).unwrap().document.as_ref().unwrap();
+    assert!(sec_doc.is_section());
+    assert!(!sec_doc.is_dirty());
+    assert_eq!(sec_doc.section_trust(), Some(BoundaryTrust::Verified));
+    assert_eq!(sec_doc.section_bounds().unwrap().snapped.base, sec_start);
+    assert_eq!(
+        sec_doc.section_bounds().unwrap().snapped.len,
+        b"1,NEW,ALPHA\n,,\n3,NEW,gamma\n".len() as u64
+    );
+    assert_eq!(sec_doc.available_data_rows(), 3);
+
+    // Verify open clean parent tab was immediately marked `source_changed = true`!
+    let parent_tab = scheduler.tab(parent_id).unwrap();
+    assert!(
+        parent_tab.document.as_ref().unwrap().source_changed,
+        "parent tab must be immediately marked source_changed after section splice-save"
+    );
+    assert!(parent_tab.notice.is_some());
+
+    let _ = fs::remove_file(&path);
+}
+
+#[test]
+fn speculative_section_blocks_row_edits_and_splice_save_until_verified_in_place() {
+    let mut bytes = Vec::from(&b"id,val\n"[..]);
+    let pad = "p".repeat(60);
+    let mut i = 0u64;
+    while bytes.len() < 17 * 1024 * 1024 {
+        bytes.extend_from_slice(format!("{i},{pad}\n").as_bytes());
+        i += 1;
+    }
+    let sec_start = bytes.len() as u64;
+    bytes.extend_from_slice(b"900001,target_one\n900002,target_two\n");
+    let sec_len = b"900001,target_one\n900002,target_two\n".len() as u64;
+    bytes.extend_from_slice(b"900003,tail_untouched\n");
+    let path = temp_csv("spec-then-verify-splice", &bytes);
+
+    let mut scheduler = WorkbenchScheduler::new(WorkbenchSchedulerConfig::default());
+    scheduler.register_window(WindowId::PRIMARY);
+
+    let sec_id = match scheduler
+        .open_section(
+            WindowId::PRIMARY,
+            path.clone(),
+            ByteWindow::new(sec_start, sec_len).unwrap(),
+            SectionOpenOptions::default(),
+        )
+        .unwrap()
+    {
+        WakeOutcome::Ready { document_id, .. } => document_id,
+        other => panic!("unexpected open outcome: {other:?}"),
+    };
+    wait_for_index(&mut scheduler, sec_id);
+
+    // Speculative section blocks row insert, row delete, replace all, and in-place Save.
+    {
+        let doc = scheduler
+            .tab_mut(sec_id)
+            .unwrap()
+            .document
+            .as_mut()
+            .unwrap();
+        assert_eq!(doc.section_trust(), Some(BoundaryTrust::Speculative));
+        assert!(doc.row_structural_edit_disabled_reason().is_some());
+        assert!(!doc.can_splice_save_section());
+        doc.begin_cell_edit(0, 1, b"target_one".to_vec()).unwrap();
+        doc.cell_edit.as_mut().unwrap().draft = "EDITED_ONE".into();
+        doc.commit_cell_edit();
+        assert!(!doc.is_save_ready());
+        assert!(doc.start_save().is_err());
+    }
+
+    // Run Verify Boundary -> same boundaries (boundary_changed == false) upgrades Session in-place!
+    scheduler.start_verify_section_boundary(sec_id).unwrap();
+    let comp = wait_for_verify(&mut scheduler, sec_id);
+    assert!(!comp.reopened);
+    assert!(matches!(
+        comp.result.unwrap(),
+        VerifyBoundaryOutcome::Verified {
+            boundary_changed: false,
+            ..
+        }
+    ));
+
+    // Now the already-dirty section is Verified and CAN splice-save directly back to parent!
+    {
+        let doc = scheduler
+            .tab_mut(sec_id)
+            .unwrap()
+            .document
+            .as_mut()
+            .unwrap();
+        assert_eq!(doc.section_trust(), Some(BoundaryTrust::Verified));
+        assert!(doc.is_save_ready());
+        doc.start_save().unwrap();
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let saves = scheduler.poll_saves();
+        if let Some(c) = saves.into_iter().find(|s| s.document_id == sec_id) {
+            c.result.unwrap();
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for splice save"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    wait_for_index(&mut scheduler, sec_id);
+
+    let updated = fs::read(&path).unwrap();
+    assert_eq!(
+        &updated[sec_start as usize..(sec_start + sec_len) as usize],
+        b"900001,EDITED_ONE\n900002,target_two\n"
+    );
+    assert!(updated.ends_with(b"900003,tail_untouched\n"));
+
+    let _ = fs::remove_file(&path);
+}
+
+#[test]
+fn undo_redo_enforces_sibling_dirty_exclusion() {
+    let path = temp_csv("undo-redo-sibling", b"id,val\n1,alpha\n2,beta\n");
+    let mut scheduler = WorkbenchScheduler::new(WorkbenchSchedulerConfig::default());
+    scheduler.register_window(WindowId::PRIMARY);
+
+    let parent_id = match scheduler
+        .open_path(
+            WindowId::PRIMARY,
+            path.clone(),
+            OpenOptions::default(),
+            None,
+        )
+        .unwrap()
+    {
+        WakeOutcome::Ready { document_id, .. } => document_id,
+        other => panic!("unexpected parent open: {other:?}"),
+    };
+    wait_for_index(&mut scheduler, parent_id);
+
+    let sec_id = match scheduler
+        .open_section(
+            WindowId::PRIMARY,
+            path.clone(),
+            ByteWindow::new(7, 8).unwrap(),
+            SectionOpenOptions::default(),
+        )
+        .unwrap()
+    {
+        WakeOutcome::Ready { document_id, .. } => document_id,
+        other => panic!("unexpected section open: {other:?}"),
+    };
+    wait_for_index(&mut scheduler, sec_id);
+
+    // Edit section tab -> dirty -> undo until clean.
+    {
+        let doc = scheduler
+            .tab_mut(sec_id)
+            .unwrap()
+            .document
+            .as_mut()
+            .unwrap();
+        doc.begin_cell_edit(0, 1, b"alpha".to_vec()).unwrap();
+        doc.cell_edit.as_mut().unwrap().draft = "ALPHA".into();
+        doc.commit_cell_edit();
+        assert!(doc.is_dirty());
+    }
+    scheduler.apply_undo_redo(sec_id, false).unwrap();
+    assert!(!scheduler.tab_is_dirty(sec_id));
+
+    // Edit parent tab -> now parent is dirty.
+    {
+        let doc = scheduler
+            .tab_mut(parent_id)
+            .unwrap()
+            .document
+            .as_mut()
+            .unwrap();
+        doc.begin_cell_edit(1, 1, b"alpha".to_vec()).unwrap();
+        doc.cell_edit.as_mut().unwrap().draft = "PARENT".into();
+        doc.commit_cell_edit();
+        assert!(doc.is_dirty());
+    }
+
+    // Attempting to Redo in the clean section tab must be blocked while parent is dirty!
+    let err = scheduler.apply_undo_redo(sec_id, true).unwrap_err();
+    assert!(
+        err.text.contains("already has unsaved changes"),
+        "expected sibling dirty conflict on redo, got: {}",
+        err.text
+    );
+    assert!(!scheduler.tab_is_dirty(sec_id));
+
+    let _ = fs::remove_file(&path);
+}
+
+#[test]
+fn sibling_invalidation_releases_unrelated_export_write_destination() {
+    let path = temp_csv("sibling-export-res", b"id,val\n1,alpha\n2,beta\n");
+    let export_dest = path.with_extension("exported.csv");
+    let _ = fs::remove_file(&export_dest);
+
+    let mut scheduler = WorkbenchScheduler::new(WorkbenchSchedulerConfig::default());
+    scheduler.register_window(WindowId::PRIMARY);
+
+    let parent_id = match scheduler
+        .open_path(
+            WindowId::PRIMARY,
+            path.clone(),
+            OpenOptions::default(),
+            None,
+        )
+        .unwrap()
+    {
+        WakeOutcome::Ready { document_id, .. } => document_id,
+        other => panic!("unexpected parent open: {other:?}"),
+    };
+    wait_for_index(&mut scheduler, parent_id);
+
+    let sec_id = match scheduler
+        .open_section(
+            WindowId::PRIMARY,
+            path.clone(),
+            ByteWindow::new(7, 8).unwrap(),
+            SectionOpenOptions::default(),
+        )
+        .unwrap()
+    {
+        WakeOutcome::Ready { document_id, .. } => document_id,
+        other => panic!("unexpected section open: {other:?}"),
+    };
+    wait_for_index(&mut scheduler, sec_id);
+
+    // Simulate an unrelated write_destination reservation on the clean parent tab.
+    scheduler.tab_mut(parent_id).unwrap().write_destination = Some(export_dest.clone());
+
+    // Edit & splice-save the section tab.
+    {
+        let doc = scheduler
+            .tab_mut(sec_id)
+            .unwrap()
+            .document
+            .as_mut()
+            .unwrap();
+        doc.begin_cell_edit(0, 1, b"alpha".to_vec()).unwrap();
+        doc.cell_edit.as_mut().unwrap().draft = "ALPHA".into();
+        doc.commit_cell_edit();
+        doc.start_save().unwrap();
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let saves = scheduler.poll_saves();
+        if let Some(c) = saves.into_iter().find(|s| s.document_id == sec_id) {
+            c.result.unwrap();
+            break;
+        }
+        assert!(Instant::now() < deadline, "timed out waiting for splice");
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    // Parent tab must be invalidated AND its unrelated write_destination reservation cleared.
+    let parent_tab = scheduler.tab(parent_id).unwrap();
+    assert!(parent_tab.document.as_ref().unwrap().source_changed);
+    assert!(
+        parent_tab.write_destination.is_none(),
+        "sibling invalidation must not strand an unrelated export write_destination"
+    );
+
+    let _ = fs::remove_file(&path);
+    let _ = fs::remove_file(&export_dest);
+}
+
+#[test]
+fn quote_free_materialized_section_disables_verify_boundary_and_still_splice_saves() {
+    let path = temp_csv("quotefree-wc-verify", b"1,a\n2,b\n3,c\n4,d\n");
+    let mut scheduler = WorkbenchScheduler::new(WorkbenchSchedulerConfig::default());
+    scheduler.register_window(WindowId::PRIMARY);
+
+    let sec_id = match scheduler
+        .open_section(
+            WindowId::PRIMARY,
+            path.clone(),
+            ByteWindow::new(4, 8).unwrap(), // "2,b\n3,c\n"
+            SectionOpenOptions {
+                open: OpenOptions {
+                    delimiter: Some(b','),
+                    header_mode: quarry_core::HeaderMode::NoHeader,
+                    ..OpenOptions::default()
+                },
+                quote_free_confirmed: true,
+                ..SectionOpenOptions::default()
+            },
+        )
+        .unwrap()
+    {
+        WakeOutcome::Ready { document_id, .. } => document_id,
+        other => panic!("unexpected section open: {other:?}"),
+    };
+    wait_for_index(&mut scheduler, sec_id);
+
+    // QuoteFreeConfirmed is Verified with unknown global row, so Verify Boundary is available
+    // before structural edits.
+    {
+        let doc = scheduler.tab(sec_id).unwrap().document.as_ref().unwrap();
+        assert_eq!(doc.section_trust(), Some(BoundaryTrust::Verified));
+        assert!(doc.can_verify_section_boundary());
+    }
+
+    // Delete all rows in the section -> materializes an empty section working copy.
+    scheduler
+        .tab_mut(sec_id)
+        .unwrap()
+        .document
+        .as_mut()
+        .unwrap()
+        .start_delete_rows(std::iter::once(0..=1).collect())
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let done = scheduler.poll_structural_edits();
+        if let Some(comp) = done.into_iter().find(|c| c.document_id == sec_id) {
+            comp.result.unwrap();
+            break;
+        }
+        assert!(Instant::now() < deadline, "timed out waiting for delete");
+        thread::sleep(Duration::from_millis(10));
+    }
+    wait_for_index(&mut scheduler, sec_id);
+
+    // While backed by a structural working copy, Verify Boundary must be disabled/rejected so it
+    // never scans the temp working copy with parent offsets, while splice-save still succeeds!
+    {
+        let doc = scheduler
+            .tab_mut(sec_id)
+            .unwrap()
+            .document
+            .as_mut()
+            .unwrap();
+        assert!(doc.session.section_backed_by_working_copy());
+        assert!(!doc.can_verify_section_boundary());
+        assert!(doc.start_verify_section_boundary(None).is_err());
+        assert!(doc.is_save_ready());
+        doc.start_save().unwrap();
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let saves = scheduler.poll_saves();
+        if let Some(c) = saves.into_iter().find(|s| s.document_id == sec_id) {
+            c.result.unwrap();
+            break;
+        }
+        assert!(Instant::now() < deadline, "timed out waiting for splice");
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    assert_eq!(fs::read(&path).unwrap(), b"1,a\n4,d\n");
+    let _ = fs::remove_file(&path);
+}
+
+#[test]
+fn dormant_clean_section_retaining_redo_does_not_block_sibling_edits() {
+    let path = temp_csv("dormant-redo-sibling", b"id,val\n1,a\n2,b\n3,c\n");
+    let other_path = temp_csv("dormant-redo-other", b"k,v\n10,x\n");
+    let mut scheduler = WorkbenchScheduler::new(WorkbenchSchedulerConfig {
+        max_hydrated_tabs: 2,
+        ..WorkbenchSchedulerConfig::default()
+    });
+    scheduler.register_window(WindowId::PRIMARY);
+
+    let parent_id = match scheduler
+        .open_path(
+            WindowId::PRIMARY,
+            path.clone(),
+            OpenOptions::default(),
+            None,
+        )
+        .unwrap()
+    {
+        WakeOutcome::Ready { document_id, .. } => document_id,
+        other => panic!("unexpected open: {other:?}"),
+    };
+    wait_for_index(&mut scheduler, parent_id);
+
+    let sec_id = match scheduler
+        .open_section(
+            WindowId::PRIMARY,
+            path.clone(),
+            ByteWindow::new(7, 8).unwrap(), // "1,a\n2,b\n"
+            SectionOpenOptions {
+                quote_free_confirmed: true,
+                ..SectionOpenOptions::default()
+            },
+        )
+        .unwrap()
+    {
+        WakeOutcome::Ready { document_id, .. } => document_id,
+        other => panic!("unexpected section open: {other:?}"),
+    };
+    wait_for_index(&mut scheduler, sec_id);
+
+    // Delete a row in the section -> materializes working copy, then undo back to original file.
+    scheduler
+        .tab_mut(sec_id)
+        .unwrap()
+        .document
+        .as_mut()
+        .unwrap()
+        .start_delete_rows(std::iter::once(0..=0).collect())
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let done = scheduler.poll_structural_edits();
+        if let Some(c) = done.into_iter().find(|c| c.document_id == sec_id) {
+            c.result.unwrap();
+            break;
+        }
+        assert!(Instant::now() < deadline, "timed out waiting for insert");
+        thread::sleep(Duration::from_millis(10));
+    }
+    wait_for_index(&mut scheduler, sec_id);
+    scheduler.apply_undo_redo(sec_id, false).unwrap();
+    assert!(!scheduler.tab_is_dirty(sec_id));
+
+    // Activate parent, then open a third file to force the clean-with-Redo section dormant!
+    scheduler
+        .activate_tab(WindowId::PRIMARY, parent_id)
+        .unwrap();
+    let other_id = match scheduler
+        .open_path(
+            WindowId::PRIMARY,
+            other_path.clone(),
+            OpenOptions::default(),
+            None,
+        )
+        .unwrap()
+    {
+        WakeOutcome::Ready { document_id, .. } => document_id,
+        other => panic!("unexpected other open: {other:?}"),
+    };
+    wait_for_index(&mut scheduler, other_id);
+    scheduler
+        .activate_tab(WindowId::PRIMARY, parent_id)
+        .unwrap();
+
+    // The dormant section only retains Redo history — it is clean and must NOT block parent edits!
+    assert!(!scheduler.tab_is_dirty(sec_id));
+    assert!(
+        scheduler.sibling_dirty_conflict(parent_id).is_none(),
+        "dormant clean section retaining only Redo must not block sibling edits"
+    );
+
+    let _ = fs::remove_file(&path);
+    let _ = fs::remove_file(&other_path);
+}
+
+#[test]
+fn intact_section_working_copy_allows_save_section_as_new_recovery_after_parent_changes() {
+    let path = temp_csv("wc-recovery-parent", b"id,val\n1,a\n2,b\n3,c\n");
+    let recovery_dest = path.with_extension("recovered.csv");
+    let _ = fs::remove_file(&recovery_dest);
+
+    let mut scheduler = WorkbenchScheduler::new(WorkbenchSchedulerConfig::default());
+    scheduler.register_window(WindowId::PRIMARY);
+
+    let sec_id = match scheduler
+        .open_section(
+            WindowId::PRIMARY,
+            path.clone(),
+            ByteWindow::new(7, 8).unwrap(), // "1,a\n2,b\n"
+            SectionOpenOptions {
+                quote_free_confirmed: true,
+                ..SectionOpenOptions::default()
+            },
+        )
+        .unwrap()
+    {
+        WakeOutcome::Ready { document_id, .. } => document_id,
+        other => panic!("unexpected section open: {other:?}"),
+    };
+    wait_for_index(&mut scheduler, sec_id);
+
+    // Delete row 0 -> backed by intact private section working copy ("2,b\n").
+    scheduler
+        .tab_mut(sec_id)
+        .unwrap()
+        .document
+        .as_mut()
+        .unwrap()
+        .start_delete_rows(std::iter::once(0..=0).collect())
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let done = scheduler.poll_structural_edits();
+        if let Some(c) = done.into_iter().find(|c| c.document_id == sec_id) {
+            c.result.unwrap();
+            break;
+        }
+        assert!(Instant::now() < deadline, "timed out waiting for insert");
+        thread::sleep(Duration::from_millis(10));
+    }
+    wait_for_index(&mut scheduler, sec_id);
+
+    // Mutate the parent externally and mark the tab `source_changed`.
+    fs::write(&path, b"id,val\n9,external\n").unwrap();
+    {
+        let doc = scheduler
+            .tab_mut(sec_id)
+            .unwrap()
+            .document
+            .as_mut()
+            .unwrap();
+        doc.invalidate_changed_source();
+        // In-place Save must stay blocked, while Save Section As New recovery is allowed!
+        assert!(!doc.is_save_ready());
+        assert!(doc.start_save().is_err());
+        assert!(doc.is_save_as_ready());
+        doc.start_save_as(recovery_dest.clone()).unwrap();
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let saves = scheduler.poll_saves();
+        if let Some(c) = saves.into_iter().find(|s| s.document_id == sec_id) {
+            let (dest, in_place) = c.result.unwrap();
+            assert_eq!(dest, recovery_dest);
+            assert!(!in_place);
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for recovery export"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(fs::read(&recovery_dest).unwrap(), b"id,val\n2,b\n");
+
+    let _ = fs::remove_file(&path);
+    let _ = fs::remove_file(&recovery_dest);
 }

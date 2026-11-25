@@ -180,6 +180,7 @@ impl SearchJob {
             cell_edits,
             max_record_bytes,
             encoding,
+            true,
             SearchTuning::for_production(1),
         )
     }
@@ -200,6 +201,7 @@ impl SearchJob {
         cell_edits: BTreeMap<(u64, usize), Vec<u8>>,
         max_record_bytes: usize,
         encoding: Encoding,
+        strip_bom_at_zero: bool,
         tuning: SearchTuning,
     ) -> Result<Self, QuarryError> {
         if cell_edits
@@ -251,6 +253,7 @@ impl SearchJob {
                         &cell_edits,
                         max_record_bytes,
                         encoding,
+                        strip_bom_at_zero,
                         tuning,
                         &worker_state,
                     )
@@ -268,6 +271,7 @@ impl SearchJob {
                         &cell_edits,
                         max_record_bytes,
                         encoding,
+                        strip_bom_at_zero,
                         &worker_state,
                     )
                 };
@@ -503,7 +507,8 @@ impl Session {
                 "index does not match session source, framing, or byte range",
             ));
         }
-        let data_start = u64::from(self.dialect.has_header && section_base == 0);
+        let strip_bom_at_zero = !self.section_is_interior();
+        let data_start = u64::from(self.dialect.has_header && strip_bom_at_zero);
         cell_edits.retain(|(row, _), _| *row >= data_start);
         let start = if start.row < data_start {
             SearchPosition {
@@ -541,6 +546,7 @@ impl Session {
             cell_edits,
             DEFAULT_MAX_RECORD_BYTES,
             self.encoding,
+            strip_bom_at_zero,
             tuning,
         )
     }
@@ -565,6 +571,7 @@ fn scan_search_stripe(
     edited_rows: &BTreeSet<u64>,
     max_record_bytes: usize,
     encoding: Encoding,
+    strip_bom_at_zero: bool,
     stop_flag: &AtomicBool,
     earliest_hit_stripe: &AtomicU64,
     #[cfg(test)] wait_for_later_hit_before_stripe_zero: bool,
@@ -609,6 +616,7 @@ fn scan_search_stripe(
             edited_rows,
             max_record_bytes,
             encoding,
+            strip_bom_at_zero,
             stop_flag,
             earliest_hit_stripe,
         );
@@ -643,7 +651,12 @@ fn scan_search_stripe(
     let can_prefilter = encoding == Encoding::Utf8 && !needle.contains(&b'"');
     let raw_stripe_has_hit = !can_prefilter || matcher.find(&buf).is_some();
 
-    let mut scanner = match RecordScanner::at_offset(delimiter, stripe.start_offset, encoding) {
+    let mut scanner = match RecordScanner::at_offset_with_bom_handling(
+        delimiter,
+        stripe.start_offset,
+        encoding,
+        strip_bom_at_zero,
+    ) {
         Ok(scanner) => scanner,
         Err(error) => {
             earliest_hit_stripe.fetch_min(stripe.id, Ordering::AcqRel);
@@ -698,6 +711,7 @@ fn scan_search_stripe(
                                 start,
                                 cell_edits,
                                 encoding,
+                                strip_bom_at_zero,
                             ) {
                                 Ok(result) => found = result,
                                 Err(error) => deferred_error = Some(error),
@@ -774,6 +788,7 @@ fn scan_search_stripe(
                             start,
                             cell_edits,
                             encoding,
+                            strip_bom_at_zero,
                         ) {
                             Ok(Some(hit)) => {
                                 earliest_hit_stripe.fetch_min(stripe.id, Ordering::AcqRel);
@@ -845,12 +860,18 @@ fn scan_search_stripe_streaming(
     edited_rows: &BTreeSet<u64>,
     max_record_bytes: usize,
     encoding: Encoding,
+    strip_bom_at_zero: bool,
     stop_flag: &AtomicBool,
     earliest_hit_stripe: &AtomicU64,
 ) -> Option<StripeResult> {
     let matcher = ByteMatcher::new(needle, case_sensitivity);
     let can_prefilter = encoding == Encoding::Utf8 && !needle.contains(&b'"');
-    let mut scanner = match RecordScanner::at_offset(delimiter, stripe.start_offset, encoding) {
+    let mut scanner = match RecordScanner::at_offset_with_bom_handling(
+        delimiter,
+        stripe.start_offset,
+        encoding,
+        strip_bom_at_zero,
+    ) {
         Ok(scanner) => scanner,
         Err(error) => {
             earliest_hit_stripe.fetch_min(stripe.id, Ordering::AcqRel);
@@ -933,6 +954,7 @@ fn scan_search_stripe_streaming(
                             start,
                             cell_edits,
                             encoding,
+                            strip_bom_at_zero,
                         ) {
                             Ok(res) => found = res,
                             Err(err) => deferred_error = Some(err),
@@ -963,6 +985,7 @@ fn scan_search_stripe_streaming(
                                 start,
                                 cell_edits,
                                 encoding,
+                                strip_bom_at_zero,
                             ) {
                                 Ok(res) => found = res,
                                 Err(err) => deferred_error = Some(err),
@@ -1053,6 +1076,7 @@ fn scan_search_stripe_streaming(
                             start,
                             cell_edits,
                             encoding,
+                            strip_bom_at_zero,
                         ) {
                             Ok(Some(hit)) => {
                                 earliest_hit_stripe.fetch_min(stripe.id, Ordering::AcqRel);
@@ -1132,6 +1156,7 @@ fn run_parallel_search(
     cell_edits: &BTreeMap<(u64, usize), Vec<u8>>,
     max_record_bytes: usize,
     encoding: Encoding,
+    strip_bom_at_zero: bool,
     tuning: SearchTuning,
     shared: &SharedState,
 ) -> Result<SearchOutcome, QuarryError> {
@@ -1227,6 +1252,7 @@ fn run_parallel_search(
                     &worker_edited_rows,
                     max_record_bytes,
                     encoding,
+                    strip_bom_at_zero,
                     &worker_stop,
                     &worker_earliest,
                     #[cfg(test)]
@@ -1341,6 +1367,7 @@ fn run_search(
         cell_edits,
         max_record_bytes,
         encoding,
+        true,
         shared,
     )
 }
@@ -1359,12 +1386,18 @@ fn run_search_bounded(
     cell_edits: &BTreeMap<(u64, usize), Vec<u8>>,
     max_record_bytes: usize,
     encoding: Encoding,
+    strip_bom_at_zero: bool,
     shared: &SharedState,
 ) -> Result<SearchOutcome, QuarryError> {
     let matcher = ByteMatcher::new(needle, case_sensitivity);
     let can_prefilter = encoding == Encoding::Utf8 && !needle.contains(&b'"');
     let edited_rows: BTreeSet<u64> = cell_edits.keys().map(|(row, _)| *row).collect();
-    let mut scanner = RecordScanner::at_offset(delimiter, checkpoint.offset, encoding)?;
+    let mut scanner = RecordScanner::at_offset_with_bom_handling(
+        delimiter,
+        checkpoint.offset,
+        encoding,
+        strip_bom_at_zero,
+    )?;
     let mut chunk = vec![0; encoding.chunk_size(DEFAULT_READ_CHUNK)];
     let mut absolute_start = checkpoint.offset;
     let mut row_number = checkpoint.row;
@@ -1409,6 +1442,7 @@ fn run_search_bounded(
                             start,
                             cell_edits,
                             encoding,
+                            strip_bom_at_zero,
                         )? {
                             return Ok(SearchOutcome::Match(found));
                         }
@@ -1459,6 +1493,7 @@ fn run_search_bounded(
                                 start,
                                 cell_edits,
                                 encoding,
+                                strip_bom_at_zero,
                             ) {
                                 Ok(result) => found = result,
                                 Err(error) => deferred_error = Some(error),
@@ -1481,6 +1516,7 @@ fn run_search_bounded(
                                 start,
                                 cell_edits,
                                 encoding,
+                                strip_bom_at_zero,
                             ) {
                                 Ok(result) => found = result,
                                 Err(error) => deferred_error = Some(error),
@@ -1535,10 +1571,16 @@ fn find_record(
     start: SearchPosition,
     cell_edits: &BTreeMap<(u64, usize), Vec<u8>>,
     encoding: Encoding,
+    strip_bom_at_zero: bool,
 ) -> Result<Option<SearchMatch>, QuarryError> {
     let first_column = if row == start.row { start.column } else { 0 };
-    let fields =
-        crate::parse_encoded_record_with_bom(record, delimiter, row, record_offset == 0, encoding)?;
+    let fields = crate::parse_encoded_record_with_bom(
+        record,
+        delimiter,
+        row,
+        strip_bom_at_zero && record_offset == 0,
+        encoding,
+    )?;
     Ok(fields
         .iter()
         .enumerate()
@@ -2392,6 +2434,7 @@ mod tests {
             BTreeMap::new(),
             64,
             session.encoding,
+            true,
             SearchTuning {
                 requested_threads: 4,
                 stripe_target_bytes: 32,

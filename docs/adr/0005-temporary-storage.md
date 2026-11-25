@@ -1,8 +1,8 @@
 # ADR 0005: Selected working folders and advisory capacity checks
 
-- Status: Accepted (amended 2026-11-22)
+- Status: Accepted (amended 2026-11-22, 2026-11-24)
 - Date: 2026-09-05
-- Amended: 2026-11-22 (persisted scratch directory, adaptive 300 MB single-run memory budget, and `mmap` deferral)
+- Amended: 2026-11-22 (persisted scratch directory, adaptive 300 MB single-run memory budget, and `mmap` deferral); 2026-11-24 ([ADR 0015](0015-guarded-section-splice-save.md): `Verified`-only guarded section splice-save with CoW snapshot cloning and `section + suffix` preflight on CoW volumes)
 
 ## Context
 

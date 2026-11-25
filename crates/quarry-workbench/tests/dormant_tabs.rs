@@ -1438,6 +1438,9 @@ fn pending_nonexistent_output_aliases_and_rollback_and_eviction_fallback_work() 
     assert_eq!(scheduler.residency(ids[0]), Some(ResidencyState::Hydrated));
 
     // 4. Filter started through scheduler reserves BackgroundJob FDs and releases on completion.
+    // Wait for the rolled-back re-hydration IndexJob on `ids[0]` to finish so its BackgroundJob FD
+    // does not race with the filter-release assertion below.
+    finish_active_indexing(&mut scheduler, ids[0]);
     scheduler.config_mut().max_dirty_overlay_bytes = 1024 * 1024;
     let query = FilterQuery::single(1, FilterOperator::Equals, b"alpha".to_vec());
     scheduler.start_filter(ids[0], query).unwrap();

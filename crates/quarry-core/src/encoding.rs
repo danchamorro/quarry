@@ -402,6 +402,15 @@ impl<const TRACK_WIDTH: bool> EncodedScanner<TRACK_WIDTH> {
         offset: u64,
         encoding: Encoding,
     ) -> Result<Self, QuarryError> {
+        Self::at_offset_with_bom_handling(delimiter, offset, encoding, true)
+    }
+
+    pub(crate) fn at_offset_with_bom_handling(
+        delimiter: u8,
+        offset: u64,
+        encoding: Encoding,
+        allow_bom_at_zero: bool,
+    ) -> Result<Self, QuarryError> {
         if encoding.is_utf16() && !offset.is_multiple_of(2) {
             return Err(QuarryError::InvalidOption(
                 "UTF-16 record offset must be a whole code unit",
@@ -415,7 +424,7 @@ impl<const TRACK_WIDTH: bool> EncodedScanner<TRACK_WIDTH> {
         let logical = offset / encoding.width() as u64;
         let dialect = quarry_delimited::ScannerDialect::rfc4180(delimiter);
         let inner = match encoding.simd_byte_class() {
-            Some(quarry_delimited::ByteEncodingClass::Utf8) => {
+            Some(quarry_delimited::ByteEncodingClass::Utf8) if allow_bom_at_zero => {
                 quarry_delimited::StructuralScanner::with_dialect(
                     dialect,
                     logical,
@@ -440,7 +449,7 @@ impl<const TRACK_WIDTH: bool> EncodedScanner<TRACK_WIDTH> {
             inner,
             encoding,
             delimiter,
-            at_start: offset == 0,
+            at_start: allow_bom_at_zero && offset == 0,
             high_surrogate: None,
             validate_utf16: true,
             shadow: Vec::new(),

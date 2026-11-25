@@ -55,6 +55,8 @@ pub struct SectionSnapshot {
     pub verify_status: Option<String>,
     pub pending_verified_reopen: Option<SectionBounds>,
     pub can_verify_boundary: bool,
+    pub can_splice_save: bool,
+    pub splice_unavailable_reason: Option<&'static str>,
     pub speculative_save_warning: Option<&'static str>,
 }
 
@@ -970,6 +972,8 @@ impl WorkbenchController {
                 verify_status: doc.section_verify_status.clone(),
                 pending_verified_reopen: doc.pending_verified_reopen,
                 can_verify_boundary: doc.can_verify_section_boundary(),
+                can_splice_save: doc.can_splice_save_section(),
+                splice_unavailable_reason: doc.section_splice_unavailable_reason(),
                 speculative_save_warning: doc.speculative_save_warning(),
             })
         });
@@ -1497,6 +1501,9 @@ impl WorkbenchController {
                     .into(),
             );
         }
+        if let Some(conflict) = self.scheduler.sibling_dirty_conflict(expected_doc_id) {
+            return Err(conflict);
+        }
         let Some(doc) = self.active_document_mut(window) else {
             return Err("Open a file first.".into());
         };
@@ -1531,6 +1538,9 @@ impl WorkbenchController {
                 "The active document changed before this header rename was applied. Switch back to the original tab or cancel."
                     .into(),
             );
+        }
+        if let Some(conflict) = self.scheduler.sibling_dirty_conflict(expected_doc_id) {
+            return Err(conflict);
         }
         let Some(doc) = self.active_document_mut(window) else {
             return Err("Open a file first.".into());
@@ -1582,11 +1592,11 @@ impl WorkbenchController {
                 "Two file operations are already running. Wait for one to finish.",
             ));
         }
+        let doc_path = self.scheduler.tab_logical_path(id);
         if let Some(dest) = destination.as_ref() {
             if let Some(warning) = gzip_destination_warning(dest) {
                 return Err(warning);
             }
-            let doc_path = self.scheduler.tab_logical_path(id);
             let aliases_other =
                 self.path_reserved(dest) && doc_path.as_ref().is_none_or(|p| p != dest);
             if aliases_other {
@@ -1594,11 +1604,44 @@ impl WorkbenchController {
                     "That destination is already open or reserved in another tab.",
                 ));
             }
+        } else {
+            if let Some(conflict) = self.scheduler.sibling_dirty_conflict(id) {
+                return Err(AppMessage::warning(conflict));
+            }
+            if let Some(parent_path) = doc_path.as_deref() {
+                let target_norm = Self::normalize_output_alias(parent_path);
+                let matches_parent = |res: &Path| {
+                    res == parent_path || Self::normalize_output_alias(res) == target_norm
+                };
+                let write_conflict = self.combine.reserved_output().is_some_and(matches_parent)
+                    || self.join.reserved_output().is_some_and(matches_parent)
+                    || self
+                        .join
+                        .retired_reserved_outputs()
+                        .into_iter()
+                        .any(matches_parent)
+                    || self.inspect.reserved_output().is_some_and(matches_parent)
+                    || self
+                        .inspect
+                        .retired_reserved_outputs()
+                        .into_iter()
+                        .any(matches_parent);
+                if write_conflict {
+                    return Err(AppMessage::warning(
+                        "Another file operation is currently writing to that destination. Wait for it to finish before saving.",
+                    ));
+                }
+            }
         }
-        let target_dest = destination.clone();
+        let target_dest = destination.clone().or(doc_path);
+        let save_fds = if destination.is_none() && self.document_is_section(id) {
+            5
+        } else {
+            2
+        };
         self.scheduler.with_reserved_job_fds(
             id,
-            2,
+            save_fds,
             false,
             |doc| {
                 doc.commit_edits();
@@ -2125,6 +2168,15 @@ impl WorkbenchController {
         self.scheduler.tab_section_bounds(document_id).is_some()
     }
 
+    /// Returns true when `document_id` is a `Verified` bounded section that supports in-place
+    /// guarded splice-save back into its parent file.
+    pub fn document_can_splice_save(&self, document_id: DocumentId) -> bool {
+        self.scheduler
+            .tab(document_id)
+            .and_then(|tab| tab.document.as_ref())
+            .is_some_and(quarry_workbench::Document::can_splice_save_section)
+    }
+
     /// Returns `(path, speculative_save_warning)` for `document_id` if available.
     pub fn document_save_as_info(
         &self,
@@ -2395,6 +2447,9 @@ impl WorkbenchController {
         let Some(doc_id) = self.scheduler.active_document(window) else {
             return Err("Open a file first.".into());
         };
+        if let Some(conflict) = self.scheduler.sibling_dirty_conflict(doc_id) {
+            return Err(conflict);
+        }
         let reveal = self.scheduler.with_reserved_job_fds(
             doc_id,
             2,
@@ -2431,6 +2486,9 @@ impl WorkbenchController {
             return Err(AppMessage::warning(
                 "The active document changed before Replace All started.",
             ));
+        }
+        if let Some(conflict) = self.scheduler.sibling_dirty_conflict(expected_doc_id) {
+            return Err(AppMessage::warning(conflict));
         }
         self.scheduler.with_reserved_job_fds(
             expected_doc_id,
@@ -2535,6 +2593,9 @@ impl WorkbenchController {
                 "The active document changed before Sort started.",
             ));
         }
+        if let Some(conflict) = self.scheduler.sibling_dirty_conflict(expected_doc_id) {
+            return Err(AppMessage::warning(conflict));
+        }
         self.scheduler.with_reserved_job_fds(
             expected_doc_id,
             2,
@@ -2565,6 +2626,9 @@ impl WorkbenchController {
                 "The active document changed before duplicate search started.",
             ));
         }
+        if let Some(conflict) = self.scheduler.sibling_dirty_conflict(expected_doc_id) {
+            return Err(AppMessage::warning(conflict));
+        }
         self.scheduler.with_reserved_job_fds(
             expected_doc_id,
             2,
@@ -2584,6 +2648,9 @@ impl WorkbenchController {
         let Some(doc_id) = self.scheduler.active_document(window) else {
             return Err(AppMessage::warning("Open a file first."));
         };
+        if let Some(conflict) = self.scheduler.sibling_dirty_conflict(doc_id) {
+            return Err(AppMessage::warning(conflict));
+        }
         let notice = self.scheduler.confirm_duplicate_removal(doc_id)?;
         self.viewport_read_seq.remove(&doc_id);
         self.pending_reveal_cells.remove(&doc_id);
@@ -2611,6 +2678,9 @@ impl WorkbenchController {
         let Some(doc_id) = self.scheduler.active_document(window) else {
             return Err(AppMessage::warning("Open a file first."));
         };
+        if let Some(conflict) = self.scheduler.sibling_dirty_conflict(doc_id) {
+            return Err(AppMessage::warning(conflict));
+        }
         self.scheduler.confirm_pending_materialization(doc_id)?;
         cx.notify();
         Ok(())
@@ -2644,6 +2714,9 @@ impl WorkbenchController {
                 "The active document changed before cleanup started.",
             ));
         }
+        if let Some(conflict) = self.scheduler.sibling_dirty_conflict(expected_doc_id) {
+            return Err(AppMessage::warning(conflict));
+        }
         self.scheduler.with_reserved_job_fds(
             expected_doc_id,
             2,
@@ -2672,6 +2745,9 @@ impl WorkbenchController {
             return Err(AppMessage::warning(
                 "The active document changed before row insertion started.",
             ));
+        }
+        if let Some(conflict) = self.scheduler.sibling_dirty_conflict(expected_doc_id) {
+            return Err(AppMessage::warning(conflict));
         }
         self.scheduler.with_reserved_job_fds(
             expected_doc_id,
@@ -2702,6 +2778,9 @@ impl WorkbenchController {
                 "The active document changed before column insertion started.",
             ));
         }
+        if let Some(conflict) = self.scheduler.sibling_dirty_conflict(expected_doc_id) {
+            return Err(AppMessage::warning(conflict));
+        }
         self.scheduler.with_reserved_job_fds(
             expected_doc_id,
             2,
@@ -2727,6 +2806,9 @@ impl WorkbenchController {
         let Some(doc_id) = self.scheduler.active_document(window) else {
             return Err(AppMessage::warning("Open a file first."));
         };
+        if let Some(conflict) = self.scheduler.sibling_dirty_conflict(doc_id) {
+            return Err(AppMessage::warning(conflict));
+        }
         self.scheduler.with_reserved_job_fds(
             doc_id,
             2,
@@ -2756,6 +2838,9 @@ impl WorkbenchController {
         let Some(doc_id) = self.scheduler.active_document(window) else {
             return Err(AppMessage::warning("Open a file first."));
         };
+        if let Some(conflict) = self.scheduler.sibling_dirty_conflict(doc_id) {
+            return Err(AppMessage::warning(conflict));
+        }
         self.scheduler.with_reserved_job_fds(
             doc_id,
             2,
@@ -2785,6 +2870,9 @@ impl WorkbenchController {
             return Err(AppMessage::warning(
                 "The active document changed before moving columns.",
             ));
+        }
+        if let Some(conflict) = self.scheduler.sibling_dirty_conflict(expected_doc_id) {
+            return Err(AppMessage::warning(conflict));
         }
         self.scheduler.with_reserved_job_fds(
             expected_doc_id,
@@ -2816,6 +2904,9 @@ impl WorkbenchController {
                 "The active document changed before splitting the column.",
             ));
         }
+        if let Some(conflict) = self.scheduler.sibling_dirty_conflict(expected_doc_id) {
+            return Err(AppMessage::warning(conflict));
+        }
         self.scheduler.with_reserved_job_fds(
             expected_doc_id,
             2,
@@ -2845,6 +2936,9 @@ impl WorkbenchController {
             return Err(AppMessage::warning(
                 "The active document changed before combining columns.",
             ));
+        }
+        if let Some(conflict) = self.scheduler.sibling_dirty_conflict(expected_doc_id) {
+            return Err(AppMessage::warning(conflict));
         }
         self.scheduler.with_reserved_job_fds(
             expected_doc_id,

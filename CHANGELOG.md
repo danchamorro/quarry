@@ -8,6 +8,13 @@ Tagged beta releases are noted on the day they were published, with exact
 checksums and verification details under `docs/releases/`. Numbers in
 parentheses are GitHub pull requests.
 
+## [2026-11-25]
+
+### Added
+
+- Added in-place guarded **Save** (`Cmd+S` / `Ctrl+S`) for verified sections, splicing edited section bytes back into the parent file using copy-on-write cloning on APFS and supported Linux filesystems (with streaming fallback elsewhere), advisory disk-space checks, and automatic parent reload notices in open sibling tabs. Documented in [ADR 0015](docs/adr/0015-guarded-section-splice-save.md). (#213)
+- Added section-scoped **Insert Rows…**, **Delete Selected Rows**, **Replace All**, and **Undo** / **Redo** for verified sections while keeping header edits, column schema changes, **Sort**, **Find Duplicates**, and **Join Files** routed to **Save Section As New…**. (#213)
+
 ## [2026-11-24]
 
 ### Added

@@ -21,10 +21,11 @@ mod sidecar;
 mod sort;
 mod source_stamp;
 mod spill;
+mod splice;
 mod storage;
 
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::error::Error;
 use std::fmt;
 use std::fs::File;
@@ -128,6 +129,7 @@ pub use source_stamp::{
 };
 #[cfg(target_os = "macos")]
 pub use source_stamp::{acquire_macos_install_lock, acquire_macos_install_lock_at};
+pub use splice::{SpliceDiskPreflight, SpliceSaveSummary, SpliceStrategy};
 pub use storage::{
     StorageSpace, available_disk_space, check_storage, estimate_duplicate_target_temporary_bytes,
     estimate_duplicate_temporary_bytes, estimate_edited_output_bytes,
@@ -817,6 +819,7 @@ impl Session {
             options.open.rows,
             options.open.bootstrap_limit,
             encoding,
+            bounds.snapped.base == 0,
         )?;
         // Revalidate that the file did not change between the byte-0 header probe and the
         // section initial-row read so header, stamp, bounds, and rows share one generation.
@@ -834,6 +837,8 @@ impl Session {
                 bounds,
                 header_row,
                 bom_len,
+                backed_by_working_copy: false,
+                origin_parent_stamp: None,
             }),
             file_size,
             dialect: Dialect {
@@ -849,6 +854,67 @@ impl Session {
         })
     }
 
+    /// Open a private section-only working copy produced by a section-scoped row edit or
+    /// Replace All, preserving the original parent section's bounds, trust, header, and BOM
+    /// provenance while reading `[0, file_size)` of `working_path`.
+    pub fn open_section_working_copy(
+        working_path: impl AsRef<Path>,
+        original_parent: &Session,
+        options: OpenOptions,
+    ) -> Result<Self, QuarryError> {
+        validate_open_options(&options)?;
+        let Some(parent_meta) = &original_parent.section else {
+            return Err(QuarryError::InvalidOption(
+                "open_section_working_copy requires an original section session",
+            ));
+        };
+        let path = working_path.as_ref();
+        let started = Instant::now();
+        let open_started = Instant::now();
+        let file = crate::source_stamp::open_regular_file(path)?;
+        let file_open = open_started.elapsed();
+        let source_stamp = SourceStamp::from_file(&file)?;
+        let file_size = source_stamp.file_size();
+        let encoding = original_parent.encoding;
+        let delimiter = original_parent.dialect.delimiter;
+        let strip_bom_at_zero = parent_meta.bounds.snapped.base == 0;
+        let (first_rows, section_bytes_read) = section::read_section_initial_rows(
+            &file,
+            0,
+            file_size,
+            delimiter,
+            options.rows,
+            options.bootstrap_limit,
+            encoding,
+            strip_bom_at_zero,
+        )?;
+        if !export::source_matches_stamp(&file, path, &source_stamp)? {
+            return Err(QuarryError::SourceChanged);
+        }
+        Ok(Self {
+            path: path.to_path_buf(),
+            source_stamp,
+            encoding,
+            completed_record_count: Arc::new(Mutex::new(None)),
+            compressed: None,
+            section: Some(section::SectionMetadata {
+                bounds: parent_meta.bounds,
+                header_row: parent_meta.header_row.clone(),
+                bom_len: parent_meta.bom_len,
+                backed_by_working_copy: true,
+                origin_parent_stamp: Some(original_parent.source_stamp.clone()),
+            }),
+            file_size,
+            dialect: original_parent.dialect,
+            first_rows,
+            metrics: OpenMetrics {
+                file_open,
+                first_rows: started.elapsed(),
+                bootstrap_bytes_read: section_bytes_read,
+            },
+        })
+    }
+
     /// Returns section bounds and trust metadata when this session was opened via `open_section`.
     pub fn section_bounds(&self) -> Option<SectionBounds> {
         self.section.as_ref().map(|meta| meta.bounds)
@@ -859,6 +925,83 @@ impl Session {
         self.section.is_some()
     }
 
+    /// True when this session is an interior bounded section (`bounds.snapped.base > 0`), even
+    /// when currently reading a section-only private working copy starting at offset 0.
+    pub fn section_is_interior(&self) -> bool {
+        self.section
+            .as_ref()
+            .is_some_and(|meta| meta.bounds.snapped.base > 0)
+    }
+
+    /// True when this section session reads a private section-only working copy rather than the
+    /// parent file directly.
+    pub fn section_backed_by_working_copy(&self) -> bool {
+        self.section
+            .as_ref()
+            .is_some_and(|meta| meta.backed_by_working_copy)
+    }
+
+    /// Return a new `Session` handle over the same file and generation with `SectionBounds`
+    /// upgraded in-place to `BoundaryTrust::Verified` after `VerifyBoundaryJob` confirms the
+    /// existing snapped window did not shift.
+    pub fn with_verified_section_bounds(
+        &self,
+        verified: SectionBounds,
+    ) -> Result<Self, QuarryError> {
+        let Some(meta) = &self.section else {
+            return Err(QuarryError::InvalidOption(
+                "with_verified_section_bounds requires a bounded section session",
+            ));
+        };
+        if verified.trust != BoundaryTrust::Verified || verified.snapped != meta.bounds.snapped {
+            return Err(QuarryError::InvalidOption(
+                "verified bounds must be Verified and match the current snapped byte window",
+            ));
+        }
+        let mut next_meta = meta.clone();
+        next_meta.bounds = verified;
+        Ok(Self {
+            path: self.path.clone(),
+            source_stamp: self.source_stamp.clone(),
+            encoding: self.encoding,
+            completed_record_count: Arc::clone(&self.completed_record_count),
+            compressed: self.compressed.clone(),
+            section: Some(next_meta),
+            file_size: self.file_size,
+            dialect: self.dialect,
+            first_rows: self.first_rows.clone(),
+            metrics: self.metrics,
+        })
+    }
+
+    /// Estimate advisory disk preflight for splicing this `Verified` section back into its parent.
+    pub fn estimate_splice_save_storage(
+        &self,
+        original_parent: Option<&Session>,
+        cell_edits: &BTreeMap<(u64, usize), Vec<u8>>,
+    ) -> Result<SpliceDiskPreflight, QuarryError> {
+        let parent = original_parent.unwrap_or(self);
+        let Some(meta) = &parent.section else {
+            return Err(QuarryError::InvalidOption(
+                "splice preflight is only available for bounded section documents",
+            ));
+        };
+        if meta.bounds.trust != BoundaryTrust::Verified {
+            return Err(QuarryError::InvalidOption(
+                "Verify section boundaries before saving changes back to the parent file.",
+            ));
+        }
+        let (read_base, read_end) = self.active_byte_range();
+        splice::estimate_splice_preflight(
+            &parent.path,
+            parent.file_size,
+            meta.bounds.snapped.base,
+            meta.bounds.snapped_end(),
+            read_end.saturating_sub(read_base),
+            cell_edits,
+        )
+    }
+
     /// Returns the byte-0 header row captured when opening a section of a headered file.
     pub fn section_header_row(&self) -> Option<&Row> {
         self.section
@@ -867,10 +1010,14 @@ impl Session {
     }
 
     /// Active half-open byte range `[start, end)` viewed by this session (`[0, file_size)` for
-    /// whole files, `[snapped.base, snapped_end)` for bounded section documents).
+    /// whole files and section working copies, `[snapped.base, snapped_end)` for direct sections).
     pub fn active_byte_range(&self) -> (u64, u64) {
         self.section.as_ref().map_or((0, self.file_size), |meta| {
-            (meta.bounds.snapped.base, meta.bounds.snapped_end())
+            if meta.backed_by_working_copy {
+                (0, self.file_size)
+            } else {
+                (meta.bounds.snapped.base, meta.bounds.snapped_end())
+            }
         })
     }
 
@@ -891,6 +1038,11 @@ impl Session {
                 "Verify Boundary is only available for bounded section documents",
             ));
         };
+        if meta.backed_by_working_copy {
+            return Err(QuarryError::InvalidOption(
+                "Save or discard structural section edits before verifying section boundaries.",
+            ));
+        }
         VerifyBoundaryJob::start(
             self.path.clone(),
             self.source_stamp.clone(),
@@ -982,6 +1134,7 @@ impl Session {
             DEFAULT_MAX_RECORD_BYTES,
             self.encoding,
             end,
+            !self.section_is_interior(),
         )
     }
 }
@@ -1302,6 +1455,7 @@ fn read_rows_from_index(
     // Bytes at or past this offset are never read, as when a live index has not
     // reached them yet.
     end: u64,
+    strip_bom_at_zero: bool,
 ) -> Result<Vec<Row>, QuarryError> {
     if count == 0 {
         return Ok(Vec::new());
@@ -1315,12 +1469,16 @@ fn read_rows_from_index(
 
     let target_end = start.saturating_add(count as u64).min(index.indexed_rows());
     let checkpoint = index.nearest_checkpoint(start);
-    let section_base = index.section_base();
     let mut file = File::open(path)?;
     if encoding.is_utf16() {
         file.seek(SeekFrom::Start(checkpoint.offset))?;
     }
-    let mut scanner = RecordScanner::at_offset(delimiter, checkpoint.offset, encoding)?;
+    let mut scanner = RecordScanner::at_offset_with_bom_handling(
+        delimiter,
+        checkpoint.offset,
+        encoding,
+        strip_bom_at_zero,
+    )?;
     let mut chunk = vec![0; encoding.chunk_size(DEFAULT_READ_CHUNK)];
     let mut absolute_start = checkpoint.offset;
     let mut row_number = checkpoint.row;
@@ -1346,15 +1504,16 @@ fn read_rows_from_index(
         };
         if read == 0 {
             if !record.is_empty() && row_number >= start && row_number < target_end {
-                let bom_row = if section_base == 0 {
-                    row_number
-                } else {
-                    row_number.saturating_add(1)
-                };
-                let fields = parse_encoded_record(&record, delimiter, bom_row, encoding)?
-                    .into_iter()
-                    .map(|field| field.into_owned())
-                    .collect();
+                let fields = parse_encoded_record_with_bom(
+                    &record,
+                    delimiter,
+                    row_number,
+                    strip_bom_at_zero && record_start == 0,
+                    encoding,
+                )?
+                .into_iter()
+                .map(|field| field.into_owned())
+                .collect();
                 rows.push(Row {
                     offset: record_start,
                     fields,
@@ -1373,12 +1532,13 @@ fn read_rows_from_index(
                         limit: max_record_bytes,
                     });
                 } else if deferred_error.is_none() {
-                    let bom_row = if section_base == 0 {
-                        row_number
-                    } else {
-                        row_number.saturating_add(1)
-                    };
-                    match parse_encoded_record(&record, delimiter, bom_row, encoding) {
+                    match parse_encoded_record_with_bom(
+                        &record,
+                        delimiter,
+                        row_number,
+                        strip_bom_at_zero && record_start == 0,
+                        encoding,
+                    ) {
                         Ok(fields) => rows.push(Row {
                             offset: record_start,
                             fields: fields.into_iter().map(|field| field.into_owned()).collect(),
@@ -1463,6 +1623,7 @@ mod tests {
             super::DEFAULT_MAX_RECORD_BYTES,
             Encoding::Utf16Le,
             bytes.len() as u64,
+            true,
         )
         .unwrap();
         let fields: Vec<_> = rows.into_iter().map(|row| row.fields).collect();

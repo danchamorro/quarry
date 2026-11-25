@@ -286,6 +286,12 @@ pub(crate) struct SectionMetadata {
     pub(crate) header_row: Option<Row>,
     /// Byte length of the file's leading BOM at byte 0 (`0`, `2`, or `3`).
     pub(crate) bom_len: u64,
+    /// True when this session reads a private section-only working copy (offsets `[0, file_size)`)
+    /// rather than reading `[bounds.snapped.base, bounds.snapped_end())` directly from the parent.
+    pub(crate) backed_by_working_copy: bool,
+    /// Stamp of the parent file generation from which a section working copy was derived.
+    /// `None` for direct sections (whose own `Session::source_stamp` is the parent stamp).
+    pub(crate) origin_parent_stamp: Option<SourceStamp>,
 }
 
 /// Live progress snapshot of a background `VerifyBoundaryJob`.
@@ -1962,6 +1968,7 @@ pub(crate) fn read_header_probe_rows(
 
 /// Materialize initial rows strictly from `[section_start, section_end)` using positional `pread`
 /// (never seeking or scanning bytes before `section_start`).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn read_section_initial_rows(
     file: &File,
     section_start: u64,
@@ -1970,12 +1977,28 @@ pub(crate) fn read_section_initial_rows(
     wanted: usize,
     limit: usize,
     encoding: Encoding,
+    strip_bom_at_zero: bool,
 ) -> Result<(Vec<Row>, u64), QuarryError> {
     if section_start >= section_end || wanted == 0 {
         return Ok((Vec::new(), 0));
     }
+    if strip_bom_at_zero && section_start == 0 {
+        let bom = encoding.bom();
+        if !bom.is_empty() && section_end == bom.len() as u64 {
+            let mut probe = [0u8; 3];
+            let read = read_at_exact_or_eof(file, 0, &mut probe[..bom.len()])?;
+            if read == bom.len() && &probe[..bom.len()] == bom {
+                return Ok((Vec::new(), read as u64));
+            }
+        }
+    }
     let max_bytes = (section_end - section_start).min(limit as u64);
-    let mut scanner = EncodedScanner::<false>::at_offset(delimiter, section_start, encoding)?;
+    let mut scanner = EncodedScanner::<false>::at_offset_with_bom_handling(
+        delimiter,
+        section_start,
+        encoding,
+        strip_bom_at_zero,
+    )?;
     let chunk_cap = encoding.chunk_size(limit.clamp(16 * 1024, 256 * 1024));
     let mut chunk = vec![0u8; chunk_cap];
     let mut cursor = section_start;
@@ -2013,7 +2036,7 @@ pub(crate) fn read_section_initial_rows(
                         &record,
                         delimiter,
                         physical_row,
-                        record_start == 0,
+                        strip_bom_at_zero && record_start == 0,
                         encoding,
                     ) {
                         Ok(fields) => {
@@ -2056,7 +2079,7 @@ pub(crate) fn read_section_initial_rows(
                 &record,
                 delimiter,
                 physical_row,
-                record_start == 0,
+                strip_bom_at_zero && record_start == 0,
                 encoding,
             )?
             .into_iter()
