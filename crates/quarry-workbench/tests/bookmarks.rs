@@ -46,7 +46,12 @@ fn wait_for_index(scheduler: &mut WorkbenchScheduler, id: DocumentId) {
         if scheduler
             .tab(id)
             .and_then(|t| t.document.as_ref())
-            .is_some_and(|d| d.job.is_none() && d.progress.done && d.bookmark_offset_job.is_none())
+            .is_some_and(|d| {
+                d.job.is_none()
+                    && d.progress.done
+                    && d.bookmark_offset_job.is_none()
+                    && !d.bookmark_offset_refresh_pending
+            })
         {
             return;
         }
@@ -990,4 +995,79 @@ fn dormant_clean_conflict_wake_clears_stale_bookmarks() {
         doc.bookmarks.is_empty(),
         "stale bookmarks must be cleared when waking against a replaced file"
     );
+}
+
+#[test]
+fn reopen_unchanged_tab_preserves_bookmarks_and_deferred_offset_refresh_retries() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("reopen_and_retry.csv");
+    let mut bytes = Vec::from(&b"id,val\n"[..]);
+    for i in 1..=650_u64 {
+        bytes.extend_from_slice(format!("{i:04},val_{i:04}\n").as_bytes());
+    }
+    fs::write(&path, &bytes).unwrap();
+
+    let mut scheduler = WorkbenchScheduler::new(WorkbenchSchedulerConfig {
+        index_cache_enabled: false,
+        ..Default::default()
+    });
+    scheduler.register_window(WindowId::PRIMARY);
+    let id = scheduler
+        .open_many_lazy(WindowId::PRIMARY, [path.clone()], open_options(), None)
+        .unwrap()[0];
+    wait_for_index(&mut scheduler, id);
+
+    // Bookmark row 550, mark index cancelled, then reopen unchanged tab: bookmarks must survive!
+    let expected_offset = {
+        let doc = scheduler.tab_mut(id).unwrap().document.as_mut().unwrap();
+        doc.toggle_bookmark_row(550).unwrap();
+        let off = doc
+            .bookmarks
+            .get(550)
+            .unwrap()
+            .key
+            .record_start_offset
+            .unwrap();
+        doc.progress.cancelled = true;
+        assert!(doc.split_at_bookmarks_disabled_reason().is_some());
+        off
+    };
+
+    scheduler
+        .reopen_tab(WindowId::PRIMARY, id, open_options(), None)
+        .unwrap();
+    wait_for_index(&mut scheduler, id);
+    {
+        let doc = scheduler.tab_mut(id).unwrap().document.as_mut().unwrap();
+        assert!(!doc.progress.cancelled);
+        assert_eq!(doc.split_at_bookmarks_disabled_reason(), None);
+        assert_eq!(
+            doc.bookmarks.get(550).unwrap().key.record_start_offset,
+            Some(expected_offset)
+        );
+
+        // Simulate a deferred offset refresh (e.g. temporary FD pressure during install):
+        // mark generation bumped with pending offset and `bookmark_offset_refresh_pending = true`.
+        doc.source_generation += 1;
+        doc.bookmarks.apply_transform(
+            doc.source_generation,
+            &quarry_workbench::BookmarkTransform::PreserveSameRows,
+        );
+        assert_eq!(
+            doc.bookmarks.get(550).unwrap().key.record_start_offset,
+            None
+        );
+        doc.bookmark_offset_refresh_pending = true;
+    }
+
+    // `poll_all()` must retry the deferred refresh and resolve row 550's byte offset.
+    wait_for_index(&mut scheduler, id);
+    {
+        let doc = scheduler.tab(id).unwrap().document.as_ref().unwrap();
+        assert!(!doc.bookmark_offset_refresh_pending);
+        assert_eq!(
+            doc.bookmarks.get(550).unwrap().key.record_start_offset,
+            Some(expected_offset)
+        );
+    }
 }

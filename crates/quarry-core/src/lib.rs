@@ -2064,11 +2064,17 @@ mod tests {
             .record_start_offsets(&index, &query_rows, &cancel)
             .unwrap()
             .expect("uncancelled offset resolution should return offsets");
-        assert_eq!(resolved.len(), 7);
-        for &(row, offset) in &resolved {
-            let loaded = session.read_rows(&index, row, 1).unwrap();
-            assert_eq!(offset, loaded[0].offset, "mismatch on row {row}");
-        }
+        let mut expected_rows = query_rows.to_vec();
+        expected_rows.sort_unstable();
+        expected_rows.dedup();
+        let expected: Vec<(u64, u64)> = expected_rows
+            .into_iter()
+            .map(|row| {
+                let loaded = session.read_rows(&index, row, 1).unwrap();
+                (row, loaded[0].offset)
+            })
+            .collect();
+        assert_eq!(resolved, expected);
 
         let cancelled = std::sync::atomic::AtomicBool::new(true);
         assert_eq!(

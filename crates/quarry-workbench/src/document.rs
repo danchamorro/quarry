@@ -256,6 +256,7 @@ pub struct Document {
     pub source_generation: u64,
     pub bookmarks: RowBookmarks,
     pub bookmark_offset_job: Option<BookmarkOffsetJob>,
+    pub bookmark_offset_refresh_pending: bool,
     pub job: Option<IndexJob>,
     pub index: Option<StructuralIndex>,
     pub progress: IndexProgress,
@@ -546,6 +547,7 @@ impl Document {
             source_generation: 1,
             bookmarks: RowBookmarks::new(),
             bookmark_offset_job: None,
+            bookmark_offset_refresh_pending: false,
             job: None,
             index: None,
             progress,
@@ -3256,6 +3258,7 @@ impl Document {
 
     /// Cancels and drops any running background bookmark offset resolver.
     pub fn stop_bookmark_offset_job(&mut self) {
+        self.bookmark_offset_refresh_pending = false;
         if let Some(job) = self.bookmark_offset_job.take() {
             job.cancel();
         }
@@ -3289,6 +3292,7 @@ impl Document {
             })
             .is_ok()
         {
+            self.bookmark_offset_refresh_pending = false;
             self.bookmark_offset_job = Some(BookmarkOffsetJob {
                 generation,
                 cancel,
@@ -3296,12 +3300,16 @@ impl Document {
             });
             true
         } else {
+            self.bookmark_offset_refresh_pending = true;
             false
         }
     }
 
     /// Polls the background bookmark offset resolver without blocking.
     pub fn poll_bookmark_offsets(&mut self) -> Result<(), String> {
+        if self.saving_in_place {
+            return Ok(());
+        }
         let Some(job) = &self.bookmark_offset_job else {
             return Ok(());
         };
@@ -3424,7 +3432,7 @@ impl Document {
         if self.job.is_some() || self.index.is_none() || !self.progress.done {
             return Some("Wait for indexing to finish before splitting at bookmarks.".into());
         }
-        if self.bookmark_offset_job.is_some() {
+        if self.bookmark_offset_job.is_some() || self.bookmark_offset_refresh_pending {
             return Some(
                 "Wait for bookmark byte offsets to finish resolving before splitting at bookmarks."
                     .into(),

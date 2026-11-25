@@ -1907,6 +1907,33 @@ impl WorkbenchScheduler {
             if let Err(err) = doc.poll() {
                 errors.push((id, err));
             }
+            if doc.bookmark_offset_refresh_pending
+                && doc.bookmark_offset_job.is_none()
+                && doc.job.is_none()
+                && doc.index.is_some()
+                && !doc.saving_in_place
+            {
+                doc.refresh_bookmark_offsets_from_buffers();
+                if doc
+                    .bookmarks
+                    .pending_offset_rows(doc.source_generation)
+                    .is_empty()
+                {
+                    doc.bookmark_offset_refresh_pending = false;
+                } else {
+                    let needed = doc_active_job_fds(doc) + 1;
+                    if try_sync_optional_lease(
+                        &fd_budget,
+                        job_fd_lease,
+                        FdCategory::BackgroundJob,
+                        needed,
+                    )
+                    .is_ok()
+                    {
+                        doc.start_bookmark_offset_refresh();
+                    }
+                }
+            }
             // Reserve descriptors BEFORE polling filter/read workers so `poll_filter()` or
             // `poll_filter_read()` cannot start a queued filter refresh or filtered-read worker
             // without an FD lease.
@@ -2204,6 +2231,19 @@ impl WorkbenchScheduler {
             return Err(SchedulerError::NotFound(id));
         };
         let was_hydrated = matches!(slot.residency, SlotResidency::Hydrated { .. });
+        let preserved_bookmarks = slot.tab.document.as_ref().and_then(|doc| {
+            (!doc.source_changed && !doc.bookmarks.is_empty()).then(|| {
+                (
+                    doc.session.source_guard(),
+                    doc.session.dialect,
+                    doc.session.encoding(),
+                    doc.data_start,
+                    doc.section_bounds(),
+                    doc.source_generation,
+                    doc.bookmarks.clone(),
+                )
+            })
+        });
         let existing_section = slot
             .tab
             .document
@@ -2302,6 +2342,27 @@ impl WorkbenchScheduler {
         replacement.index_cache_enabled = self.config.index_cache_enabled;
         replacement.working_cleanup = self.working_cleanup.clone();
         replacement.decompression_slots = self.decompression_slots.clone();
+        if !source_reloaded
+            && let Some((
+                prev_guard,
+                prev_dialect,
+                prev_encoding,
+                prev_data_start,
+                prev_bounds,
+                prev_generation,
+                prev_bookmarks,
+            )) = preserved_bookmarks
+            && replacement.session.source_guard() == prev_guard
+            && replacement.session.dialect.delimiter == prev_dialect.delimiter
+            && replacement.session.dialect.has_header == prev_dialect.has_header
+            && replacement.session.encoding() == prev_encoding
+            && replacement.data_start == prev_data_start
+            && replacement.section_bounds() == prev_bounds
+        {
+            replacement.source_generation = prev_generation;
+            replacement.bookmarks = prev_bookmarks;
+            replacement.refresh_bookmark_offsets_from_buffers();
+        }
         replacement
             .start_indexing()
             .map_err(SchedulerError::OpenFailed)?;
@@ -3157,9 +3218,13 @@ impl WorkbenchScheduler {
                         .try_reserve(FdCategory::BackgroundJob, 1)
                         .ok();
                 }
-                if job_fd_lease_to_install.is_some() && !replacement.start_bookmark_offset_refresh()
-                {
-                    job_fd_lease_to_install = None;
+                if job_fd_lease_to_install.is_some() {
+                    if !replacement.start_bookmark_offset_refresh() {
+                        job_fd_lease_to_install = None;
+                        replacement.bookmark_offset_refresh_pending = true;
+                    }
+                } else {
+                    replacement.bookmark_offset_refresh_pending = true;
                 }
             }
         } else {
