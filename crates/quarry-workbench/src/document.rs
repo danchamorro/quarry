@@ -5168,8 +5168,8 @@ impl Document {
             return Some(name.as_bytes());
         }
         self.session
-            .first_rows
-            .first()?
+            .section_header_row()
+            .or_else(|| self.session.first_rows.first())?
             .fields
             .get(column)
             .map(|value| value.as_slice())

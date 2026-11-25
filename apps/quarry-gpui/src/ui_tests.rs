@@ -4144,9 +4144,54 @@ fn rename_header_targets_selected_column_and_context_menus_work(cx: &mut TestApp
                 "Shift+F10 on selected column must open column context menu"
             );
             q.close_grid_context_menu(cx);
+
+            // Invoke Rename Selected Column Header… with no explicit column: must target selected
+            // column 2 (`city`) rather than focused cell column 0 (`id`).
+            q.show_header_rename_dialog(None, window, cx);
+            assert!(q.editing, "header rename dialog must open");
         });
     })
     .unwrap();
+    wait_for_ui(cx, handle, &controller, &view, |q, window, _| {
+        q.editing && window.try_find("apply-header-rename").is_some()
+    });
+    cx.update_window(handle.into(), |_, window, cx| {
+        let input = snapshots(window)
+            .into_iter()
+            .find(|element| element.label() == Some("Column header name"))
+            .expect("the dialog must render its accessible header input");
+        assert_eq!(
+            input.value(),
+            Some("city"),
+            "rename dialog must pre-fill selected column 2 (`city`), not focused column 0 (`id`)"
+        );
+        window
+            .within("dialog")
+            .click(input.path().last().unwrap().clone(), cx);
+        window.press(&format!("{PRIMARY_MOD}-a"), cx);
+        cx.write_to_clipboard(ClipboardItem::new_string("metro_area".to_string()));
+        window.press(&format!("{PRIMARY_MOD}-v"), cx);
+        window.click("apply-header-rename", cx);
+    })
+    .unwrap();
+    wait_for_ui(cx, handle, &controller, &view, |q, window, _| {
+        !q.editing && window.try_find("apply-header-rename").is_none()
+    });
+    let headers_after_rename = cx.update(|cx| {
+        controller
+            .read(cx)
+            .active_snapshot(win_id)
+            .expect("active snapshot")
+            .headers
+    });
+    assert_eq!(
+        headers_after_rename[0], "id",
+        "focused cell column 0 must remain unchanged"
+    );
+    assert_eq!(
+        headers_after_rename[2], "metro_area",
+        "selected column 2 must receive the submitted rename"
+    );
 
     // Open row gutter context menu via GridAction and verify row gets auto-selected.
     cx.update_window(handle.into(), |_, window, cx| {

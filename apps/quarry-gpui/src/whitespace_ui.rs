@@ -60,6 +60,8 @@ pub fn render_whitespace(
     let mut current_mark_start: Option<usize> = None;
     let mut preserve_mark_format = true;
     let max_mark_runs = MAX_LAYOUT_SECTIONS.saturating_sub(3) / 2;
+    let ellipsis_limit = max_chars.saturating_sub(3);
+    let mut safe_text_len = 0;
 
     while offset < bytes.len() && output_chars < max_chars {
         let (c, width) = scalar(bytes, offset);
@@ -103,6 +105,9 @@ pub fn render_whitespace(
         }
         text.push_str(&piece);
         output_chars += count;
+        if output_chars <= ellipsis_limit {
+            safe_text_len = text.len();
+        }
         leading &= c.is_whitespace();
         previous_space = c == ' ';
         offset += width;
@@ -113,17 +118,12 @@ pub fn render_whitespace(
     }
 
     if offset < bytes.len() {
-        let retained = max_chars.saturating_sub(3);
-        let end = text
-            .char_indices()
-            .nth(retained)
-            .map_or(text.len(), |(idx, _)| idx);
-        text.truncate(end);
+        text.truncate(safe_text_len);
         mark_ranges.retain_mut(|range| {
-            if range.start >= end {
+            if range.start >= safe_text_len {
                 return false;
             }
-            range.end = range.end.min(end);
+            range.end = range.end.min(safe_text_len);
             range.start < range.end
         });
         for _ in 0..max_chars.min(3) {
@@ -199,5 +199,25 @@ mod tests {
         for range in &r.mark_ranges {
             assert!(r.text.get(range.clone()).is_some());
         }
+
+        // Truncation must break between complete rendered markers rather than splitting `[TAB]`.
+        let exact = format!("{}\t", "a".repeat(235));
+        let r_exact = render_whitespace(
+            exact.as_bytes(),
+            Some(summary(exact.as_bytes())),
+            false,
+            240,
+        );
+        assert_eq!(r_exact.text, format!("{}[TAB]", "a".repeat(235)));
+
+        let overflow = format!("{}\tb", "a".repeat(235));
+        let r_overflow = render_whitespace(
+            overflow.as_bytes(),
+            Some(summary(overflow.as_bytes())),
+            false,
+            240,
+        );
+        assert_eq!(r_overflow.text, format!("{}...", "a".repeat(235)));
+        assert!(r_overflow.mark_ranges.is_empty());
     }
 }

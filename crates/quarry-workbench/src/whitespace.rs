@@ -5,7 +5,6 @@
 use quarry_core::{FilterMatch, Row, Session};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs::File,
     io::{self, Read, Write},
     path::PathBuf,
     sync::{
@@ -41,7 +40,11 @@ pub enum Input {
 impl Input {
     pub fn bytes(&self) -> &[u8] {
         match self {
-            Self::Header(session, column) => &session.first_rows[0].fields[*column],
+            Self::Header(session, column) => session
+                .section_header_row()
+                .or_else(|| session.first_rows.first())
+                .and_then(|row| row.fields.get(*column))
+                .map_or(&[][..], Vec::as_slice),
             Self::Text(value) => value.as_bytes(),
             Self::Row(row, column) => &row.fields[*column],
             Self::Filtered(row, column) => &row.fields[*column],
@@ -226,7 +229,8 @@ pub struct Cache {
 }
 
 impl Cache {
-    pub fn begin_frame(&mut self) {
+    fn harvest_finished_job(&mut self) -> bool {
+        let mut updated = false;
         if self.job.as_ref().is_some_and(|j| j.handle.is_finished()) {
             let job = self.job.take().unwrap();
             match job.handle.join() {
@@ -242,11 +246,20 @@ impl Cache {
                             self.usage.remove(&(used, id));
                         }
                         self.usage.insert((self.clock, id));
+                        updated = true;
                     }
                 }
-                Err(_) => self.failed = true,
+                Err(_) => {
+                    self.failed = true;
+                    updated = true;
+                }
             }
         }
+        updated
+    }
+
+    pub fn begin_frame(&mut self) {
+        let _ = self.harvest_finished_job();
         self.requests.clear();
         self.requested.clear();
         self.queued_bytes = 0;
@@ -308,31 +321,7 @@ impl Cache {
     /// Harvests any completed background inspection batch and starts the next queued batch.
     /// Returns `true` when new summaries were stored and the view should repaint.
     pub fn poll(&mut self) -> bool {
-        let mut updated = false;
-        if self.job.as_ref().is_some_and(|j| j.handle.is_finished()) {
-            let job = self.job.take().unwrap();
-            match job.handle.join() {
-                Ok(entries) => {
-                    for (id, summary) in entries {
-                        if self.entries.len() >= MAX_CACHE_CELLS
-                            && !self.entries.contains_key(&id)
-                            && let Some((_, oldest)) = self.usage.pop_first()
-                        {
-                            self.entries.remove(&oldest);
-                        }
-                        if let Some((used, _)) = self.entries.insert(id, (self.clock, summary)) {
-                            self.usage.remove(&(used, id));
-                        }
-                        self.usage.insert((self.clock, id));
-                        updated = true;
-                    }
-                }
-                Err(_) => {
-                    self.failed = true;
-                    updated = true;
-                }
-            }
-        }
+        let updated = self.harvest_finished_job();
         if self.job.is_none() && !self.requests.is_empty() {
             let _ = self.finish_frame_with_notify(|| {});
             self.requested.clear();
@@ -418,7 +407,7 @@ impl Preferences {
     pub fn load(path: Option<PathBuf>) -> Self {
         let show_all = path
             .as_ref()
-            .and_then(|p| File::open(p).ok())
+            .and_then(|p| quarry_core::open_regular_file_nofollow(p).ok())
             .and_then(|file| {
                 let mut value = String::new();
                 file.take(64).read_to_string(&mut value).ok()?;
@@ -647,5 +636,19 @@ mod tests {
         trailing_invalid.push(0xFF);
         let invalid_summary = analyze(&trailing_invalid, &cancel).unwrap();
         assert!(invalid_summary.invalid_utf8);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn preferences_load_rejects_fifo_without_blocking() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("view-preferences");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("mkfifo should run on unix");
+        assert!(status.success());
+        let prefs = Preferences::load(Some(fifo));
+        assert!(!prefs.show_all);
     }
 }

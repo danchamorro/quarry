@@ -116,6 +116,7 @@ pub struct DocumentSnapshot {
     pub index_committed_rows: u64,
     pub can_pause_indexing: bool,
     pub can_resume_indexing: bool,
+    pub can_cancel_indexing: bool,
     pub dirty: bool,
     pub saving: bool,
     pub save_cancel_requested: bool,
@@ -134,7 +135,7 @@ pub struct DocumentSnapshot {
     pub compressed_preview: bool,
     pub compressed_unreadable_text: bool,
     pub join_reserved: bool,
-    pub has_diagnostic: bool,
+    pub pending_diagnostic_message: Option<String>,
 }
 
 /// Summary of a tab rendered inside a window's tab bar (works for Stub, Dormant, and Hydrated).
@@ -1101,6 +1102,7 @@ impl WorkbenchController {
             index_committed_rows: doc.committed_data_rows(),
             can_pause_indexing: doc.can_pause_indexing(),
             can_resume_indexing: doc.can_resume_indexing(),
+            can_cancel_indexing: doc.job.is_some() && !doc.progress.done,
             dirty: doc.is_dirty(),
             saving: doc.save_job.is_some(),
             save_cancel_requested: doc.save_cancel_requested,
@@ -1119,7 +1121,10 @@ impl WorkbenchController {
             compressed_preview: doc.compressed_is_preview(),
             compressed_unreadable_text: doc.compressed_unreadable_text(),
             join_reserved: doc.join_reserved(),
-            has_diagnostic: doc.pending_diagnostic.is_some(),
+            pending_diagnostic_message: doc
+                .pending_diagnostic
+                .as_ref()
+                .and_then(|_| doc.pending_diagnostic_message.clone()),
         })
     }
 

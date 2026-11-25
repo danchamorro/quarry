@@ -421,6 +421,9 @@ impl QuarryWindow {
                 self.last_headers = info.headers.clone();
                 self.last_shown_columns = info.shown_columns.clone();
                 self.last_row_gutter_anchor = row_gutter_anchor;
+                if doc_changed {
+                    self.close_grid_context_menu(cx);
+                }
                 self.table.update(cx, |table, cx| {
                     if doc_changed {
                         table.delegate_mut().reset_widths();
@@ -442,6 +445,7 @@ impl QuarryWindow {
                 self.table.update(cx, |_, cx| cx.notify());
             }
         } else {
+            self.close_grid_context_menu(cx);
             if self.last_synced_doc.is_some() {
                 self.last_synced_doc = None;
                 self.last_headers.clear();
@@ -1992,9 +1996,10 @@ impl QuarryWindow {
         };
 
         let weak = cx.weak_entity();
-        let raw_for_eq = raw_opt.clone();
-        let raw_for_neq = raw_opt.clone();
-        let has_value = raw_opt.is_some();
+        let raw_shared = raw_opt.map(std::sync::Arc::new);
+        let raw_for_eq = raw_shared.clone();
+        let raw_for_neq = raw_shared.clone();
+        let has_value = raw_shared.is_some();
 
         let menu = PopupMenu::build(window, cx, |menu, _, _| {
             let w_eq = weak.clone();
@@ -2006,7 +2011,10 @@ impl QuarryWindow {
                 PopupMenuItem::new("Filter to This Value")
                     .disabled(!can_filter)
                     .on_click(move |_, window, cx| {
-                        let value = raw_for_eq.clone().unwrap_or_default();
+                        let Some(bytes) = raw_for_eq.as_deref() else {
+                            return;
+                        };
+                        let value = bytes.clone();
                         let _ = w_eq.update(cx, |this, cx| {
                             this.close_grid_context_menu(cx);
                             this.apply_quick_cell_filter(
@@ -2024,7 +2032,10 @@ impl QuarryWindow {
                 PopupMenuItem::new("Filter Out This Value")
                     .disabled(!can_filter)
                     .on_click(move |_, window, cx| {
-                        let value = raw_for_neq.clone().unwrap_or_default();
+                        let Some(bytes) = raw_for_neq.as_deref() else {
+                            return;
+                        };
+                        let value = bytes.clone();
                         let _ = w_neq.update(cx, |this, cx| {
                             this.close_grid_context_menu(cx);
                             this.apply_quick_cell_filter(
@@ -4011,15 +4022,16 @@ impl QuarryWindow {
     fn render_status_banner(
         &self,
         msg: AppMessage,
-        has_diagnostic: bool,
+        pending_diagnostic_message: Option<&str>,
         tokens: &quarry_workbench::theme::Palette,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let is_error = msg.severity == MessageSeverity::Error;
         let is_warning = msg.severity == MessageSeverity::Warning;
         let inspect_target = msg.inspection_target.clone();
+        let matches_tab_diagnostic = pending_diagnostic_message == Some(msg.text.as_str());
         let can_inspect_banner = inspect_target.is_some()
-            || ((is_error || is_warning) && (msg.diagnostic.is_some() || has_diagnostic));
+            || ((is_error || is_warning) && (msg.diagnostic.is_some() || matches_tab_diagnostic));
         div()
             .id("status-banner")
             .role(if is_error || is_warning {
@@ -4216,7 +4228,7 @@ impl QuarryWindow {
                         } else {
                             None
                         };
-                    (label, control, None, !info.index_done)
+                    (label, control, None, info.can_cancel_indexing)
                 } else if info.index_done {
                     ("Index complete".into(), None, None, false)
                 } else if info.index_paused {
@@ -4229,14 +4241,14 @@ impl QuarryWindow {
                         ),
                         Some((true, false, false, info.can_resume_indexing)),
                         None,
-                        true,
+                        info.can_cancel_indexing,
                     )
                 } else if info.index_pausing {
                     (
                         "Pausing indexing…".into(),
                         Some((false, true, false, false)),
                         None,
-                        true,
+                        info.can_cancel_indexing,
                     )
                 } else {
                     let text = if info.index_bytes_read > info.index_committed_bytes {
@@ -4257,7 +4269,7 @@ impl QuarryWindow {
                         text,
                         Some((false, false, info.can_pause_indexing, false)),
                         None,
-                        true,
+                        info.can_cancel_indexing,
                     )
                 }
             } else {
@@ -4610,8 +4622,10 @@ impl Render for QuarryWindow {
         }
 
         if let Some(msg) = message {
-            let has_diagnostic = info.as_ref().is_some_and(|i| i.has_diagnostic);
-            body = body.child(self.render_status_banner(msg, has_diagnostic, &tokens, cx));
+            let pending_diag_msg = info
+                .as_ref()
+                .and_then(|i| i.pending_diagnostic_message.as_deref());
+            body = body.child(self.render_status_banner(msg, pending_diag_msg, &tokens, cx));
         }
 
         body = body.child(self.render_status_bar(info.as_ref(), total_open_tabs, &tokens, cx));
