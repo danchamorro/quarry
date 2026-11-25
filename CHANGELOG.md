@@ -12,6 +12,8 @@ parentheses are GitHub pull requests.
 
 ### Added
 
+- Added in-place guarded **Save** (`Cmd+S` / `Ctrl+S`) for verified sections, splicing edited section bytes back into the parent file using copy-on-write cloning on APFS and supported Linux filesystems (with streaming fallback elsewhere), advisory disk-space checks, and automatic parent reload notices in open sibling tabs. Documented in [ADR 0015](docs/adr/0015-guarded-section-splice-save.md). (#213)
+- Added section-scoped **Insert Rows…**, **Delete Selected Rows**, **Replace All**, and **Undo** / **Redo** for verified sections while keeping header edits, column schema changes, **Sort**, **Find Duplicates**, and **Join Files** routed to **Save Section As New…**. (#213)
 - Added **File → Open Section…** (`Cmd+Shift+O` / `Ctrl+Shift+O`) to open a bounded byte range of a multi-terabyte file without indexing the whole file, with exact `Bytes`–`TiB` bounds, coarse slider presets, and **Save Section As New…** export. Sections must be saved as a new file; in-place **Save** is disabled. (#209)
 - Added **Data → Verify Section Boundary** and a `Verified`/`Speculative` banner so mid-file sections can be verified with pause, resume, and cancel controls while preserving unsaved edits if the row boundary shifts. Documented in [ADR 0014](docs/adr/0014-large-file-controller-and-section-windows.md). (#209)
 - Added **Data → Pause / Resume Indexing** and an inline status-bar **Pause** / **Resume** control so large-file indexing can pause mid-scan without holding worker threads or file handles, while keeping Find and Filter usable up to the indexed row. (#206)
