@@ -63,7 +63,7 @@ Build the headless CLI as well:
 
 ```bash
 cargo build --release -p quarry-cli --locked
-./target/release/quarry-cli --help
+./target/release/quarry --help
 ```
 
 ---

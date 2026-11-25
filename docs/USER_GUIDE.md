@@ -208,8 +208,12 @@ Ctrl+Shift+O on Linux):
 1. Pick the file and enter a **From** offset and **Size** (or **To** offset) in
    `Bytes`, `KiB`, `MiB`, `GiB`, or `TiB`. Quarry computes all offsets in
    checked 64-bit integer arithmetic (verified on a 20 TiB sparse file).
-2. Quarry snaps boundaries outward to complete logical record boundaries so
-   valid rows are not torn in half.
+2. Quarry snaps boundaries outward to newline boundaries so ordinary rows are
+   aligned cleanly. However, complete logical record boundaries are guaranteed
+   only for **`Verified`** sections: if an interior offset lands inside a quoted
+   multiline field, `Speculative` alignment can treat an embedded newline as a
+   row start. Verify boundaries before relying on boundary rows or exporting
+   them via **Save As…**.
 3. Inspect the section trust badge in the toolbar:
    - **`Verified`:** Record boundaries from byte 0 to the section start are
      proven (for example, sections starting at byte 0 or verified via a full
@@ -221,7 +225,10 @@ Ctrl+Shift+O on Linux):
      boundary is verified.
 4. To upgrade a `Speculative` section to `Verified`, choose **Data → Verify
    Section Boundary**. Verification runs in the background and can be paused or
-   cancelled cleanly.
+   cancelled cleanly. If verification shifts the section boundaries while you
+   have unsaved edits, saving back to the parent file is blocked; save your
+   draft with **Save Section As New**, or reopen the section at the verified
+   boundaries.
 5. Choosing **Save** on a `Verified` section performs a **Guarded Section
    Splice-Save**, assembling `prefix + edited section + suffix` in private
    staging (using APFS copy-on-write on macOS or Linux `FICLONE` when supported,

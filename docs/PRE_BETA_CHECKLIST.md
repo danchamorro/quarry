@@ -233,7 +233,7 @@ it.
 
 ## Follow-ups that do not block this checklist
 
-- Date/time sorting remains planned in [Phase 6D](ROADMAP_HISTORY.md) (later completed; see [ADR 0008](adr/0008-date-time-sorting.md)).
+- Date/time sorting remains planned in [Phase 6D](ROADMAP_HISTORY.md#phase-6d-date-and-time-sorting-planned) (later completed; see [ADR 0008](adr/0008-date-time-sorting.md)).
 - Multi-column sorting.
 - Inserting rows and columns.
 - Editing and deleting rows while a filter is active.

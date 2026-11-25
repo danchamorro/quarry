@@ -75,9 +75,11 @@ Measured on real public ClickHouse datasets (`weather`, **9.10 GiB**, 131,990,02
 | **Random 100-row viewport read (p95)** | `0.231 ms` | `0.325 ms` | — |
 | **Find (absent literal scan)** | `0.303 s` | `0.510 s` | `14.5–23.0 MiB` |
 | **Multi-column AND Filter** | `1.086 s` | `1.617 s` | `17.5–21.8 MiB` |
-| **Replace All (full rewrite)** | `2.800 s` (`60.2×` vs Phase 1) | `2.760 s` (`14.0×` vs Phase 1) | `72.7–73.1 MiB` |
-| **Stable Number Sort (out-of-core)** | `50.968 s` | `38.974 s` | `164.5–172.1 MiB` |
-| **Delete Duplicates (out-of-core)** | `121.441 s` (`2.18×` vs Phase 1) | `75.822 s` (`4.66×` vs Phase 1) | `189.2–194.3 MiB` |
+| **Replace All (full rewrite)** | `2.800 s` op / `3.121 s` cmd (`60.2×` cmd vs Phase 1) | `2.760 s` op / `3.207 s` cmd (`14.0×` cmd vs Phase 1) | `178.9–193.2 MiB` |
+| **Stable Number Sort (out-of-core)\*** | `50.968 s` op / `146.046 s` cmd (`5.51×` cmd vs Phase 1) | `38.974 s` op / `90.254 s` cmd (`1.89×` cmd vs Phase 1) | `164.5–172.1 MiB` |
+| **Delete Duplicates (out-of-core)** | `120.677 s` op / `121.441 s` cmd (`2.18×` cmd vs Phase 1) | `74.870 s` op / `75.822 s` cmd (`4.66×` cmd vs Phase 1) | `174.3–194.3 MiB` |
+
+*\*Note: For Stable Number Sort, `quarry-bench sort-save-as` runs an independent post-sort full-file re-index and dual-fingerprint verification pass inside the command time (`146.046 s` Weather / `90.254 s` Hacker News); the parallel sort operation wall times alone are `50.968 s` and `38.974 s`. Speedup ratios compare whole-command wall times against the matched Phase 1 single-threaded baseline.*
 
 Partitioned multi-threaded **Hash-Join** (with automatic sort-merge skew fallback, 100% SHA-256 oracle parity):
 - **18 GiB large join:** `19.40 s` (`4.99×` faster than sort-merge baseline), `16.30 MiB` peak RSS, `9.68 GB` peak temp disk.
@@ -146,7 +148,7 @@ Build and run the headless engine CLI on macOS or Linux:
 
 ```bash
 cargo build --release -p quarry-cli --locked
-./target/release/quarry-cli --help
+./target/release/quarry --help
 ```
 
 ---

@@ -7,9 +7,9 @@ Quarry is a calm, high-density desktop tool for inspecting and editing massive d
 | Layer | Location | Responsibility |
 |---|---|---|
 | **Design tokens & palettes** | [`crates/quarry-workbench/src/theme.rs`](../crates/quarry-workbench/src/theme.rs) | Frontend-neutral RGBA semantic palettes (**Light**, WCAG AA **Dark**, and derived **Omarchy** palettes), contrast guards, theme preference persistence, and numeric-alignment classification. |
-| **GPUI theme bridge & components** | `apps/quarry-gpui/src/theme.rs`, `apps/quarry-gpui/src/components.rs` | Maps `quarry_workbench::theme::Palette` onto `gpui-kit` tokens and renders Quarry's buttons, inputs, modals, popovers, dropdowns, banners, and toolbar chrome. |
+| **GPUI theme bridge, window & dialogs** | [`apps/quarry-gpui/src/main.rs`](../apps/quarry-gpui/src/main.rs), `panels.rs`, `operations.rs`, `section_modal.rs`, `workflows_ui.rs`, `find_bar.rs` | Maps `quarry_workbench::theme::Palette` onto `gpui-kit` tokens and renders Quarry's window chrome, toolbar, popovers, modals, banners, and find/replace controls. |
 | **Menus & shortcuts** | [`apps/quarry-gpui/src/menus.rs`](../apps/quarry-gpui/src/menus.rs) | Native macOS application menu bar, Linux in-window `AppMenuBar`, and platform keybindings (`Command` on macOS, `Ctrl` on Linux). |
-| **Main window & grid** | `apps/quarry-gpui/src/window.rs`, `apps/quarry-gpui/src/grid.rs` | Multi-window GPUI chrome, tab bar, toolbar, virtualized GPU grid, row gutter (selection + bookmark dots), status bar, and Live Resource HUD. |
+| **Workbench shell & GPU grid** | [`apps/quarry-gpui/src/workbench.rs`](../apps/quarry-gpui/src/workbench.rs), [`apps/quarry-gpui/src/grid.rs`](../apps/quarry-gpui/src/grid.rs) | Multi-window GPUI tab/document orchestration, virtualized GPU grid, `#` row gutter (selection + bookmark dots), status bar, and Live Resource HUD. |
 | **Frontend ADR** | [ADR 0013](adr/0013-adopt-gpui-desktop-frontend.md) | Adopts GPUI (`gpui-kit`) for macOS and Linux/Omarchy, superseding the historical egui bake-off ([ADR 0003](adr/0003-select-egui-ui.md)). |
 
 Never hardcode ad-hoc RGB colors in views or dialogs. Always read semantic roles from `Palette` so every control renders legibly across **Light**, **Dark**, **System**, and **Omarchy** themes.
