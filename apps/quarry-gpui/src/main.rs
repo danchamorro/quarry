@@ -1853,7 +1853,7 @@ impl QuarryWindow {
         let Some((bookmarked, can_insert_rows, can_delete_rows, display_row)) = ({
             let controller = self.controller.read(cx);
             controller.active_document(self.window_id).map(|doc| {
-                let structural_ok = doc.structural_edit_disabled_reason().is_none()
+                let row_structural_ok = doc.row_structural_edit_disabled_reason().is_none()
                     && doc.structural_job.is_none()
                     && doc.pending_materialization.is_none();
                 let data_row_1based = source_row
@@ -1862,8 +1862,8 @@ impl QuarryWindow {
                     .max((table_row as u64).saturating_add(1));
                 (
                     doc.bookmarks.contains_row(source_row),
-                    doc.insertion_disabled_reason(true).is_none() && structural_ok,
-                    structural_ok && !doc.selected_rows.is_empty(),
+                    doc.insertion_disabled_reason(true).is_none() && row_structural_ok,
+                    row_structural_ok && !doc.selected_rows.is_empty(),
                     data_row_1based,
                 )
             })

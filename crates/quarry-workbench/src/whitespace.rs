@@ -63,6 +63,7 @@ pub struct Summary {
     pub repeated_spaces: u64,
     pub leading_end: usize,
     pub trailing_start: usize,
+    pub invalid_utf8: bool,
 }
 
 impl Summary {
@@ -163,6 +164,9 @@ pub fn analyze(bytes: &[u8], cancel: &AtomicBool) -> Option<Summary> {
             checked = offset.saturating_add(16 * 1024);
         }
         let (c, width) = scalar(bytes, offset);
+        if c == '\u{fffd}' && width == 1 {
+            result.invalid_utf8 = true;
+        }
         if c.is_whitespace() {
             if !nonwhite {
                 result.leading += 1;
@@ -630,5 +634,18 @@ mod tests {
             unix_preferences_path(Some(PathBuf::from("/config-root")), None),
             Some(PathBuf::from("/config-root/quarry/view-preferences"))
         );
+    }
+
+    #[test]
+    fn analyze_tracks_invalid_utf8_without_false_positive_on_valid_replacement_char() {
+        let cancel = AtomicBool::new(false);
+        let valid_replacement = "hello \u{fffd} world".as_bytes();
+        let valid_summary = analyze(valid_replacement, &cancel).unwrap();
+        assert!(!valid_summary.invalid_utf8);
+
+        let mut trailing_invalid = vec![b'a'; 1024];
+        trailing_invalid.push(0xFF);
+        let invalid_summary = analyze(&trailing_invalid, &cancel).unwrap();
+        assert!(invalid_summary.invalid_utf8);
     }
 }

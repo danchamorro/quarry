@@ -13,6 +13,7 @@ pub struct RenderedWhitespace {
     pub text: String,
     pub mark_ranges: Vec<Range<usize>>,
     pub visible_marks: bool,
+    pub prefix_invalid_utf8: bool,
 }
 
 impl RenderedWhitespace {
@@ -55,12 +56,16 @@ pub fn render_whitespace(
     let mut leading = true;
     let mut previous_space = false;
     let mut visible_marks = false;
+    let mut prefix_invalid_utf8 = false;
     let mut current_mark_start: Option<usize> = None;
     let mut preserve_mark_format = true;
     let max_mark_runs = MAX_LAYOUT_SECTIONS.saturating_sub(3) / 2;
 
     while offset < bytes.len() && output_chars < max_chars {
         let (c, width) = scalar(bytes, offset);
+        if c == '\u{fffd}' && width == 1 {
+            prefix_invalid_utf8 = true;
+        }
         let repeated = c == ' ' && (previous_space || bytes.get(offset + width) == Some(&b' '));
         let edge = summary.is_some_and(|s| offset < s.leading_end || offset >= s.trailing_start);
         let mark = c.is_whitespace()
@@ -130,6 +135,7 @@ pub fn render_whitespace(
         text,
         mark_ranges,
         visible_marks,
+        prefix_invalid_utf8,
     }
 }
 

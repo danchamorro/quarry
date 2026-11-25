@@ -148,19 +148,10 @@ impl Grid {
         column: usize,
         cx: &App,
     ) -> Option<(u64, usize, Option<Vec<u8>>)> {
-        if column == 0 {
-            return None;
-        }
         let controller = self.controller.read(cx);
         let doc = controller.active_document(self.window_id)?;
-        let source_col = *doc.columns.visible.get(column - 1)?;
-        let (source_row, fields) = loaded_row(doc, row)?;
-        let raw = if let Some(edited) = doc.cell_edits.get(&(source_row, source_col)) {
-            Some(edited.as_ref().clone())
-        } else {
-            fields.get(source_col).cloned()
-        };
-        Some((source_row, source_col, raw))
+        let (source_row, source_col, raw) = borrowed_cell_raw(doc, row, column)?;
+        Some((source_row, source_col, raw.map(<[u8]>::to_vec)))
     }
 
     /// Maps a rendered `table_column` (1-based) to its physical `source_column`.
@@ -215,6 +206,24 @@ impl Grid {
         }
         Some((source_row + 1 - doc.data_start).to_string())
     }
+}
+
+fn borrowed_cell_raw(
+    doc: &Document,
+    row: usize,
+    column: usize,
+) -> Option<(u64, usize, Option<&[u8]>)> {
+    if column == 0 {
+        return None;
+    }
+    let source_col = *doc.columns.visible.get(column - 1)?;
+    let (source_row, fields) = loaded_row(doc, row)?;
+    let raw = if let Some(edited) = doc.cell_edits.get(&(source_row, source_col)) {
+        Some(edited.as_slice())
+    } else {
+        fields.get(source_col).map(Vec::as_slice)
+    };
+    Some((source_row, source_col, raw))
 }
 
 fn loaded_row(doc: &Document, table_row: usize) -> Option<(u64, &[Vec<u8>])> {
@@ -309,16 +318,14 @@ impl TableDelegate for Grid {
                 format!("Row {value}").into()
             });
         }
-        let (_, source_col, raw_opt) = self.cell_raw_value(row, column, cx)?;
-        let header = self
-            .controller
-            .read(cx)
-            .active_document(self.window_id)?
-            .column_name(source_col);
+        let controller = self.controller.read(cx);
+        let doc = controller.active_document(self.window_id)?;
+        let (_, source_col, raw_opt) = borrowed_cell_raw(doc, row, column)?;
+        let header = doc.column_name(source_col);
         let Some(raw) = raw_opt else {
             return Some(format!("{header}: Field is absent from this row.").into());
         };
-        let preview = field_preview(&raw, MAX_GRID_TEXT_CHARS.min(240));
+        let preview = field_preview(raw, MAX_GRID_TEXT_CHARS.min(240));
         if preview.is_empty() {
             Some(format!("{header}: empty").into())
         } else {
@@ -343,7 +350,7 @@ impl TableDelegate for Grid {
                 .child(name);
         }
         let source_col = self.source_column_at(column, cx);
-        let (selected, header_name, header_raw, tokens, show_all) = {
+        let (selected, header_name, header_len, tokens, show_all) = {
             let controller = self.controller.read(cx);
             let tokens = controller.active_palette();
             let show_all = controller.show_all_whitespace();
@@ -353,31 +360,35 @@ impl TableDelegate for Grid {
             let header_name = source_col
                 .and_then(|src| doc.map(|d| d.column_name(src)))
                 .unwrap_or_default();
-            let header_raw = source_col
-                .and_then(|src| doc.and_then(|d| d.header_value(src).map(ToOwned::to_owned)));
-            (selected, header_name, header_raw, tokens, show_all)
+            let header_len =
+                source_col.and_then(|src| doc.and_then(|d| d.header_value(src).map(<[u8]>::len)));
+            (selected, header_name, header_len, tokens, show_all)
         };
 
-        let (summary, rendered, indicated, pending, tooltip_text) =
-            if let (Some(src_col), Some(raw)) = (source_col, header_raw.as_deref()) {
+        let (rendered, indicated, pending, tooltip_text) =
+            if let (Some(src_col), Some(raw_len)) = (source_col, header_len) {
                 let win_id = self.window_id;
                 let summary = self.controller.update(cx, |controller, _| {
-                    controller.inspect_header_whitespace(win_id, src_col, raw.len())
+                    controller.inspect_header_whitespace(win_id, src_col, raw_len)
                 });
-                let rendered = render_whitespace(raw, summary, show_all, 120);
-                let indicated =
-                    summary.is_some_and(|s| s.indicated(show_all)) || rendered.visible_marks;
-                let pending = summary.is_none() && !raw.is_empty();
-                let tip = (indicated || pending).then(|| {
-                    self.controller
-                        .read(cx)
-                        .whitespace_explanation(win_id, summary)
-                });
-                (summary, Some(rendered), indicated, pending, tip)
+                let controller = self.controller.read(cx);
+                if let Some(raw) = controller
+                    .active_document(win_id)
+                    .and_then(|d| d.header_value(src_col))
+                {
+                    let rendered = render_whitespace(raw, summary, show_all, 120);
+                    let indicated =
+                        summary.is_some_and(|s| s.indicated(show_all)) || rendered.visible_marks;
+                    let pending = summary.is_none() && !raw.is_empty();
+                    let tip = (indicated || pending)
+                        .then(|| controller.whitespace_explanation(win_id, summary));
+                    (Some(rendered), indicated, pending, tip)
+                } else {
+                    (None, false, false, None)
+                }
             } else {
-                (None, None, false, false, None)
+                (None, false, false, None)
             };
-        let _ = summary;
 
         let mut header = div()
             .id(("grid-th", column))
@@ -581,7 +592,15 @@ impl TableDelegate for Grid {
             cell = cell.bg(rgb(tokens.selection.to_rgb_hex()));
         }
 
-        if let Some((src_row, src_col, raw_opt)) = self.cell_raw_value(row, column, cx) {
+        let cell_meta = {
+            let controller = self.controller.read(cx);
+            controller
+                .active_document(self.window_id)
+                .and_then(|doc| borrowed_cell_raw(doc, row, column))
+                .map(|(src_row, src_col, raw)| (src_row, src_col, raw.map(<[u8]>::len)))
+        };
+
+        if let Some((src_row, src_col, raw_len_opt)) = cell_meta {
             let on_action_right = self.on_action.clone();
             cell = cell.on_mouse_down(MouseButton::Right, move |event, window, cx| {
                 cx.stop_propagation();
@@ -598,7 +617,7 @@ impl TableDelegate for Grid {
                 );
             });
 
-            let Some(raw) = raw_opt else {
+            let Some(raw_len) = raw_len_opt else {
                 // Absent/ragged field in this row: show clear hover tooltip distinguishing it from empty.
                 let absent_tip = "This row has no cell in this file column.".to_owned();
                 return cell
@@ -606,16 +625,44 @@ impl TableDelegate for Grid {
                     .child(div().flex_1().min_w_0());
             };
 
-            let numeric_cell = source_looks_numeric(&raw);
-            let invalid_utf8 = std::str::from_utf8(&raw).is_err();
             let win_id = self.window_id;
             let summary = self.controller.update(cx, |controller, _| {
-                controller.inspect_cell_whitespace(win_id, src_row, src_col, raw.len())
+                controller.inspect_cell_whitespace(win_id, src_row, src_col, raw_len)
             });
-            let rendered = render_whitespace(&raw, summary, show_all, MAX_GRID_TEXT_CHARS.min(240));
-            let indicated =
-                summary.is_some_and(|s| s.indicated(show_all)) || rendered.visible_marks;
-            let pending = summary.is_none() && !raw.is_empty();
+
+            let rendered_cell = {
+                let controller = self.controller.read(cx);
+                controller
+                    .active_document(win_id)
+                    .and_then(|doc| borrowed_cell_raw(doc, row, column))
+                    .and_then(|(_, _, raw_opt)| raw_opt)
+                    .map(|raw| {
+                        let numeric_cell = source_looks_numeric(raw);
+                        let rendered =
+                            render_whitespace(raw, summary, show_all, MAX_GRID_TEXT_CHARS.min(240));
+                        let invalid_utf8 =
+                            summary.map_or(rendered.prefix_invalid_utf8, |s| s.invalid_utf8);
+                        let indicated = summary.is_some_and(|s| s.indicated(show_all))
+                            || rendered.visible_marks;
+                        let pending = summary.is_none() && !raw.is_empty();
+                        let ws_tip = (indicated || pending)
+                            .then(|| controller.whitespace_explanation(win_id, summary));
+                        (
+                            numeric_cell,
+                            rendered,
+                            invalid_utf8,
+                            indicated,
+                            pending,
+                            ws_tip,
+                        )
+                    })
+            };
+
+            let Some((numeric_cell, rendered, invalid_utf8, indicated, pending, ws_tip)) =
+                rendered_cell
+            else {
+                return cell.child(div().flex_1().min_w_0());
+            };
 
             let mut text_div = div().flex_1().min_w_0().overflow_hidden().text_ellipsis();
             if numeric_cell {
@@ -651,11 +698,6 @@ impl TableDelegate for Grid {
             }
 
             if invalid_utf8 || indicated || pending {
-                let ws_tip = (indicated || pending).then(|| {
-                    self.controller
-                        .read(cx)
-                        .whitespace_explanation(win_id, summary)
-                });
                 let tip = match (invalid_utf8, ws_tip) {
                     (true, Some(ws)) => {
                         format!("This cell is not valid UTF-8 and cannot be edited.\n{ws}")
