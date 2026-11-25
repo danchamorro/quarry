@@ -2448,10 +2448,17 @@ impl WorkbenchController {
                     "{label} is not in the currently visible filtered page. Clear the filter to jump directly to any bookmarked row."
                 ));
             };
-            usize::try_from(doc.filter_buffer_start)
+            let table_row = usize::try_from(doc.filter_buffer_start)
                 .ok()
                 .and_then(|start| start.checked_add(rel))
-                .ok_or_else(|| "Bookmarked row is outside the scrollable table range.".to_owned())?
+                .ok_or_else(|| {
+                    "Bookmarked row is outside the scrollable table range.".to_owned()
+                })?;
+            doc.selection = Some(quarry_workbench::GridSelection::Row { row: local_row });
+            doc.cursor.select_row(local_row);
+            doc.selected_rows
+                .select(local_row, SelectionModifiers::NONE);
+            table_row
         } else {
             if local_row < doc.data_start || local_row >= doc.available_rows() {
                 return Err(format!(

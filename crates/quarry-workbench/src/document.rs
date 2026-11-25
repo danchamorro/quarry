@@ -255,6 +255,7 @@ pub struct Document {
     pub edit_history: EditHistory,
     pub source_generation: u64,
     pub bookmarks: RowBookmarks,
+    pub bookmark_offset_job: Option<BookmarkOffsetJob>,
     pub job: Option<IndexJob>,
     pub index: Option<StructuralIndex>,
     pub progress: IndexProgress,
@@ -351,6 +352,27 @@ pub struct ActiveFilterRead {
     pub job: FilterReadJob,
     pub started: Instant,
     pub cancel_requested: bool,
+}
+
+type BookmarkOffsetBatch = Result<Option<Vec<(u64, u64)>>, QuarryError>;
+
+pub struct BookmarkOffsetJob {
+    pub generation: u64,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+    rx: std::sync::mpsc::Receiver<BookmarkOffsetBatch>,
+}
+
+impl BookmarkOffsetJob {
+    pub fn cancel(&self) {
+        self.cancel
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+impl Drop for BookmarkOffsetJob {
+    fn drop(&mut self) {
+        self.cancel();
+    }
 }
 
 impl Document {
@@ -523,6 +545,7 @@ impl Document {
             edit_history: EditHistory::default(),
             source_generation: 1,
             bookmarks: RowBookmarks::new(),
+            bookmark_offset_job: None,
             job: None,
             index: None,
             progress,
@@ -2288,6 +2311,7 @@ impl Document {
     }
 
     pub fn poll(&mut self) -> Result<(), String> {
+        self.poll_bookmark_offsets()?;
         if self.poll_decompression()? {
             return Ok(());
         }
@@ -2315,7 +2339,7 @@ impl Document {
             match result {
                 Ok(index) => {
                     self.index = Some(index);
-                    self.refresh_bookmark_offsets();
+                    self.start_bookmark_offset_refresh();
                 }
                 Err(error) => {
                     if matches!(error, QuarryError::SourceChanged) {
@@ -3077,13 +3101,32 @@ impl Document {
     }
 
     pub fn can_toggle_bookmark(&self) -> bool {
-        !self.source_changed && self.available_data_rows() > 0
+        if self.source_changed {
+            return false;
+        }
+        if self.filter_active() {
+            self.bookmark_target_row().is_some()
+        } else {
+            self.available_data_rows() > 0
+        }
+    }
+
+    fn is_loaded_filter_row(&self, row: u64) -> bool {
+        self.filtered_rows.iter().any(|matched| matched.row == row)
     }
 
     /// Resolves the best active target data row for toggling a bookmark from menus or shortcuts.
     pub fn bookmark_target_row(&self) -> Option<u64> {
+        let filter_active = self.filter_active();
         let available = self.available_rows();
-        let valid = |row: u64| row >= self.data_start && row < available;
+        let valid = |row: u64| {
+            row >= self.data_start
+                && if filter_active {
+                    self.is_loaded_filter_row(row)
+                } else {
+                    row < available
+                }
+        };
         if let Some(selection) = self.selection
             && valid(selection.row())
         {
@@ -3099,12 +3142,12 @@ impl Document {
         {
             return Some(coord.row);
         }
-        if self.filter_active() {
+        if filter_active {
             return self
-                .filtered_rows
+                .visible_filter_rows()
                 .first()
                 .map(|matched| matched.row)
-                .filter(|&row| valid(row));
+                .filter(|&row| row >= self.data_start);
         }
         let fallback = self.viewport_start.max(self.data_start);
         valid(fallback).then_some(fallback)
@@ -3140,7 +3183,9 @@ impl Document {
         if local_row < self.data_start {
             return Err("Header rows cannot be bookmarked.".into());
         }
-        if local_row >= self.available_rows() {
+        if local_row >= self.available_rows()
+            && !(self.filter_active() && self.is_loaded_filter_row(local_row))
+        {
             return Err("Wait for indexing to reach this row before bookmarking it.".into());
         }
         let offset = self.resolve_record_offset_for_row(local_row)?;
@@ -3209,20 +3254,120 @@ impl Document {
         }
     }
 
-    /// Resolves all pending bookmark `record_start_offset`s for the active `source_generation`,
-    /// using buffers first and `self.index` when indexing is complete.
-    pub fn refresh_bookmark_offsets(&mut self) {
+    /// Cancels and drops any running background bookmark offset resolver.
+    pub fn stop_bookmark_offset_job(&mut self) {
+        if let Some(job) = self.bookmark_offset_job.take() {
+            job.cancel();
+        }
+    }
+
+    /// Starts an asynchronous, checkpoint-grouped resolver for any bookmarks whose
+    /// `record_start_offset` could not be satisfied from loaded buffers.
+    ///
+    /// Returns `true` when a background worker was spawned.
+    pub fn start_bookmark_offset_refresh(&mut self) -> bool {
+        self.refresh_bookmark_offsets_from_buffers();
+        let generation = self.source_generation;
+        let pending = self.bookmarks.pending_offset_rows(generation);
+        if pending.is_empty() {
+            self.stop_bookmark_offset_job();
+            return false;
+        }
+        let Some(index) = self.index.as_ref().cloned() else {
+            return false;
+        };
+        self.stop_bookmark_offset_job();
+        let session = Arc::clone(&self.session);
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        if std::thread::Builder::new()
+            .name("quarry-bookmark-offsets".into())
+            .spawn(move || {
+                let result = session.record_start_offsets(&index, &pending, &worker_cancel);
+                let _ = tx.send(result);
+            })
+            .is_ok()
+        {
+            self.bookmark_offset_job = Some(BookmarkOffsetJob {
+                generation,
+                cancel,
+                rx,
+            });
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Polls the background bookmark offset resolver without blocking.
+    pub fn poll_bookmark_offsets(&mut self) -> Result<(), String> {
+        let Some(job) = &self.bookmark_offset_job else {
+            return Ok(());
+        };
+        match job.rx.try_recv() {
+            Ok(result) => {
+                let job = self
+                    .bookmark_offset_job
+                    .take()
+                    .expect("bookmark offset job is present");
+                match result {
+                    Ok(Some(resolved)) => {
+                        if job.generation == self.source_generation {
+                            for (row, offset) in resolved {
+                                self.bookmarks
+                                    .set_record_offset(row, job.generation, offset);
+                            }
+                        }
+                        Ok(())
+                    }
+                    Ok(None) => Ok(()),
+                    Err(QuarryError::SourceChanged) => {
+                        self.invalidate_changed_source();
+                        Err(SOURCE_CHANGED_NOTICE.into())
+                    }
+                    Err(error) => Err(self.diagnostic_error(error)),
+                }
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => Ok(()),
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.bookmark_offset_job = None;
+                Ok(())
+            }
+        }
+    }
+
+    fn refresh_bookmark_offsets_checked(&mut self) -> Result<(), String> {
         self.refresh_bookmark_offsets_from_buffers();
         let Some(index) = self.index.as_ref() else {
-            return;
+            return Ok(());
         };
         let generation = self.source_generation;
         let pending = self.bookmarks.pending_offset_rows(generation);
-        for row in pending {
-            if let Ok(Some(offset)) = self.session.record_start_offset(Some(index), row) {
-                self.bookmarks.set_record_offset(row, generation, offset);
-            }
+        if pending.is_empty() {
+            return Ok(());
         }
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        match self.session.record_start_offsets(index, &pending, &cancel) {
+            Ok(Some(resolved)) => {
+                for (row, offset) in resolved {
+                    self.bookmarks.set_record_offset(row, generation, offset);
+                }
+                Ok(())
+            }
+            Ok(None) => Ok(()),
+            Err(QuarryError::SourceChanged) => {
+                self.invalidate_changed_source();
+                Err(SOURCE_CHANGED_NOTICE.into())
+            }
+            Err(error) => Err(self.diagnostic_error(error)),
+        }
+    }
+
+    /// Resolves all pending bookmark `record_start_offset`s for the active `source_generation`,
+    /// using buffers first and a single checkpoint-grouped scan over `self.index` when available.
+    pub fn refresh_bookmark_offsets(&mut self) {
+        let _ = self.refresh_bookmark_offsets_checked();
     }
 
     /// Recomputes `global_ordinal` for every bookmark (e.g. after in-place Verify Boundary).
@@ -3264,8 +3409,18 @@ impl Document {
                     .into(),
             );
         }
-        if self.job.is_some() || self.index.is_none() {
+        if self.job.is_some()
+            || self.index.is_none()
+            || !self.progress.done
+            || self.progress.cancelled
+        {
             return Some("Wait for indexing to finish before splitting at bookmarks.".into());
+        }
+        if self.bookmark_offset_job.is_some() {
+            return Some(
+                "Wait for bookmark byte offsets to finish resolving before splitting at bookmarks."
+                    .into(),
+            );
         }
         if !self
             .bookmarks
@@ -3284,7 +3439,14 @@ impl Document {
         if let Some(reason) = self.split_at_bookmarks_disabled_reason() {
             return Err(reason);
         }
-        self.refresh_bookmark_offsets();
+        if let Err(error) = self.session.ensure_source_unchanged() {
+            if matches!(error, QuarryError::SourceChanged) {
+                self.invalidate_changed_source();
+                return Err(SOURCE_CHANGED_NOTICE.into());
+            }
+            return Err(self.diagnostic_error(error));
+        }
+        self.refresh_bookmark_offsets_checked()?;
         self.bookmarks.split_targets(self.data_start)
     }
 
@@ -4406,6 +4568,7 @@ impl Document {
 
     pub fn shutdown(&mut self) {
         self.stop_decompression();
+        self.stop_bookmark_offset_job();
         self.whitespace.invalidate();
         self.stop_filter_read();
         if let Some(job) = self.structural_job.take() {

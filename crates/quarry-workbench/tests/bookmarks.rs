@@ -46,7 +46,7 @@ fn wait_for_index(scheduler: &mut WorkbenchScheduler, id: DocumentId) {
         if scheduler
             .tab(id)
             .and_then(|t| t.document.as_ref())
-            .is_some_and(|d| d.job.is_none() && d.progress.done)
+            .is_some_and(|d| d.job.is_none() && d.progress.done && d.bookmark_offset_job.is_none())
         {
             return;
         }
@@ -744,4 +744,244 @@ fn bookmarks_preserved_across_replace_all_in_place_save_and_section_splice_save(
             );
         }
     }
+}
+
+#[test]
+fn bookmarks_filter_targets_loaded_matches_and_rejects_filtered_out_cursor() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("filtered_targets.csv");
+    fs::write(
+        &path,
+        b"id,name,group\n1,alpha,a\n2,beta,b\n3,gamma,a\n4,delta,b\n5,epsilon,a\n",
+    )
+    .unwrap();
+
+    let mut scheduler = WorkbenchScheduler::new(WorkbenchSchedulerConfig {
+        index_cache_enabled: false,
+        ..Default::default()
+    });
+    scheduler.register_window(WindowId::PRIMARY);
+    let id = scheduler
+        .open_many_lazy(WindowId::PRIMARY, [path.clone()], open_options(), None)
+        .unwrap()[0];
+    wait_for_index(&mut scheduler, id);
+
+    let query = FilterQuery::single(2, FilterOperator::Equals, b"a".to_vec());
+    scheduler.start_filter(id, query).unwrap();
+    wait_for_filter(&mut scheduler, id);
+
+    {
+        let doc = scheduler.tab_mut(id).unwrap().document.as_mut().unwrap();
+        // Place selection/cursor on filtered-out row 2 (group b).
+        doc.selection = Some(quarry_workbench::GridSelection::Cell { row: 2, column: 0 });
+        doc.cursor.select_row(2);
+        doc.selected_rows
+            .select(2, quarry_workbench::SelectionModifiers::NONE);
+        // Must skip filtered-out row 2 and fall back to first visible filtered row (row 1).
+        assert_eq!(doc.bookmark_target_row(), Some(1));
+
+        // Advance filter_viewport_start so visible_filter_rows() starts at match index 1 (row 3).
+        doc.filter_viewport_start = 1;
+        assert_eq!(doc.bookmark_target_row(), Some(3));
+
+        // Simulate a loaded filter match whose physical row is ahead of available_rows()
+        // (e.g. while structural indexing is still behind the filter scan).
+        doc.index = None;
+        doc.progress.rows_scanned = 2;
+        doc.session = std::sync::Arc::new(
+            quarry_core::Session::open(
+                &path,
+                OpenOptions {
+                    rows: 2,
+                    header_mode: HeaderMode::FirstRow,
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        );
+        assert!(doc.available_rows() <= 5);
+        assert!(doc.toggle_bookmark_row(5).unwrap());
+        let bm5 = doc.bookmarks.get(5).unwrap();
+        assert!(bm5.key.record_start_offset.is_some());
+    }
+}
+
+#[test]
+fn bookmark_split_targets_rejects_cancelled_index_and_external_modification() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("split_guards.csv");
+    fs::write(&path, b"id,name\n1,a\n2,b\n3,c\n4,d\n").unwrap();
+
+    let mut scheduler = WorkbenchScheduler::new(WorkbenchSchedulerConfig {
+        index_cache_enabled: false,
+        ..Default::default()
+    });
+    scheduler.register_window(WindowId::PRIMARY);
+    let id = scheduler
+        .open_many_lazy(WindowId::PRIMARY, [path.clone()], open_options(), None)
+        .unwrap()[0];
+    wait_for_index(&mut scheduler, id);
+
+    {
+        let doc = scheduler.tab_mut(id).unwrap().document.as_mut().unwrap();
+        doc.toggle_bookmark_row(3).unwrap();
+        assert_eq!(doc.split_at_bookmarks_disabled_reason(), None);
+
+        // A cancelled partial index must block Split-at-Bookmarks.
+        doc.progress.cancelled = true;
+        assert!(doc.split_at_bookmarks_disabled_reason().is_some());
+        assert!(doc.bookmark_split_targets().is_err());
+        doc.progress.cancelled = false;
+        assert_eq!(doc.split_at_bookmarks_disabled_reason(), None);
+
+        // External file replacement must be detected before returning split targets.
+        fs::write(&path, b"id,name\n10,replaced_externally\n20,other\n").unwrap();
+        let err = doc.bookmark_split_targets().unwrap_err();
+        assert_eq!(err, quarry_workbench::SOURCE_CHANGED_NOTICE);
+        assert!(doc.source_changed);
+    }
+}
+
+#[test]
+fn bookmark_offsets_resolve_asynchronously_and_undo_preserves_mid_job_bookmarks() {
+    let dir = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let path = dir.path().join("async_offsets.csv");
+    let mut bytes = Vec::from(&b"id,val\n"[..]);
+    for i in 1..=650_u64 {
+        bytes.extend_from_slice(format!("{i:04},item_{i:04}\n").as_bytes());
+    }
+    fs::write(&path, &bytes).unwrap();
+
+    let mut scheduler = WorkbenchScheduler::new(WorkbenchSchedulerConfig {
+        working_directory: scratch.path().to_path_buf(),
+        index_cache_enabled: false,
+        ..Default::default()
+    });
+    scheduler.register_window(WindowId::PRIMARY);
+    let id = scheduler
+        .open_many_lazy(WindowId::PRIMARY, [path.clone()], open_options(), None)
+        .unwrap()[0];
+    wait_for_index(&mut scheduler, id);
+
+    // Bookmark row 550 (well past the initial viewport buffer of ~280 rows).
+    {
+        let doc = scheduler.tab_mut(id).unwrap().document.as_mut().unwrap();
+        doc.toggle_bookmark_row(550).unwrap();
+        assert!(
+            doc.bookmarks
+                .get(550)
+                .unwrap()
+                .key
+                .record_start_offset
+                .is_some()
+        );
+        // Replace All changes record offsets across the whole file.
+        doc.start_replace_all_with_case(b"item_", b"longer_item_", CaseSensitivity::Sensitive)
+            .unwrap();
+    }
+    let _ = wait_for_structural(&mut scheduler, id).unwrap();
+    wait_for_index(&mut scheduler, id);
+    {
+        let doc = scheduler.tab(id).unwrap().document.as_ref().unwrap();
+        let index = doc.index.as_ref().unwrap();
+        let loaded = doc.session.read_rows(index, 550, 1).unwrap();
+        assert_eq!(loaded[0].fields[1], b"longer_item_0550");
+        assert_eq!(
+            doc.bookmarks.get(550).unwrap().key.record_start_offset,
+            Some(loaded[0].offset)
+        );
+    }
+
+    // Start a Sort job, toggle a new bookmark (row 10) while the sort is running, then Undo Sort.
+    {
+        let doc = scheduler.tab_mut(id).unwrap().document.as_mut().unwrap();
+        let plan = SortPlan::from(SortSpec {
+            column: 0,
+            mode: SortMode::Number,
+            direction: SortDirection::Descending,
+            case_sensitivity: CaseSensitivity::Insensitive,
+        });
+        doc.start_sort_plan(plan).unwrap();
+        // User toggles a bookmark while the structural job is already in flight!
+        doc.toggle_bookmark_row(10).unwrap();
+        assert!(doc.bookmarks.contains_row(10));
+    }
+    let _ = wait_for_structural(&mut scheduler, id).unwrap();
+    wait_for_index(&mut scheduler, id);
+    assert!(
+        scheduler
+            .tab(id)
+            .unwrap()
+            .document
+            .as_ref()
+            .unwrap()
+            .bookmarks
+            .is_empty()
+    );
+
+    // Undo Sort must restore BOTH row 550 AND row 10 that was added while Sort ran.
+    scheduler.apply_undo_redo(id, false).unwrap();
+    wait_for_index(&mut scheduler, id);
+    {
+        let doc = scheduler.tab(id).unwrap().document.as_ref().unwrap();
+        assert!(doc.bookmarks.contains_row(10));
+        assert!(doc.bookmarks.contains_row(550));
+    }
+}
+
+#[test]
+fn dormant_clean_conflict_wake_clears_stale_bookmarks() {
+    let dir = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let p1 = dir.path().join("conflict_one.csv");
+    let p2 = dir.path().join("conflict_two.csv");
+    fs::write(&p1, b"id,name\n1,alpha\n2,beta\n3,gamma\n4,delta\n").unwrap();
+    fs::write(&p2, b"id,name\n1,other\n").unwrap();
+
+    let mut scheduler = WorkbenchScheduler::new(WorkbenchSchedulerConfig {
+        max_hydrated_tabs: 1,
+        working_directory: scratch.path().to_path_buf(),
+        index_cache_enabled: false,
+        ..Default::default()
+    });
+    scheduler.register_window(WindowId::PRIMARY);
+    let ids = scheduler
+        .open_many_lazy(
+            WindowId::PRIMARY,
+            [p1.clone(), p2.clone()],
+            open_options(),
+            None,
+        )
+        .unwrap();
+    wait_for_index(&mut scheduler, ids[0]);
+
+    {
+        let doc = scheduler
+            .tab_mut(ids[0])
+            .unwrap()
+            .document
+            .as_mut()
+            .unwrap();
+        doc.toggle_bookmark_row(2).unwrap();
+        doc.toggle_bookmark_row(4).unwrap();
+        assert_eq!(doc.bookmarks.len(), 2);
+    }
+
+    // Evict tab 0 to DormantClean, then replace its file on disk.
+    scheduler.activate_tab(WindowId::PRIMARY, ids[1]).unwrap();
+    assert_eq!(
+        scheduler.residency(ids[0]),
+        Some(ResidencyState::DormantClean)
+    );
+    fs::write(&p1, b"id,name\n100,completely_new\n200,different_rows\n").unwrap();
+
+    // Waking tab 0 against the replacement file must clear stale bookmarks.
+    scheduler.activate_tab(WindowId::PRIMARY, ids[0]).unwrap();
+    let doc = scheduler.tab(ids[0]).unwrap().document.as_ref().unwrap();
+    assert!(doc.source_changed);
+    assert!(
+        doc.bookmarks.is_empty(),
+        "stale bookmarks must be cleared when waking against a replaced file"
+    );
 }

@@ -3884,3 +3884,105 @@ fn row_bookmarks_toggle_navigate_sort_undo_and_accessible_labels_in_gpui(cx: &mu
     let after_clear = cx.update(|cx| view.read(cx).snapshot(cx).unwrap());
     assert_eq!(after_clear.bookmark_count, 0);
 }
+
+#[gpui_kit::test]
+fn row_bookmarks_filtered_stepping_advances_and_wraps_cleanly(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("bookmarks_filtered_ui.csv");
+    std::fs::write(
+        &path,
+        "id,name,group\n1,alpha,a\n2,beta,b\n3,gamma,a\n4,delta,b\n5,epsilon,a\n6,zeta,b\n",
+    )
+    .unwrap();
+
+    let controller = cx.update(|cx| {
+        gpui_kit::init(cx);
+        crate::apply_light_theme(cx);
+        bind_shortcuts(cx);
+        install_menus(cx);
+        WorkbenchController::reset_for_test(
+            cx,
+            WorkbenchSchedulerConfig {
+                index_cache_enabled: false,
+                ..WorkbenchSchedulerConfig::default()
+            },
+        )
+    });
+    let (handle, view) = open_test_window(cx, &controller);
+    let win_id = cx.update(|cx| view.read(cx).window_id);
+
+    cx.update_window(handle.into(), |_, window, cx| {
+        view.update(cx, |q, cx| {
+            q.open_paths_direct(
+                vec![path.clone()],
+                OpenOptions {
+                    header_mode: HeaderMode::FirstRow,
+                    ..OpenOptions::default()
+                },
+                None,
+                window,
+                cx,
+            );
+        });
+    })
+    .unwrap();
+    wait_for_ui(cx, handle, &controller, &view, |q, _, cx| {
+        q.snapshot(cx).is_some_and(|s| s.index_done)
+    });
+
+    // Bookmark all 3 group-a rows (physical rows 1, 3, 5) and activate a filter for group == a.
+    cx.update(|cx| {
+        controller
+            .update(cx, |c, cx| {
+                c.toggle_bookmark_row_active(win_id, 1, cx).unwrap();
+                c.toggle_bookmark_row_active(win_id, 3, cx).unwrap();
+                c.toggle_bookmark_row_active(win_id, 5, cx).unwrap();
+                c.start_filter_active(
+                    win_id,
+                    quarry_core::FilterQuery::single(
+                        2,
+                        quarry_core::FilterOperator::Equals,
+                        b"a".to_vec(),
+                    ),
+                    cx,
+                )
+            })
+            .unwrap();
+    });
+    wait_for_ui(cx, handle, &controller, &view, |q, _, cx| {
+        q.snapshot(cx).is_some_and(|s| {
+            s.filter_active && s.filter_done && !s.filter_running && s.available_rows == 3
+        })
+    });
+
+    // Repeated Next Bookmark must advance through filtered rows (0 -> 1 -> 2 -> 0) without stalling!
+    let (r1, _) = cx.update(|cx| {
+        controller
+            .update(cx, |c, cx| c.step_bookmark_active(win_id, true, cx))
+            .unwrap()
+    });
+    let (r2, _) = cx.update(|cx| {
+        controller
+            .update(cx, |c, cx| c.step_bookmark_active(win_id, true, cx))
+            .unwrap()
+    });
+    let (r3, _) = cx.update(|cx| {
+        controller
+            .update(cx, |c, cx| c.step_bookmark_active(win_id, true, cx))
+            .unwrap()
+    });
+    assert_eq!((r1, r2, r3), (1, 2, 0));
+
+    // Previous Bookmark must wrap cleanly from 0 -> 2 -> 1.
+    let (p1, _) = cx.update(|cx| {
+        controller
+            .update(cx, |c, cx| c.step_bookmark_active(win_id, false, cx))
+            .unwrap()
+    });
+    let (p2, _) = cx.update(|cx| {
+        controller
+            .update(cx, |c, cx| c.step_bookmark_active(win_id, false, cx))
+            .unwrap()
+    });
+    assert_eq!((p1, p2), (2, 1));
+}

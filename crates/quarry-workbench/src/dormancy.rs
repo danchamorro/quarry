@@ -2646,7 +2646,7 @@ impl WorkbenchScheduler {
         replacement.edit_history = target.edit_history;
         replacement.source_generation = target.source_generation;
         replacement.bookmarks = target.bookmarks;
-        replacement.refresh_bookmark_offsets();
+        replacement.refresh_bookmark_offsets_from_buffers();
         replacement.refresh_column_headers();
         replacement.index_cache_enabled = self.config.index_cache_enabled;
         replacement.start_indexing().map_err(AppMessage::error)?;
@@ -2873,7 +2873,7 @@ impl WorkbenchScheduler {
                         replacement.decompression_slots = self.decompression_slots.clone();
                         replacement.source_generation = next_generation;
                         replacement.bookmarks = carried_bookmarks;
-                        replacement.refresh_bookmark_offsets();
+                        replacement.refresh_bookmark_offsets_from_buffers();
                         replacement.start_indexing()?;
                         Ok(replacement)
                     });
@@ -3116,7 +3116,10 @@ impl WorkbenchScheduler {
             replacement.shutdown();
             return;
         };
-        current.accept_materialized_change(ready.undo);
+        let mut undo = ready.undo;
+        undo.bookmarks = current.bookmarks.clone();
+        undo.source_generation = current.source_generation;
+        current.accept_materialized_change(undo);
         let next_generation = current.source_generation.saturating_add(1);
         let mut carried_bookmarks = current.bookmarks.clone();
         let bookmark_affected =
@@ -3140,7 +3143,28 @@ impl WorkbenchScheduler {
         }
         replacement.source_generation = next_generation;
         replacement.bookmarks = carried_bookmarks;
-        replacement.refresh_bookmark_offsets();
+        let mut job_fd_lease_to_install = index_job_fd;
+        if replacement.index.is_some() {
+            replacement.refresh_bookmark_offsets_from_buffers();
+            if !replacement
+                .bookmarks
+                .pending_offset_rows(replacement.source_generation)
+                .is_empty()
+            {
+                if job_fd_lease_to_install.is_none() {
+                    job_fd_lease_to_install = self
+                        .fd_budget
+                        .try_reserve(FdCategory::BackgroundJob, 1)
+                        .ok();
+                }
+                if job_fd_lease_to_install.is_some() && !replacement.start_bookmark_offset_refresh()
+                {
+                    job_fd_lease_to_install = None;
+                }
+            }
+        } else {
+            replacement.refresh_bookmark_offsets_from_buffers();
+        }
         replacement.logical_path = current.logical_path.clone();
         replacement.original_session = current.original_session.take();
         replacement.working_copy = current.working_copy.take();
@@ -3159,7 +3183,7 @@ impl WorkbenchScheduler {
         }
         current.shutdown();
         slot.tab.document = Some(replacement);
-        if let Some(lease) = index_job_fd
+        if let Some(lease) = job_fd_lease_to_install
             && let SlotResidency::Hydrated { job_fd_lease, .. } = &mut slot.residency
         {
             *job_fd_lease = Some(lease);
@@ -4066,6 +4090,7 @@ fn doc_non_filter_job_fds(doc: &Document) -> usize {
         0
     };
     usize::from(doc.job.is_some())
+        + usize::from(doc.bookmark_offset_job.is_some())
         + usize::from(doc.section_verify_job.is_some())
         + usize::from(doc.search_job.is_some()) * 2
         + usize::from(doc.export_job.is_some()) * 2
@@ -4608,6 +4633,7 @@ fn wake_dormant_document(
                     working_cleanup,
                     decompression_slots,
                 );
+                doc.bookmarks.clear();
                 doc.source_changed = true;
                 return Ok((
                     doc,
@@ -4673,6 +4699,7 @@ fn wake_dormant_document(
                     working_cleanup,
                     decompression_slots,
                 );
+                doc.bookmarks.clear();
                 doc.source_changed = true;
                 return Ok((
                     doc,

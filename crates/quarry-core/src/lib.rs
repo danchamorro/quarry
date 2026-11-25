@@ -1159,6 +1159,156 @@ impl Session {
         let rows = self.read_rows(index, row, 1)?;
         Ok(rows.first().map(|found| found.offset))
     }
+
+    /// Resolves record start byte offsets for a batch of logical rows using a single file open,
+    /// one reusable chunk buffer, and checkpoint-grouped scans without parsing field payloads.
+    ///
+    /// Returns `Ok(None)` promptly when `cancel` becomes `true`, and verifies
+    /// [`Self::ensure_source_unchanged`] before and after reading.
+    pub fn record_start_offsets(
+        &self,
+        index: &StructuralIndex,
+        rows: &[u64],
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<Option<Vec<(u64, u64)>>, QuarryError> {
+        use std::sync::atomic::Ordering;
+
+        if rows.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+        if cancel.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
+        self.ensure_source_unchanged()?;
+        let (section_base, section_end) = self.active_byte_range();
+        if !index.matches_session(
+            &self.source_stamp,
+            self.dialect.delimiter,
+            self.encoding,
+            section_base,
+            section_end,
+            self.is_section(),
+        ) {
+            return Err(QuarryError::InvalidOption(
+                "index does not match session source, framing, or byte range",
+            ));
+        }
+
+        let mut resolved = Vec::with_capacity(rows.len());
+        let mut to_scan = Vec::new();
+        let indexed_rows = index.indexed_rows();
+        for &row in rows {
+            if let Ok(first_idx) = usize::try_from(row)
+                && let Some(found) = self.first_rows.get(first_idx)
+            {
+                resolved.push((row, found.offset));
+            } else if row < indexed_rows {
+                to_scan.push(row);
+            }
+        }
+        to_scan.sort_unstable();
+        to_scan.dedup();
+        if to_scan.is_empty() {
+            resolved.sort_unstable_by_key(|&(row, _)| row);
+            resolved.dedup_by_key(|entry| entry.0);
+            return Ok(Some(resolved));
+        }
+
+        let end = index.section_end().unwrap_or(u64::MAX);
+        let strip_bom_at_zero = !self.section_is_interior();
+        let mut file = File::open(&self.path)?;
+        let mut chunk = vec![0; self.encoding.chunk_size(DEFAULT_READ_CHUNK)];
+
+        let mut i = 0;
+        while i < to_scan.len() {
+            if cancel.load(Ordering::Relaxed) {
+                return Ok(None);
+            }
+            let checkpoint = index.nearest_checkpoint(to_scan[i]);
+            let mut group_end = i + 1;
+            while group_end < to_scan.len()
+                && index.nearest_checkpoint(to_scan[group_end]).row == checkpoint.row
+            {
+                group_end += 1;
+            }
+            let targets = &to_scan[i..group_end];
+            i = group_end;
+
+            let mut target_idx = 0;
+            let mut row_number = checkpoint.row;
+            let mut record_start = checkpoint.offset;
+            if targets[target_idx] == row_number {
+                resolved.push((row_number, record_start));
+                target_idx += 1;
+                if target_idx >= targets.len() {
+                    continue;
+                }
+            }
+
+            let target_last = *targets.last().expect("non-empty checkpoint group");
+            if self.encoding.is_utf16() {
+                file.seek(SeekFrom::Start(checkpoint.offset))?;
+            }
+            let mut scanner = RecordScanner::at_offset_with_bom_handling(
+                self.dialect.delimiter,
+                checkpoint.offset,
+                self.encoding,
+                strip_bom_at_zero,
+            )?;
+            let mut absolute_start = checkpoint.offset;
+            let mut has_pending_bytes = false;
+
+            while target_idx < targets.len() && row_number <= target_last {
+                if cancel.load(Ordering::Relaxed) {
+                    return Ok(None);
+                }
+                let remaining = end.saturating_sub(absolute_start);
+                let read = if remaining == 0 {
+                    0
+                } else {
+                    let limit = chunk
+                        .len()
+                        .min(usize::try_from(remaining).unwrap_or(usize::MAX));
+                    if self.encoding.is_utf16() {
+                        self.encoding.read_chunk(&mut file, &mut chunk[..limit])?
+                    } else {
+                        positional_io::read_at_exact_or_eof(
+                            &file,
+                            absolute_start,
+                            &mut chunk[..limit],
+                        )?
+                    }
+                };
+                if read == 0 {
+                    if has_pending_bytes
+                        && target_idx < targets.len()
+                        && targets[target_idx] == row_number
+                    {
+                        resolved.push((row_number, record_start));
+                    }
+                    break;
+                }
+                let mut last_local_end = 0usize;
+                scanner.scan_chunk(&chunk[..read], absolute_start, |absolute_end| {
+                    let local_end = (absolute_end - absolute_start) as usize;
+                    row_number += 1;
+                    record_start = absolute_end;
+                    last_local_end = local_end;
+                    if target_idx < targets.len() && targets[target_idx] == row_number {
+                        resolved.push((row_number, record_start));
+                        target_idx += 1;
+                    }
+                })?;
+                has_pending_bytes = last_local_end < read;
+                absolute_start += read as u64;
+            }
+        }
+
+        self.ensure_source_unchanged()?;
+        resolved.sort_unstable_by_key(|&(row, _)| row);
+        resolved.dedup_by_key(|entry| entry.0);
+        Ok(Some(resolved))
+    }
 }
 
 fn validate_open_options(options: &OpenOptions) -> Result<(), QuarryError> {
@@ -1879,6 +2029,59 @@ mod tests {
                 limit: 64,
                 rows_found: 0,
             })
+        ));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn record_start_offsets_batches_checkpoints_honors_cancel_and_source_guard() {
+        let mut bytes = Vec::from(&b"id,val\n"[..]);
+        for i in 1..=64_u64 {
+            bytes.extend_from_slice(format!("{i},row_value_{i:03}\n").as_bytes());
+        }
+        let path = fixture(&bytes);
+        let session = Session::open(
+            &path,
+            OpenOptions {
+                rows: 4,
+                header_mode: HeaderMode::FirstRow,
+                ..OpenOptions::default()
+            },
+        )
+        .unwrap();
+        let index = session
+            .start_indexing(IndexConfig {
+                checkpoint_every: 8,
+                ..IndexConfig::default()
+            })
+            .unwrap()
+            .wait()
+            .unwrap();
+
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let query_rows = [55, 1, 24, 10, 24, 64, 3, 17];
+        let resolved = session
+            .record_start_offsets(&index, &query_rows, &cancel)
+            .unwrap()
+            .expect("uncancelled offset resolution should return offsets");
+        assert_eq!(resolved.len(), 7);
+        for &(row, offset) in &resolved {
+            let loaded = session.read_rows(&index, row, 1).unwrap();
+            assert_eq!(offset, loaded[0].offset, "mismatch on row {row}");
+        }
+
+        let cancelled = std::sync::atomic::AtomicBool::new(true);
+        assert_eq!(
+            session
+                .record_start_offsets(&index, &[20, 40], &cancelled)
+                .unwrap(),
+            None
+        );
+
+        fs::write(&path, b"id,val\n999,changed_externally\n").unwrap();
+        assert!(matches!(
+            session.record_start_offsets(&index, &[20], &cancel),
+            Err(QuarryError::SourceChanged)
         ));
         fs::remove_file(path).unwrap();
     }

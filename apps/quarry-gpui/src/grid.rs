@@ -431,7 +431,15 @@ impl TableDelegate for Grid {
                 })
                 .on_mouse_down(MouseButton::Right, move |_, _, cx| {
                     right_controller.update(cx, |controller, cx| {
-                        let _ = controller.toggle_bookmark_row_active(win_id, src_row, cx);
+                        if let Err(error) =
+                            controller.toggle_bookmark_row_active(win_id, src_row, cx)
+                        {
+                            controller.set_window_message(
+                                win_id,
+                                Some(quarry_workbench::AppMessage::warning(error)),
+                                cx,
+                            );
+                        }
                     });
                 });
         }

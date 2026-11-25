@@ -219,6 +219,7 @@ impl WorkbenchTab {
     pub fn document_busy(&self) -> bool {
         self.document.as_ref().is_some_and(|document| {
             document.job.is_some()
+                || document.bookmark_offset_job.is_some()
                 || document.section_verify_job.is_some()
                 || document.decompressing()
                 || document.search_job.is_some()
