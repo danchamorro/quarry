@@ -3409,11 +3409,19 @@ impl Document {
                     .into(),
             );
         }
-        if self.job.is_some()
-            || self.index.is_none()
-            || !self.progress.done
-            || self.progress.cancelled
-        {
+        if self.progress.cancelled {
+            return Some(
+                "Indexing was cancelled before completing. Reopen the file to finish indexing before splitting at bookmarks."
+                    .into(),
+            );
+        }
+        if self.is_indexing_paused() {
+            return Some(
+                "Indexing is paused. Resume indexing to completion before splitting at bookmarks."
+                    .into(),
+            );
+        }
+        if self.job.is_some() || self.index.is_none() || !self.progress.done {
             return Some("Wait for indexing to finish before splitting at bookmarks.".into());
         }
         if self.bookmark_offset_job.is_some() {

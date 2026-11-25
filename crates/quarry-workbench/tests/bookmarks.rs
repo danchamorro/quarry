@@ -827,10 +827,16 @@ fn bookmark_split_targets_rejects_cancelled_index_and_external_modification() {
         doc.toggle_bookmark_row(3).unwrap();
         assert_eq!(doc.split_at_bookmarks_disabled_reason(), None);
 
-        // A cancelled partial index must block Split-at-Bookmarks.
+        // A cancelled partial index must block Split-at-Bookmarks with a cancellation-specific recovery message.
         doc.progress.cancelled = true;
-        assert!(doc.split_at_bookmarks_disabled_reason().is_some());
-        assert!(doc.bookmark_split_targets().is_err());
+        let cancelled_reason = doc
+            .split_at_bookmarks_disabled_reason()
+            .expect("cancelled index must block Split-at-Bookmarks");
+        assert!(
+            cancelled_reason.contains("cancelled") && cancelled_reason.contains("Reopen"),
+            "expected cancellation recovery message, got: {cancelled_reason}"
+        );
+        assert_eq!(doc.bookmark_split_targets().unwrap_err(), cancelled_reason);
         doc.progress.cancelled = false;
         assert_eq!(doc.split_at_bookmarks_disabled_reason(), None);
 
