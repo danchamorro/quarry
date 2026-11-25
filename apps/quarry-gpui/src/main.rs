@@ -436,7 +436,7 @@ impl QuarryWindow {
                 self.last_shown_columns = info.shown_columns.clone();
                 self.last_row_gutter_anchor = row_gutter_anchor;
                 if doc_changed {
-                    self.close_grid_context_menu(cx);
+                    self.close_grid_context_menu_and_restore_focus(window, cx);
                 }
                 self.table.update(cx, |table, cx| {
                     if doc_changed {
@@ -459,7 +459,7 @@ impl QuarryWindow {
                 self.table.update(cx, |_, cx| cx.notify());
             }
         } else {
-            self.close_grid_context_menu(cx);
+            self.close_grid_context_menu_and_restore_focus(window, cx);
             if self.last_synced_doc.is_some() {
                 self.last_synced_doc = None;
                 self.last_headers.clear();
@@ -1570,8 +1570,37 @@ impl QuarryWindow {
         self.table.update(cx, |_, cx| cx.notify());
     }
 
+    fn restore_grid_focus(&self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.editing || self.confirming {
+            return;
+        }
+        let table_focus = self
+            .snapshot(cx)
+            .is_some()
+            .then(|| self.table.focus_handle(cx));
+        let root_focus = self.focus_handle.clone();
+        window.defer(cx, move |window, cx| {
+            if let Some(tf) = table_focus {
+                tf.focus(window, cx);
+            } else {
+                root_focus.focus(window, cx);
+            }
+        });
+    }
+
     fn close_grid_context_menu(&mut self, cx: &mut Context<Self>) {
         if self.grid_context_menu.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    fn close_grid_context_menu_and_restore_focus(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.grid_context_menu.take().is_some() {
+            self.restore_grid_focus(window, cx);
             cx.notify();
         }
     }
@@ -1586,15 +1615,7 @@ impl QuarryWindow {
         let dismiss_sub =
             cx.subscribe_in(&menu, window, |this, _, _: &DismissEvent, window, cx| {
                 this.grid_context_menu = None;
-                let table_focus = this
-                    .snapshot(cx)
-                    .is_some()
-                    .then(|| this.table.focus_handle(cx));
-                window.defer(cx, move |window, cx| {
-                    if let Some(tf) = table_focus {
-                        tf.focus(window, cx);
-                    }
-                });
+                this.restore_grid_focus(window, cx);
                 cx.notify();
             });
         menu.focus_handle(cx).focus(window, cx);
@@ -1904,9 +1925,9 @@ impl QuarryWindow {
             let w_del = weak.clone();
 
             menu.item(
-                PopupMenuItem::new(bookmark_label).on_click(move |_, _, cx| {
+                PopupMenuItem::new(bookmark_label).on_click(move |_, window, cx| {
                     let _ = w_bm.update(cx, |this, cx| {
-                        this.close_grid_context_menu(cx);
+                        this.close_grid_context_menu_and_restore_focus(window, cx);
                         let res = this.controller.update(cx, |controller, cx| {
                             controller.toggle_bookmark_row_active(this.window_id, source_row, cx)
                         });
@@ -1939,21 +1960,23 @@ impl QuarryWindow {
                     }),
             )
             .separator()
-            .item(PopupMenuItem::new("Copy Row").on_click(move |_, _, cx| {
-                let _ = w_copy.update(cx, |this, cx| {
-                    this.close_grid_context_menu(cx);
-                    match this
-                        .controller
-                        .update(cx, |c, _| c.copy_row_active(this.window_id, source_row))
-                    {
-                        Ok(text) => {
-                            cx.write_to_clipboard(ClipboardItem::new_string(text));
-                            this.set_message(AppMessage::status("Copied row."), cx);
+            .item(
+                PopupMenuItem::new("Copy Row").on_click(move |_, window, cx| {
+                    let _ = w_copy.update(cx, |this, cx| {
+                        this.close_grid_context_menu_and_restore_focus(window, cx);
+                        match this
+                            .controller
+                            .update(cx, |c, _| c.copy_row_active(this.window_id, source_row))
+                        {
+                            Ok(text) => {
+                                cx.write_to_clipboard(ClipboardItem::new_string(text));
+                                this.set_message(AppMessage::status("Copied row."), cx);
+                            }
+                            Err(error) => this.set_message(AppMessage::warning(error), cx),
                         }
-                        Err(error) => this.set_message(AppMessage::warning(error), cx),
-                    }
-                });
-            }))
+                    });
+                }),
+            )
             .item(
                 PopupMenuItem::new("Delete Selected Rows")
                     .disabled(!can_delete_rows)
@@ -2034,7 +2057,7 @@ impl QuarryWindow {
                         };
                         let value = bytes.clone();
                         let _ = w_eq.update(cx, |this, cx| {
-                            this.close_grid_context_menu(cx);
+                            this.close_grid_context_menu_and_restore_focus(window, cx);
                             this.apply_quick_cell_filter(
                                 source_col,
                                 value,
@@ -2055,7 +2078,7 @@ impl QuarryWindow {
                         };
                         let value = bytes.clone();
                         let _ = w_neq.update(cx, |this, cx| {
-                            this.close_grid_context_menu(cx);
+                            this.close_grid_context_menu_and_restore_focus(window, cx);
                             this.apply_quick_cell_filter(
                                 source_col,
                                 value,
@@ -2071,9 +2094,9 @@ impl QuarryWindow {
             .item(
                 PopupMenuItem::new("Copy Cell")
                     .disabled(!has_value)
-                    .on_click(move |_, _, cx| {
+                    .on_click(move |_, window, cx| {
                         let _ = w_copy.update(cx, |this, cx| {
-                            this.close_grid_context_menu(cx);
+                            this.close_grid_context_menu_and_restore_focus(window, cx);
                             match this.controller.update(cx, |c, _| {
                                 c.copy_cell_active(this.window_id, source_row, source_col)
                             }) {
@@ -4661,14 +4684,14 @@ impl Render for QuarryWindow {
                             .h(win_size.height)
                             .on_mouse_down(
                                 MouseButton::Left,
-                                cx.listener(|this, _, _, cx| {
-                                    this.close_grid_context_menu(cx);
+                                cx.listener(|this, _, window, cx| {
+                                    this.close_grid_context_menu_and_restore_focus(window, cx);
                                 }),
                             )
                             .on_mouse_down(
                                 MouseButton::Right,
-                                cx.listener(|this, _, _, cx| {
-                                    this.close_grid_context_menu(cx);
+                                cx.listener(|this, _, window, cx| {
+                                    this.close_grid_context_menu_and_restore_focus(window, cx);
                                 }),
                             )
                             .on_scroll(|_, _, cx| {
