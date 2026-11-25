@@ -37,11 +37,11 @@ cargo test --workspace --locked
 ./scripts/generate-notices.sh --check
 ```
 
-To build, install, and verify the macOS app bundle:
+To build and verify the local macOS app bundle (or run `./scripts/macos-app.sh install` followed by `./scripts/macos-app.sh verify` to install and verify `/Applications/Quarry.app`):
 
 ```bash
 ./scripts/macos-app.sh package
-./scripts/macos-app.sh verify
+./scripts/macos-app.sh verify target/package/Quarry.app
 ```
 
 ### Validation on Linux / Omarchy
