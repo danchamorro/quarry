@@ -534,7 +534,7 @@ impl TableDelegate for Grid {
             let controller = self.controller.read(cx);
             let doc = controller.active_document(self.window_id);
             let row_sel =
-                src_row_opt.is_some_and(|r| doc.is_some_and(|d| d.selected_rows.contains(r)));
+                src_row_opt.is_some_and(|r| doc.is_some_and(|d| d.is_table_row_selected(row, r)));
             let row_bm = column == 0
                 && src_row_opt.is_some_and(|r| doc.is_some_and(|d| d.bookmarks.contains_row(r)));
             let col_sel =

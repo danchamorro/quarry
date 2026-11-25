@@ -1088,7 +1088,7 @@ impl WorkbenchController {
             structural_progress,
             duplicate_preview,
             pending_split_confirm_bytes,
-            selected_rows_count: doc.selected_rows.count(),
+            selected_rows_count: doc.selected_row_count(),
             selected_columns: doc.selected_columns.iter().copied().collect(),
             index_done: doc.job.is_none() && doc.progress.done && !doc.progress.cancelled,
             index_cancelled: doc.job.is_none() && doc.progress.cancelled,
@@ -1545,7 +1545,7 @@ impl WorkbenchController {
         if let Some(doc) = self.active_document_mut(window) {
             doc.selection = target.map(|(row, column)| GridSelection::Cell { row, column });
             if target.is_some() {
-                doc.selected_rows.clear();
+                doc.clear_row_selection();
                 doc.selected_columns.clear();
                 doc.column_selection_anchor = None;
             }
@@ -2703,42 +2703,65 @@ impl WorkbenchController {
         cx: &mut Context<Self>,
     ) {
         if let Some(doc) = self.active_document_mut(window) {
-            if !shift
-                && !toggle
-                && doc.selected_rows.contains(source_row)
-                && doc.selected_rows.count() == 1
-            {
-                doc.selected_rows.clear();
-                if matches!(doc.selection, Some(GridSelection::Row { .. })) {
-                    doc.selection = None;
-                }
-            } else {
-                if shift && doc.filter_active() {
-                    let anchor = doc
-                        .selected_rows
-                        .anchor
-                        .or_else(|| doc.selected_rows.first())
-                        .unwrap_or(source_row);
-                    let anchor_ix = doc.filtered_rows.iter().position(|r| r.row == anchor);
-                    let target_ix = doc.filtered_rows.iter().position(|r| r.row == source_row);
-                    if let (Some(a), Some(b)) = (anchor_ix, target_ix) {
-                        let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
-                        let matching: Vec<u64> =
-                            doc.filtered_rows[lo..=hi].iter().map(|r| r.row).collect();
-                        doc.selected_rows.select_rows(matching, anchor);
-                    } else {
-                        doc.selected_rows
-                            .select(source_row, SelectionModifiers::NONE);
+            if doc.filter_active() {
+                let Some(ordinal) = doc.filtered_ordinal_for_source_row(source_row) else {
+                    return;
+                };
+                if !shift
+                    && !toggle
+                    && doc.selected_filtered_rows.contains(ordinal)
+                    && doc.selected_filtered_rows.count() == 1
+                {
+                    doc.clear_row_selection();
+                    if matches!(doc.selection, Some(GridSelection::Row { .. })) {
+                        doc.selection = None;
                     }
                 } else {
-                    doc.selected_rows.select(
-                        source_row,
+                    doc.selected_filtered_rows.select(
+                        ordinal,
                         SelectionModifiers {
                             shift,
                             command: toggle,
                         },
                     );
+                    let active_row = doc
+                        .selected_filtered_rows
+                        .contains(ordinal)
+                        .then_some(source_row)
+                        .or_else(|| {
+                            doc.filtered_rows
+                                .iter()
+                                .enumerate()
+                                .find(|(rel, _)| {
+                                    doc.selected_filtered_rows.contains(
+                                        doc.filter_buffer_start.saturating_add(*rel as u64),
+                                    )
+                                })
+                                .map(|(_, r)| r.row)
+                        });
+                    doc.selection = active_row.map(|row| GridSelection::Row { row });
+                    if !doc.selected_filtered_rows.is_empty() {
+                        doc.selected_columns.clear();
+                        doc.column_selection_anchor = None;
+                    }
                 }
+            } else if !shift
+                && !toggle
+                && doc.selected_rows.contains(source_row)
+                && doc.selected_rows.count() == 1
+            {
+                doc.clear_row_selection();
+                if matches!(doc.selection, Some(GridSelection::Row { .. })) {
+                    doc.selection = None;
+                }
+            } else {
+                doc.selected_rows.select(
+                    source_row,
+                    SelectionModifiers {
+                        shift,
+                        command: toggle,
+                    },
+                );
                 let active_row = doc
                     .selected_rows
                     .contains(source_row)
@@ -2763,7 +2786,7 @@ impl WorkbenchController {
     pub fn clear_selection_active(&mut self, window: WindowId, cx: &mut Context<Self>) {
         if let Some(doc) = self.active_document_mut(window) {
             doc.selection = None;
-            doc.selected_rows.clear();
+            doc.clear_row_selection();
             doc.selected_columns.clear();
             doc.column_selection_anchor = None;
             cx.notify();
@@ -2778,8 +2801,15 @@ impl WorkbenchController {
         cx: &mut Context<Self>,
     ) {
         if let Some(doc) = self.active_document_mut(window) {
-            doc.selected_rows
-                .select(source_row, SelectionModifiers::NONE);
+            if doc.filter_active() {
+                if let Some(ordinal) = doc.filtered_ordinal_for_source_row(source_row) {
+                    doc.selected_filtered_rows
+                        .select(ordinal, SelectionModifiers::NONE);
+                }
+            } else {
+                doc.selected_rows
+                    .select(source_row, SelectionModifiers::NONE);
+            }
             doc.selection = Some(GridSelection::Row { row: source_row });
             doc.selected_columns.clear();
             doc.column_selection_anchor = None;
@@ -2795,7 +2825,14 @@ impl WorkbenchController {
         cx: &mut Context<Self>,
     ) {
         if let Some(doc) = self.active_document_mut(window) {
-            if !doc.selected_rows.contains(source_row) {
+            if doc.filter_active() {
+                if let Some(ordinal) = doc.filtered_ordinal_for_source_row(source_row)
+                    && !doc.selected_filtered_rows.contains(ordinal)
+                {
+                    doc.selected_filtered_rows
+                        .select(ordinal, SelectionModifiers::NONE);
+                }
+            } else if !doc.selected_rows.contains(source_row) {
                 doc.selected_rows
                     .select(source_row, SelectionModifiers::NONE);
             }
@@ -2830,7 +2867,7 @@ impl WorkbenchController {
                 },
             );
             doc.selection = None;
-            doc.selected_rows.clear();
+            doc.clear_row_selection();
             cx.notify();
         }
     }
@@ -2853,7 +2890,7 @@ impl WorkbenchController {
                 doc.column_selection_anchor = Some(source_col);
             }
             doc.selection = None;
-            doc.selected_rows.clear();
+            doc.clear_row_selection();
             cx.notify();
         }
     }

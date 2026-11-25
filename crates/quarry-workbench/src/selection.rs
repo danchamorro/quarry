@@ -214,20 +214,6 @@ impl RowSelection {
         self.anchor = None;
     }
 
-    /// Replaces the selection with an arbitrary set of matching source rows (e.g., Shift-range
-    /// selection over a filtered result set) while preserving `anchor`.
-    pub fn select_rows(&mut self, rows: impl IntoIterator<Item = u64>, anchor: u64) {
-        self.ranges.clear();
-        let mut sorted: Vec<u64> = rows.into_iter().collect();
-        sorted.sort_unstable();
-        sorted.dedup();
-        for row in sorted {
-            self.ranges.push(row..=row);
-        }
-        self.merge_adjacent();
-        self.anchor = Some(anchor);
-    }
-
     pub fn select(&mut self, row: u64, modifiers: SelectionModifiers) {
         if modifiers.shift {
             let anchor = self

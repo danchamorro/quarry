@@ -605,7 +605,7 @@ impl Document {
         self.progress.cancelled = true;
         self.selection = None;
         self.cursor.clear();
-        self.selected_rows.clear();
+        self.clear_row_selection();
         let last_start = max_viewport_start(self.available_rows(), self.visible_rows);
         self.viewport_start = self.viewport_start.min(last_start.max(self.data_start));
         self.buffer_start = self.data_start;
