@@ -420,9 +420,11 @@ impl Document {
             return Self::prepare_compressed(path, options, encoding);
         }
         let session = Session::open_with_encoding(path, options, encoding).map_err(|error| {
+            let inspectable = !matches!(error, QuarryError::CompressedFile { .. })
+                && !compressed::compressed_source(path);
             compressed::OpenFailure {
                 message: error.to_string(),
-                inspectable: true,
+                inspectable,
             }
         })?;
         Ok(Self::from_session(session, path))
@@ -5197,6 +5199,57 @@ impl Document {
             || whitespace::Input::Header(self.session.clone(), column),
             |name| whitespace::Input::Text(name.clone()),
         )
+    }
+
+    /// Queries the bounded async whitespace cache for a loaded cell without cloning on cache hits.
+    pub fn inspect_cell_whitespace(
+        &mut self,
+        row: u64,
+        column: usize,
+        raw_len: usize,
+    ) -> Option<whitespace::Summary> {
+        let id = whitespace::CellId {
+            row: Some(row),
+            column,
+        };
+        let cell_edits = &self.cell_edits;
+        let filter_active = self.filter_active();
+        let filtered_rows = &self.filtered_rows;
+        let buffered_rows = &self.buffered_rows;
+        let buffer_start = self.buffer_start;
+        self.whitespace.get(id, raw_len, || {
+            if let Some(value) = cell_edits.get(&(row, column)) {
+                return whitespace::Input::Owned(value.clone());
+            }
+            if filter_active {
+                let found = filtered_rows
+                    .iter()
+                    .find(|value| value.row == row)
+                    .expect("inspected filtered row is loaded");
+                whitespace::Input::Filtered(found.clone(), column)
+            } else {
+                let index = usize::try_from(row.saturating_sub(buffer_start))
+                    .expect("loaded row offset fits usize");
+                whitespace::Input::Row(buffered_rows[index].clone(), column)
+            }
+        })
+    }
+
+    /// Queries the bounded async whitespace cache for a column header without cloning on cache hits.
+    pub fn inspect_header_whitespace(
+        &mut self,
+        column: usize,
+        raw_len: usize,
+    ) -> Option<whitespace::Summary> {
+        let id = whitespace::CellId { row: None, column };
+        let header_renames = &self.header_renames;
+        let session = &self.session;
+        self.whitespace.get(id, raw_len, || {
+            header_renames.get(&column).map_or_else(
+                || whitespace::Input::Header(session.clone(), column),
+                |name| whitespace::Input::Text(name.clone()),
+            )
+        })
     }
 
     /// Core jobs own their snapshots; copying is deferred until starting a data operation.

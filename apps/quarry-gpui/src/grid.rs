@@ -3,18 +3,22 @@
 
 use std::collections::HashMap;
 use std::ops::Range;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui_kit::component::ActiveTheme;
 use gpui_kit::component::table::{Column, TableDelegate, TableState};
+use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::{
     App, Context, Entity, FontFeatures, InteractiveElement, IntoElement, MouseButton,
-    ParentElement, Pixels, SharedString, Styled, Window, div, px, rgb,
+    ParentElement, Pixels, Point, SharedString, StatefulInteractiveElement, Styled, Window, div,
+    px, rgb,
 };
 use quarry_workbench::{
-    Document, MAX_GRID_TEXT_CHARS, WindowId, field_preview, source_looks_numeric, whitespace,
+    Document, MAX_GRID_TEXT_CHARS, WindowId, field_preview, source_looks_numeric,
 };
 
+use crate::whitespace_ui::render_whitespace;
 use crate::workbench::WorkbenchController;
 
 /// OpenType `tnum` (tabular figures) font feature configuration for native CoreText
@@ -23,19 +27,52 @@ pub fn tabular_font_features() -> FontFeatures {
     FontFeatures(Arc::new(vec![("tnum".to_owned(), 1)]))
 }
 
+/// Interactive requests emitted from grid headers, row gutter cells, and data cells.
+#[derive(Clone, Debug)]
+pub enum GridAction {
+    ColumnContextMenu {
+        source_col: usize,
+        position: Point<Pixels>,
+    },
+    RowContextMenu {
+        table_row: usize,
+        source_row: u64,
+        position: Point<Pixels>,
+    },
+    CellContextMenu {
+        table_row: usize,
+        table_col: usize,
+        source_row: u64,
+        source_col: usize,
+        position: Point<Pixels>,
+    },
+    RenameHeader {
+        source_col: usize,
+    },
+}
+
+/// Callback invoked when the user triggers a grid context menu or header rename.
+pub type GridActionCallback = Rc<dyn Fn(GridAction, &mut Window, &mut App)>;
+
 pub struct Grid {
     controller: Entity<WorkbenchController>,
     window_id: WindowId,
+    on_action: GridActionCallback,
     widths: HashMap<usize, Pixels>,
     visible_rows: Range<usize>,
     visible_columns: Range<usize>,
 }
 
 impl Grid {
-    pub fn new(controller: Entity<WorkbenchController>, window_id: WindowId) -> Self {
+    pub fn new(
+        controller: Entity<WorkbenchController>,
+        window_id: WindowId,
+        on_action: GridActionCallback,
+    ) -> Self {
         Self {
             controller,
             window_id,
+            on_action,
             widths: HashMap::new(),
             visible_rows: 0..40,
             visible_columns: 0..16,
@@ -59,6 +96,10 @@ impl Grid {
 
     pub fn reset_widths(&mut self) {
         self.widths.clear();
+    }
+
+    pub fn visible_rows(&self) -> Range<usize> {
+        self.visible_rows.clone()
     }
 
     pub fn visible_rows_count(&self) -> usize {
@@ -97,6 +138,29 @@ impl Grid {
         let source_col = *doc.columns.visible.get(column - 1)?;
         let (source_row, _) = loaded_row(doc, row)?;
         Some((source_row, source_col))
+    }
+
+    /// Maps a rendered `(row, table_column)` (for `column > 0`) to
+    /// `(source_row, source_column, Option<raw_bytes>)`, where `None` indicates an absent/ragged field.
+    pub fn cell_raw_value(
+        &self,
+        row: usize,
+        column: usize,
+        cx: &App,
+    ) -> Option<(u64, usize, Option<Vec<u8>>)> {
+        if column == 0 {
+            return None;
+        }
+        let controller = self.controller.read(cx);
+        let doc = controller.active_document(self.window_id)?;
+        let source_col = *doc.columns.visible.get(column - 1)?;
+        let (source_row, fields) = loaded_row(doc, row)?;
+        let raw = if let Some(edited) = doc.cell_edits.get(&(source_row, source_col)) {
+            Some(edited.as_ref().clone())
+        } else {
+            fields.get(source_col).cloned()
+        };
+        Some((source_row, source_col, raw))
     }
 
     /// Maps a rendered `table_column` (1-based) to its physical `source_column`.
@@ -142,41 +206,14 @@ impl Grid {
         loaded_row(doc, row).map(|(source_row, _)| source_row)
     }
 
-    fn display_loaded(&self, row: usize, column: usize, cx: &App) -> Option<String> {
+    fn gutter_label(&self, row: usize, cx: &App) -> Option<String> {
         let controller = self.controller.read(cx);
         let doc = controller.active_document(self.window_id)?;
-        let (source_row, fields) = loaded_row(doc, row)?;
-        if column == 0 {
-            if let Some(global_row) = doc.global_data_row_number(source_row) {
-                return Some(global_row.to_string());
-            }
-            return Some((source_row + 1 - doc.data_start).to_string());
+        let (source_row, _) = loaded_row(doc, row)?;
+        if let Some(global_row) = doc.global_data_row_number(source_row) {
+            return Some(global_row.to_string());
         }
-        let source_col = *doc.columns.visible.get(column - 1)?;
-        let raw = fields.get(source_col).map(Vec::as_slice).unwrap_or(&[]);
-        let value = doc.cell_value(source_row, source_col, raw);
-        let preview = field_preview(value, MAX_GRID_TEXT_CHARS.min(240));
-        if controller.show_all_whitespace() {
-            Some(render_whitespace_marks(&preview))
-        } else {
-            Some(preview)
-        }
-    }
-
-    fn display_raw_loaded(&self, row: usize, column: usize, cx: &App) -> Option<String> {
-        let controller = self.controller.read(cx);
-        let doc = controller.active_document(self.window_id)?;
-        let (source_row, fields) = loaded_row(doc, row)?;
-        if column == 0 {
-            if let Some(global_row) = doc.global_data_row_number(source_row) {
-                return Some(global_row.to_string());
-            }
-            return Some((source_row + 1 - doc.data_start).to_string());
-        }
-        let source_col = *doc.columns.visible.get(column - 1)?;
-        let raw = fields.get(source_col).map(Vec::as_slice).unwrap_or(&[]);
-        let value = doc.cell_value(source_row, source_col, raw);
-        Some(field_preview(value, MAX_GRID_TEXT_CHARS.min(240)))
+        Some((source_row + 1 - doc.data_start).to_string())
     }
 }
 
@@ -193,21 +230,6 @@ fn loaded_row(doc: &Document, table_row: usize) -> Option<(u64, &[Vec<u8>])> {
         let found = doc.buffered_rows.get(index)?;
         Some((source_row, found.fields.as_slice()))
     }
-}
-
-fn render_whitespace_marks(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    for ch in text.chars() {
-        match ch {
-            ' ' => out.push('·'),
-            '\t' => out.push('→'),
-            '\r' => out.push('↵'),
-            '\n' => out.push('⏎'),
-            '\u{a0}' => out.push('⍽'),
-            other => out.push(other),
-        }
-    }
-    out
 }
 
 impl TableDelegate for Grid {
@@ -270,8 +292,8 @@ impl TableDelegate for Grid {
     }
 
     fn cell_label(&self, row: usize, column: usize, cx: &App) -> Option<SharedString> {
-        let value = self.display_raw_loaded(row, column, cx)?;
         if column == 0 {
+            let value = self.gutter_label(row, cx)?;
             if value.is_empty() {
                 return None;
             }
@@ -287,14 +309,20 @@ impl TableDelegate for Grid {
                 format!("Row {value}").into()
             });
         }
-        let controller = self.controller.read(cx);
-        let doc = controller.active_document(self.window_id)?;
-        let source = *doc.columns.visible.get(column - 1)?;
-        let header = doc.column_name(source);
-        if value.is_empty() {
+        let (_, source_col, raw_opt) = self.cell_raw_value(row, column, cx)?;
+        let header = self
+            .controller
+            .read(cx)
+            .active_document(self.window_id)?
+            .column_name(source_col);
+        let Some(raw) = raw_opt else {
+            return Some(format!("{header}: Field is absent from this row.").into());
+        };
+        let preview = field_preview(&raw, MAX_GRID_TEXT_CHARS.min(240));
+        if preview.is_empty() {
             Some(format!("{header}: empty").into())
         } else {
-            Some(format!("{header}: {value}").into())
+            Some(format!("{header}: {preview}").into())
         }
     }
 
@@ -304,8 +332,8 @@ impl TableDelegate for Grid {
         _: &mut Window,
         cx: &mut Context<TableState<Self>>,
     ) -> impl IntoElement {
-        let name = self.column(column, cx).name.clone();
         if column == 0 {
+            let name = self.column(column, cx).name.clone();
             return div()
                 .id("grid-th-row-num")
                 .size_full()
@@ -315,17 +343,49 @@ impl TableDelegate for Grid {
                 .child(name);
         }
         let source_col = self.source_column_at(column, cx);
-        let selected = source_col.is_some_and(|src| {
-            self.controller
-                .read(cx)
-                .active_document(self.window_id)
-                .is_some_and(|doc| doc.selected_columns.contains(&src))
-        });
+        let (selected, header_name, header_raw, tokens, show_all) = {
+            let controller = self.controller.read(cx);
+            let tokens = controller.active_palette();
+            let show_all = controller.show_all_whitespace();
+            let doc = controller.active_document(self.window_id);
+            let selected = source_col
+                .is_some_and(|src| doc.is_some_and(|doc| doc.selected_columns.contains(&src)));
+            let header_name = source_col
+                .and_then(|src| doc.map(|d| d.column_name(src)))
+                .unwrap_or_default();
+            let header_raw = source_col
+                .and_then(|src| doc.and_then(|d| d.header_value(src).map(ToOwned::to_owned)));
+            (selected, header_name, header_raw, tokens, show_all)
+        };
+
+        let (summary, rendered, indicated, pending, tooltip_text) =
+            if let (Some(src_col), Some(raw)) = (source_col, header_raw.as_deref()) {
+                let win_id = self.window_id;
+                let summary = self.controller.update(cx, |controller, _| {
+                    controller.inspect_header_whitespace(win_id, src_col, raw.len())
+                });
+                let rendered = render_whitespace(raw, summary, show_all, 120);
+                let indicated =
+                    summary.is_some_and(|s| s.indicated(show_all)) || rendered.visible_marks;
+                let pending = summary.is_none() && !raw.is_empty();
+                let tip = (indicated || pending).then(|| {
+                    self.controller
+                        .read(cx)
+                        .whitespace_explanation(win_id, summary)
+                });
+                (summary, Some(rendered), indicated, pending, tip)
+            } else {
+                (None, None, false, false, None)
+            };
+        let _ = summary;
+
         let mut header = div()
             .id(("grid-th", column))
+            .relative()
             .size_full()
             .flex()
             .items_center()
+            .gap_1()
             .overflow_hidden()
             .whitespace_nowrap()
             .text_ellipsis()
@@ -334,18 +394,84 @@ impl TableDelegate for Grid {
                 cx.theme().primary
             } else {
                 cx.theme().foreground
-            })
-            .child(name);
+            });
+
+        if selected {
+            header = header.child(div().flex_shrink_0().child("✓"));
+        }
+
+        let text_el = div().flex_1().min_w_0().overflow_hidden().text_ellipsis();
+        header = if let Some(rendered) = rendered {
+            header.child(
+                text_el.child(rendered.into_styled_text(rgb(tokens.mark.to_rgb_hex()).into())),
+            )
+        } else {
+            header.child(text_el.child(header_name))
+        };
+
+        if indicated {
+            header = header.child(
+                div()
+                    .absolute()
+                    .top(px(2.))
+                    .right(px(2.))
+                    .w(px(5.))
+                    .h(px(5.))
+                    .rounded_full()
+                    .bg(rgb(tokens.indicator_fill.to_rgb_hex())),
+            );
+        } else if pending {
+            header = header.child(
+                div()
+                    .absolute()
+                    .top(px(2.))
+                    .right(px(2.))
+                    .w(px(5.))
+                    .h(px(5.))
+                    .rounded_full()
+                    .border_1()
+                    .border_color(rgb(tokens.mark.to_rgb_hex())),
+            );
+        }
+
+        if let Some(tip) = tooltip_text {
+            header = header.tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx));
+        }
+
         if let Some(src_col) = source_col {
             let controller = self.controller.clone();
             let win_id = self.window_id;
-            header = header.on_mouse_down(MouseButton::Left, move |event, _, cx| {
-                let shift = event.modifiers.shift;
-                let toggle = event.modifiers.platform || event.modifiers.control;
-                controller.update(cx, |controller, cx| {
-                    controller.select_column_active(win_id, src_col, shift, toggle, cx);
+            let on_action_left = self.on_action.clone();
+            let on_action_right = self.on_action.clone();
+            header = header
+                .on_mouse_down(MouseButton::Left, move |event, window, cx| {
+                    if event.click_count == 2 {
+                        (on_action_left)(
+                            GridAction::RenameHeader {
+                                source_col: src_col,
+                            },
+                            window,
+                            cx,
+                        );
+                        return;
+                    }
+                    let shift = event.modifiers.shift;
+                    let toggle = event.modifiers.platform || event.modifiers.control;
+                    controller.update(cx, |controller, cx| {
+                        controller.select_column_active(win_id, src_col, shift, toggle, cx);
+                    });
+                })
+                .on_mouse_down(MouseButton::Right, move |event, window, cx| {
+                    cx.stop_propagation();
+                    (on_action_right)(
+                        GridAction::ColumnContextMenu {
+                            source_col: src_col,
+                            position: event.position,
+                        },
+                        window,
+                        cx,
+                    );
                 });
-            });
         }
         header
     }
@@ -357,39 +483,27 @@ impl TableDelegate for Grid {
         _: &mut Window,
         cx: &mut Context<TableState<Self>>,
     ) -> impl IntoElement {
-        let text = self.display_loaded(row, column, cx).unwrap_or_default();
-        let (has_whitespace_mark, numeric_cell) = if column > 0 {
-            let show_all = self.controller.read(cx).show_all_whitespace();
-            let raw = self.display_raw_loaded(row, column, cx).unwrap_or_default();
-            let is_numeric = source_looks_numeric(raw.as_bytes());
-            let has_ws = if raw.is_empty() {
-                false
-            } else {
-                let summary =
-                    whitespace::analyze(raw.as_bytes(), &std::sync::atomic::AtomicBool::new(false));
-                summary.is_some_and(|s| s.indicated(show_all))
-            };
-            (has_ws, is_numeric)
-        } else {
-            (false, true)
+        let (tokens, show_all) = {
+            let controller = self.controller.read(cx);
+            (
+                controller.active_palette(),
+                controller.show_all_whitespace(),
+            )
         };
-        let tokens = self.controller.read(cx).active_palette();
-        let (row_selected, row_bookmarked) = if column == 0 {
-            self.source_row_at(row, cx)
-                .map_or((false, false), |src_row| {
-                    self.controller
-                        .read(cx)
-                        .active_document(self.window_id)
-                        .map_or((false, false), |doc| {
-                            (
-                                doc.selected_rows.contains(src_row),
-                                doc.bookmarks.contains_row(src_row),
-                            )
-                        })
-                })
-        } else {
-            (false, false)
+        let src_row_opt = self.source_row_at(row, cx);
+        let src_col_opt = self.source_column_at(column, cx);
+        let (row_selected, row_bookmarked, col_selected) = {
+            let controller = self.controller.read(cx);
+            let doc = controller.active_document(self.window_id);
+            let row_sel =
+                src_row_opt.is_some_and(|r| doc.is_some_and(|d| d.selected_rows.contains(r)));
+            let row_bm = column == 0
+                && src_row_opt.is_some_and(|r| doc.is_some_and(|d| d.bookmarks.contains_row(r)));
+            let col_sel =
+                src_col_opt.is_some_and(|c| doc.is_some_and(|d| d.selected_columns.contains(&c)));
+            (row_sel, row_bm, col_sel)
         };
+
         let mut cell = div()
             .id(("grid-cell", row * 1024 + column))
             .relative()
@@ -411,68 +525,149 @@ impl TableDelegate for Grid {
             } else {
                 cx.theme().foreground
             });
-        if row_selected {
-            cell = cell.bg(rgb(tokens.selection_strong.to_rgb_hex()));
-        }
-        if column == 0
-            && let Some(src_row) = self.source_row_at(row, cx)
-        {
-            let controller = self.controller.clone();
-            let win_id = self.window_id;
-            let right_controller = self.controller.clone();
-            cell = cell
-                .cursor_pointer()
-                .on_mouse_down(MouseButton::Left, move |event, _, cx| {
-                    let shift = event.modifiers.shift;
-                    let toggle = event.modifiers.platform || event.modifiers.control;
-                    controller.update(cx, |controller, cx| {
-                        controller.select_row_active(win_id, src_row, shift, toggle, cx);
+
+        if column == 0 {
+            if row_selected {
+                cell = cell.bg(rgb(tokens.selection_strong.to_rgb_hex()));
+            }
+            if let Some(src_row) = src_row_opt {
+                let controller = self.controller.clone();
+                let win_id = self.window_id;
+                let on_action_right = self.on_action.clone();
+                cell = cell
+                    .cursor_pointer()
+                    .on_mouse_down(MouseButton::Left, move |event, _, cx| {
+                        let shift = event.modifiers.shift;
+                        let toggle = event.modifiers.platform || event.modifiers.control;
+                        controller.update(cx, |controller, cx| {
+                            controller.select_row_active(win_id, src_row, shift, toggle, cx);
+                        });
+                    })
+                    .on_mouse_down(MouseButton::Right, move |event, window, cx| {
+                        cx.stop_propagation();
+                        (on_action_right)(
+                            GridAction::RowContextMenu {
+                                table_row: row,
+                                source_row: src_row,
+                                position: event.position,
+                            },
+                            window,
+                            cx,
+                        );
                     });
-                })
-                .on_mouse_down(MouseButton::Right, move |_, _, cx| {
-                    right_controller.update(cx, |controller, cx| {
-                        if let Err(error) =
-                            controller.toggle_bookmark_row_active(win_id, src_row, cx)
-                        {
-                            controller.set_window_message(
-                                win_id,
-                                Some(quarry_workbench::AppMessage::warning(error)),
-                                cx,
-                            );
-                        }
-                    });
-                });
-        }
-        if row_bookmarked {
-            cell = cell.child(
-                div()
-                    .w(px(6.))
-                    .h(px(6.))
-                    .flex_shrink_0()
-                    .rounded_full()
-                    .bg(rgb(if row_selected {
+            }
+            if row_bookmarked {
+                cell = cell.child(div().w(px(6.)).h(px(6.)).flex_shrink_0().rounded_full().bg(
+                    rgb(if row_selected {
                         tokens.on_accent.to_rgb_hex()
                     } else {
                         tokens.accent_text.to_rgb_hex()
-                    })),
-            );
-        }
-        let mut text_div = div().flex_1().min_w_0().overflow_hidden().text_ellipsis();
-        if numeric_cell {
-            text_div = text_div.text_right();
-        }
-        cell = cell.child(text_div.child(text));
-        if has_whitespace_mark {
-            cell = cell.child(
+                    }),
+                ));
+            }
+            let text = self.gutter_label(row, cx).unwrap_or_default();
+            return cell.child(
                 div()
-                    .absolute()
-                    .top(px(2.))
-                    .right(px(2.))
-                    .w(px(5.))
-                    .h(px(5.))
-                    .rounded_full()
-                    .bg(rgb(tokens.indicator_fill.to_rgb_hex())),
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .text_right()
+                    .child(text),
             );
+        }
+
+        if row_selected || col_selected {
+            cell = cell.bg(rgb(tokens.selection.to_rgb_hex()));
+        }
+
+        if let Some((src_row, src_col, raw_opt)) = self.cell_raw_value(row, column, cx) {
+            let on_action_right = self.on_action.clone();
+            cell = cell.on_mouse_down(MouseButton::Right, move |event, window, cx| {
+                cx.stop_propagation();
+                (on_action_right)(
+                    GridAction::CellContextMenu {
+                        table_row: row,
+                        table_col: column,
+                        source_row: src_row,
+                        source_col: src_col,
+                        position: event.position,
+                    },
+                    window,
+                    cx,
+                );
+            });
+
+            let Some(raw) = raw_opt else {
+                // Absent/ragged field in this row: show clear hover tooltip distinguishing it from empty.
+                let absent_tip = "This row has no cell in this file column.".to_owned();
+                return cell
+                    .tooltip(move |window, cx| Tooltip::new(absent_tip.clone()).build(window, cx))
+                    .child(div().flex_1().min_w_0());
+            };
+
+            let numeric_cell = source_looks_numeric(&raw);
+            let invalid_utf8 = std::str::from_utf8(&raw).is_err();
+            let win_id = self.window_id;
+            let summary = self.controller.update(cx, |controller, _| {
+                controller.inspect_cell_whitespace(win_id, src_row, src_col, raw.len())
+            });
+            let rendered = render_whitespace(&raw, summary, show_all, MAX_GRID_TEXT_CHARS.min(240));
+            let indicated =
+                summary.is_some_and(|s| s.indicated(show_all)) || rendered.visible_marks;
+            let pending = summary.is_none() && !raw.is_empty();
+
+            let mut text_div = div().flex_1().min_w_0().overflow_hidden().text_ellipsis();
+            if numeric_cell {
+                text_div = text_div.text_right();
+            }
+            cell = cell.child(
+                text_div.child(rendered.into_styled_text(rgb(tokens.mark.to_rgb_hex()).into())),
+            );
+
+            if indicated {
+                cell = cell.child(
+                    div()
+                        .absolute()
+                        .top(px(2.))
+                        .right(px(2.))
+                        .w(px(5.))
+                        .h(px(5.))
+                        .rounded_full()
+                        .bg(rgb(tokens.indicator_fill.to_rgb_hex())),
+                );
+            } else if pending {
+                cell = cell.child(
+                    div()
+                        .absolute()
+                        .top(px(2.))
+                        .right(px(2.))
+                        .w(px(5.))
+                        .h(px(5.))
+                        .rounded_full()
+                        .border_1()
+                        .border_color(rgb(tokens.mark.to_rgb_hex())),
+                );
+            }
+
+            if invalid_utf8 || indicated || pending {
+                let ws_tip = (indicated || pending).then(|| {
+                    self.controller
+                        .read(cx)
+                        .whitespace_explanation(win_id, summary)
+                });
+                let tip = match (invalid_utf8, ws_tip) {
+                    (true, Some(ws)) => {
+                        format!("This cell is not valid UTF-8 and cannot be edited.\n{ws}")
+                    }
+                    (true, None) => "This cell is not valid UTF-8 and cannot be edited.".to_owned(),
+                    (false, Some(ws)) => ws,
+                    (false, None) => unreachable!(),
+                };
+                cell = cell.tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx));
+            }
+        } else {
+            cell = cell.child(div().flex_1().min_w_0());
         }
         cell
     }

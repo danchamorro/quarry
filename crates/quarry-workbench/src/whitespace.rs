@@ -301,6 +301,42 @@ impl Cache {
         self.job.is_some() || !self.requested.is_empty()
     }
 
+    /// Harvests any completed background inspection batch and starts the next queued batch.
+    /// Returns `true` when new summaries were stored and the view should repaint.
+    pub fn poll(&mut self) -> bool {
+        let mut updated = false;
+        if self.job.as_ref().is_some_and(|j| j.handle.is_finished()) {
+            let job = self.job.take().unwrap();
+            match job.handle.join() {
+                Ok(entries) => {
+                    for (id, summary) in entries {
+                        if self.entries.len() >= MAX_CACHE_CELLS
+                            && !self.entries.contains_key(&id)
+                            && let Some((_, oldest)) = self.usage.pop_first()
+                        {
+                            self.entries.remove(&oldest);
+                        }
+                        if let Some((used, _)) = self.entries.insert(id, (self.clock, summary)) {
+                            self.usage.remove(&(used, id));
+                        }
+                        self.usage.insert((self.clock, id));
+                        updated = true;
+                    }
+                }
+                Err(_) => {
+                    self.failed = true;
+                    updated = true;
+                }
+            }
+        }
+        if self.job.is_none() && !self.requests.is_empty() {
+            let _ = self.finish_frame_with_notify(|| {});
+            self.requested.clear();
+            self.queued_bytes = 0;
+        }
+        updated
+    }
+
     /// Navigation changes loaded rows, but not the current document's header values.
     pub fn invalidate_rows(&mut self) {
         if let Some(job) = self.job.take() {

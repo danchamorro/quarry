@@ -10,22 +10,24 @@ use gpui_kit::component::Root;
 use gpui_kit::{AnyWindowHandle, App, AppContext, Context, Entity, Global, WindowHandle};
 use quarry_core::{
     ByteWindow, CaseSensitivity, ColumnCleanup, DateFormatSuggestion, DuplicateTarget, Encoding,
-    FilterQuery, HeaderMode, JoinMode, OpenOptions, SectionBounds, SectionOpenOptions, SortPlan,
-    StorageSpace, VerifyBoundaryOutcome, VerifyBoundaryProgress, raise_nofile_limit,
+    FilterOperator, FilterPredicate, FilterQuery, HeaderMode, JoinMode, OpenOptions, SectionBounds,
+    SectionOpenOptions, SortPlan, StorageSpace, VerifyBoundaryOutcome, VerifyBoundaryProgress,
+    raise_nofile_limit,
 };
 use quarry_workbench::compressed::{
     DecompressionStatus, decompression_status, gzip_destination_warning,
 };
 use quarry_workbench::{
     AppMessage, CombineWorkflow, CommandContext, CommandId, CommandResolution,
-    DEFAULT_NOFILE_TARGET, DelimiterMode, Document, DocumentId, FailedOpen, HudAnnouncement,
-    HudAnnouncementTracker, HudIndexPhase, InspectWorkflow, JOIN_INPUT_RESERVED, JoinWorkflow,
-    MessageSeverity, Palette, ResidencyState, ResolvedTheme, ResourceHudSample, ResourceHudSampler,
-    ResourceHudTargets, SchedulerError, SelectionModifiers, StoragePreferences, StructuralDialog,
-    StructuralJob, ThemeAppearance, ThemePreference, ThemePreferences, WakeOutcome, WindowId,
-    WorkbenchScheduler, WorkbenchSchedulerConfig, WorkbenchTab, clear_index_cache_summary,
-    evaluate_command, inspect_temporary_storage, materialization_progress,
-    omarchy_theme_fingerprint, resolve_theme, select_column, sort_progress,
+    DEFAULT_NOFILE_TARGET, DelimiterMode, Document, DocumentId, FailedOpen, GridSelection,
+    HudAnnouncement, HudAnnouncementTracker, HudIndexPhase, InspectWorkflow, JOIN_INPUT_RESERVED,
+    JoinWorkflow, MessageSeverity, Palette, ResidencyState, ResolvedTheme, ResourceHudSample,
+    ResourceHudSampler, ResourceHudTargets, SchedulerError, SelectionModifiers, StoragePreferences,
+    StructuralDialog, StructuralJob, ThemeAppearance, ThemePreference, ThemePreferences,
+    WakeOutcome, WindowId, WorkbenchScheduler, WorkbenchSchedulerConfig, WorkbenchTab,
+    clear_index_cache_summary, evaluate_command, inspect_temporary_storage,
+    materialization_progress, omarchy_theme_fingerprint, resolve_theme, select_column,
+    sort_progress, whitespace,
 };
 
 /// Shared global concurrency cap across document saves, exports, structural edits, decompressions,
@@ -116,6 +118,8 @@ pub struct DocumentSnapshot {
     pub can_resume_indexing: bool,
     pub dirty: bool,
     pub saving: bool,
+    pub save_cancel_requested: bool,
+    pub save_status: Option<String>,
     pub busy: bool,
     pub can_undo: bool,
     pub can_redo: bool,
@@ -236,7 +240,7 @@ pub struct WorkbenchController {
     editing_windows: BTreeSet<WindowId>,
     viewport_read_seq: BTreeMap<DocumentId, u64>,
     pending_reveal_cells: BTreeMap<DocumentId, (u64, usize)>,
-    show_all_whitespace: bool,
+    whitespace_prefs: whitespace::Preferences,
     window_messages: BTreeMap<WindowId, AppMessage>,
     pending_review: Option<PendingReviewScope>,
     active_review_token: Option<u64>,
@@ -341,7 +345,7 @@ impl WorkbenchController {
             editing_windows: BTreeSet::new(),
             viewport_read_seq: BTreeMap::new(),
             pending_reveal_cells: BTreeMap::new(),
-            show_all_whitespace: false,
+            whitespace_prefs: whitespace::Preferences::load(None),
             window_messages: BTreeMap::new(),
             pending_review: None,
             active_review_token: None,
@@ -367,13 +371,16 @@ impl WorkbenchController {
         let _ = raise_nofile_limit(DEFAULT_NOFILE_TARGET);
         let storage_prefs = StoragePreferences::application();
         let theme_prefs = ThemePreferences::load_default();
+        let whitespace_prefs = whitespace::Preferences::application();
         let theme_home = std::env::var_os("HOME").map(PathBuf::from);
         let config = WorkbenchSchedulerConfig {
             defer_gzip_decompression: true,
             ..WorkbenchSchedulerConfig::default()
         };
-        let entity =
-            cx.new(|_| Self::new_with_all_prefs(config, storage_prefs, theme_prefs, theme_home));
+        let entity = cx.new(|_| {
+            Self::new_with_all_prefs(config, storage_prefs, theme_prefs, theme_home)
+                .with_whitespace_prefs(whitespace_prefs)
+        });
         cx.set_global(WorkbenchGlobal(entity.clone()));
 
         let poll_entity = entity.clone();
@@ -819,13 +826,59 @@ impl WorkbenchController {
         self.join.release_all_async();
     }
 
-    pub fn show_all_whitespace(&self) -> bool {
-        self.show_all_whitespace
+    pub fn with_whitespace_prefs(mut self, prefs: whitespace::Preferences) -> Self {
+        self.whitespace_prefs = prefs;
+        self
     }
 
-    pub fn toggle_show_all_whitespace(&mut self, cx: &mut Context<Self>) {
-        self.show_all_whitespace = !self.show_all_whitespace;
+    pub fn show_all_whitespace(&self) -> bool {
+        self.whitespace_prefs.show_all
+    }
+
+    pub fn toggle_show_all_whitespace(&mut self, cx: &mut Context<Self>) -> Option<String> {
+        let next = !self.whitespace_prefs.show_all;
+        let warning = self
+            .whitespace_prefs
+            .set(next)
+            .err()
+            .map(|error| format!("Could not save whitespace preference: {error}"));
         cx.notify();
+        warning
+    }
+
+    /// Queries the active document's bounded async whitespace cache for a cell's full raw bytes.
+    pub fn inspect_cell_whitespace(
+        &mut self,
+        window: WindowId,
+        source_row: u64,
+        source_col: usize,
+        raw_len: usize,
+    ) -> Option<whitespace::Summary> {
+        self.active_document_mut(window)?
+            .inspect_cell_whitespace(source_row, source_col, raw_len)
+    }
+
+    /// Queries the active document's bounded async whitespace cache for a header's full raw bytes.
+    pub fn inspect_header_whitespace(
+        &mut self,
+        window: WindowId,
+        source_col: usize,
+        raw_len: usize,
+    ) -> Option<whitespace::Summary> {
+        self.active_document_mut(window)?
+            .inspect_header_whitespace(source_col, raw_len)
+    }
+
+    /// Returns a human-readable explanation of the full value's whitespace for tooltips and a11y.
+    pub fn whitespace_explanation(
+        &self,
+        window: WindowId,
+        summary: Option<whitespace::Summary>,
+    ) -> String {
+        let show_all = self.whitespace_prefs.show_all;
+        self.active_document(window)
+            .map(|doc| doc.whitespace.explanation(summary, show_all))
+            .unwrap_or_default()
     }
 
     pub fn set_window_message(
@@ -905,7 +958,7 @@ impl WorkbenchController {
             write_slot_available: self.write_slot_available(),
             external_modal_blocked,
             text_field_focused,
-            show_all_whitespace: self.show_all_whitespace,
+            show_all_whitespace: self.whitespace_prefs.show_all,
         };
         evaluate_command(command, &ctx)
     }
@@ -1050,6 +1103,8 @@ impl WorkbenchController {
             can_resume_indexing: doc.can_resume_indexing(),
             dirty: doc.is_dirty(),
             saving: doc.save_job.is_some(),
+            save_cancel_requested: doc.save_cancel_requested,
+            save_status: doc.save_status.clone(),
             busy: tab.document_writing(),
             can_undo: doc.can_undo(),
             can_redo: doc.can_redo(),
@@ -1205,6 +1260,7 @@ impl WorkbenchController {
                     SchedulerError::OpenFailed(message) => {
                         AppMessage::file_open_error(path, options, encoding, message)
                     }
+                    SchedulerError::OpenFailedUninspectable(message) => AppMessage::error(message),
                     other => AppMessage::warning(other.to_string()),
                 })?;
             let (doc_id, owner_window) = match outcome {
@@ -1253,6 +1309,7 @@ impl WorkbenchController {
                         AppMessage::error(message)
                     }
                 }
+                SchedulerError::OpenFailedUninspectable(message) => AppMessage::error(message),
                 other => AppMessage::warning(other.to_string()),
             })?;
         let local_active = self
@@ -1465,14 +1522,58 @@ impl WorkbenchController {
         }
     }
 
-    pub fn set_active_selection(
-        &mut self,
-        window: WindowId,
-        selection: Option<quarry_workbench::GridSelection>,
-    ) {
+    pub fn set_active_selection(&mut self, window: WindowId, selection: Option<GridSelection>) {
         if let Some(doc) = self.active_document_mut(window) {
             doc.selection = selection;
         }
+    }
+
+    /// Selects a data cell and clears competing row/column selections so Copy and dialogs target it unambiguously.
+    pub fn select_cell_active(
+        &mut self,
+        window: WindowId,
+        target: Option<(u64, usize)>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(doc) = self.active_document_mut(window) {
+            doc.selection = target.map(|(row, column)| GridSelection::Cell { row, column });
+            if target.is_some() {
+                doc.selected_rows.clear();
+                doc.selected_columns.clear();
+                doc.column_selection_anchor = None;
+            }
+            cx.notify();
+        }
+    }
+
+    pub fn active_selection(&self, window: WindowId) -> Option<GridSelection> {
+        self.active_document(window)?.selection
+    }
+
+    /// Applies an immediate single-predicate filter for a cell's raw value (`Filter to/out This Value`).
+    pub fn filter_by_cell_value_active(
+        &mut self,
+        window: WindowId,
+        source_col: usize,
+        value: Vec<u8>,
+        equals: bool,
+        case_sensitivity: CaseSensitivity,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let query = FilterQuery {
+            predicates: vec![FilterPredicate {
+                column: source_col,
+                operator: if equals {
+                    FilterOperator::Equals
+                } else {
+                    FilterOperator::NotEquals
+                },
+                upper_bound: None,
+                value,
+            }],
+            case_sensitivity,
+        };
+        self.start_filter_active(window, query, cx)
     }
 
     pub fn undo_redo_active(
@@ -1584,6 +1685,56 @@ impl WorkbenchController {
             return Err("Open a file first.".into());
         };
         doc.copy_selection_text()
+    }
+
+    pub fn copy_cell_active(
+        &mut self,
+        window: WindowId,
+        source_row: u64,
+        source_col: usize,
+    ) -> Result<String, String> {
+        let Some(doc) = self.active_document_mut(window) else {
+            return Err("Open a file first.".into());
+        };
+        let previous = doc.selection;
+        doc.selection = Some(GridSelection::Cell {
+            row: source_row,
+            column: source_col,
+        });
+        let result = doc.copy_selection_text();
+        if result.is_err() {
+            doc.selection = previous;
+        }
+        result
+    }
+
+    pub fn copy_row_active(&mut self, window: WindowId, source_row: u64) -> Result<String, String> {
+        let Some(doc) = self.active_document_mut(window) else {
+            return Err("Open a file first.".into());
+        };
+        let previous = doc.selection;
+        doc.selection = Some(GridSelection::Row { row: source_row });
+        let result = doc.copy_selection_text();
+        if result.is_err() {
+            doc.selection = previous;
+        }
+        result
+    }
+
+    pub fn cancel_save_active(&mut self, window: WindowId, cx: &mut Context<Self>) {
+        if let Some(id) = self.scheduler.active_document(window)
+            && self.scheduler.cancel_save(id)
+        {
+            cx.notify();
+        }
+    }
+
+    pub fn cancel_indexing_active(&mut self, window: WindowId, cx: &mut Context<Self>) {
+        if let Some(id) = self.scheduler.active_document(window)
+            && self.scheduler.cancel_indexing(id)
+        {
+            cx.notify();
+        }
     }
 
     pub fn start_save_active(
@@ -2545,15 +2696,15 @@ impl WorkbenchController {
         cx: &mut Context<Self>,
     ) {
         if let Some(doc) = self.active_document_mut(window) {
-            if doc.filter_active() {
-                return;
-            }
             if !shift
                 && !toggle
                 && doc.selected_rows.contains(source_row)
                 && doc.selected_rows.count() == 1
             {
                 doc.selected_rows.clear();
+                if matches!(doc.selection, Some(GridSelection::Row { .. })) {
+                    doc.selection = None;
+                }
             } else {
                 doc.selected_rows.select(
                     source_row,
@@ -2562,7 +2713,36 @@ impl WorkbenchController {
                         command: toggle,
                     },
                 );
+                let active_row = doc
+                    .selected_rows
+                    .contains(source_row)
+                    .then_some(source_row)
+                    .or_else(|| doc.selected_rows.first());
+                doc.selection = active_row.map(|row| GridSelection::Row { row });
+                if !doc.selected_rows.is_empty() {
+                    doc.selected_columns.clear();
+                    doc.column_selection_anchor = None;
+                }
             }
+            cx.notify();
+        }
+    }
+
+    /// Ensures `source_row` is selected before opening the row gutter context menu.
+    pub fn ensure_row_selected_for_context_menu(
+        &mut self,
+        window: WindowId,
+        source_row: u64,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(doc) = self.active_document_mut(window) {
+            if !doc.selected_rows.contains(source_row) {
+                doc.selected_rows
+                    .select(source_row, SelectionModifiers::NONE);
+            }
+            doc.selection = Some(GridSelection::Row { row: source_row });
+            doc.selected_columns.clear();
+            doc.column_selection_anchor = None;
             cx.notify();
         }
     }
@@ -2590,6 +2770,31 @@ impl WorkbenchController {
                     command: toggle,
                 },
             );
+            doc.selection = None;
+            doc.selected_rows.clear();
+            cx.notify();
+        }
+    }
+
+    /// Ensures `source_col` is selected before opening the column header context menu.
+    pub fn ensure_column_selected_for_context_menu(
+        &mut self,
+        window: WindowId,
+        source_col: usize,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(doc) = self.active_document_mut(window) {
+            let total = doc.known_width();
+            if source_col >= total {
+                return;
+            }
+            if !doc.selected_columns.contains(&source_col) {
+                doc.selected_columns.clear();
+                doc.selected_columns.insert(source_col);
+                doc.column_selection_anchor = Some(source_col);
+            }
+            doc.selection = None;
+            doc.selected_rows.clear();
             cx.notify();
         }
     }
@@ -3973,6 +4178,21 @@ impl WorkbenchController {
                 }
             }
             changed = true;
+        }
+        let active_doc_ids: Vec<DocumentId> = self
+            .windows
+            .keys()
+            .filter_map(|&win| self.scheduler.active_document(win))
+            .collect();
+        for doc_id in active_doc_ids {
+            if let Some(doc) = self
+                .scheduler
+                .tab_mut(doc_id)
+                .and_then(|t| t.document.as_mut())
+                && doc.whitespace.poll()
+            {
+                changed = true;
+            }
         }
         let blocked_auto_reopen: BTreeSet<DocumentId> = self
             .editing_windows
