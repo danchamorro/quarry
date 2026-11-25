@@ -2733,6 +2733,23 @@ impl WorkbenchController {
         }
     }
 
+    /// Selects `source_row` via keyboard navigation within the `#` row gutter.
+    pub fn select_row_keyboard_active(
+        &mut self,
+        window: WindowId,
+        source_row: u64,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(doc) = self.active_document_mut(window) {
+            doc.selected_rows
+                .select(source_row, SelectionModifiers::NONE);
+            doc.selection = Some(GridSelection::Row { row: source_row });
+            doc.selected_columns.clear();
+            doc.column_selection_anchor = None;
+            cx.notify();
+        }
+    }
+
     /// Ensures `source_row` is selected before opening the row gutter context menu.
     pub fn ensure_row_selected_for_context_menu(
         &mut self,

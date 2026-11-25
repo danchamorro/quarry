@@ -1,6 +1,7 @@
 //! Virtualized `DataTable` delegate backed directly by `WorkbenchController` and
 //! `quarry_workbench::Document` (zero duplicate document or worker thread).
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::ops::Range;
 use std::rc::Rc;
@@ -58,6 +59,7 @@ pub struct Grid {
     controller: Entity<WorkbenchController>,
     window_id: WindowId,
     on_action: GridActionCallback,
+    gutter_mouse_row: Rc<Cell<Option<usize>>>,
     widths: HashMap<usize, Pixels>,
     visible_rows: Range<usize>,
     visible_columns: Range<usize>,
@@ -73,10 +75,22 @@ impl Grid {
             controller,
             window_id,
             on_action,
+            gutter_mouse_row: Rc::new(Cell::new(None)),
             widths: HashMap::new(),
             visible_rows: 0..40,
             visible_columns: 0..16,
         }
+    }
+
+    /// Consumes a recent mouse-click gutter selection on `row` so the bubbled `TableEvent::SelectCell`
+    /// does not overwrite modifier/toggle mouse row selection.
+    pub fn take_gutter_mouse_selection(&self, row: usize) -> bool {
+        self.gutter_mouse_row.take() == Some(row)
+    }
+
+    /// Clears any recorded mouse-click gutter row marker when selection leaves column 0.
+    pub fn clear_gutter_mouse_selection(&self) {
+        self.gutter_mouse_row.set(None);
     }
 
     pub fn columns(&self, cx: &App) -> Vec<usize> {
@@ -545,9 +559,11 @@ impl TableDelegate for Grid {
                 let controller = self.controller.clone();
                 let win_id = self.window_id;
                 let on_action_right = self.on_action.clone();
+                let gutter_mouse_row = self.gutter_mouse_row.clone();
                 cell = cell
                     .cursor_pointer()
                     .on_mouse_down(MouseButton::Left, move |event, _, cx| {
+                        gutter_mouse_row.set(Some(row));
                         let shift = event.modifiers.shift;
                         let toggle = event.modifiers.platform || event.modifiers.control;
                         controller.update(cx, |controller, cx| {

@@ -167,8 +167,22 @@ impl QuarryWindow {
                 |this, table, event, window, cx| match event {
                     TableEvent::SelectCell(row, column) => {
                         if *column == 0 {
+                            if table.read(cx).delegate().take_gutter_mouse_selection(*row) {
+                                return;
+                            }
+                            if let Some(src_row) = table.read(cx).delegate().source_row_at(*row, cx)
+                            {
+                                this.controller.update(cx, |controller, cx| {
+                                    controller.select_row_keyboard_active(
+                                        this.window_id,
+                                        src_row,
+                                        cx,
+                                    );
+                                });
+                            }
                             return;
                         }
+                        table.read(cx).delegate().clear_gutter_mouse_selection();
                         let target = table.read(cx).delegate().cell_at(*row, *column, cx);
                         this.controller.update(cx, |controller, cx| {
                             controller.select_cell_active(this.window_id, target, cx);

@@ -4084,6 +4084,28 @@ fn row_copy_works_after_cell_selection_and_under_active_filter(cx: &mut TestAppC
             .unwrap_or_default()
     });
     assert_eq!(copied_filtered, "3\tgamma\ta");
+
+    // Keyboard navigation within column 0 (row gutter) must synchronize document row selection
+    // so Cmd/Ctrl+C copies the newly navigated row rather than the old clicked row.
+    cx.update_window(handle.into(), |_, _, cx| {
+        view.update(cx, |q, cx| {
+            q.table.update(cx, |t, cx| t.set_selected_cell(0, 0, cx));
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle.into(), |_, window, cx| {
+        view.update(cx, |q, cx| {
+            q.copy_action(&crate::CopySelection, window, cx);
+        });
+    })
+    .unwrap();
+    let copied_navigated = cx.update(|cx| {
+        cx.read_from_clipboard()
+            .and_then(|item| item.text())
+            .unwrap_or_default()
+    });
+    assert_eq!(copied_navigated, "1\talpha\ta");
 }
 
 #[gpui_kit::test]
