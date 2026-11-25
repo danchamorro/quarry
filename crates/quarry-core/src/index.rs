@@ -847,9 +847,7 @@ impl IndexJob {
         cache_config: IndexCacheConfig,
         pool: &'static EnginePool,
     ) -> Result<Self, QuarryError> {
-        let section_range = session
-            .section_bounds()
-            .map(|bounds| (bounds.snapped.base, bounds.snapped_end()));
+        let section_range = session.is_section().then(|| session.active_byte_range());
         let (mut index, target_bytes) = match section_range {
             Some((base, end)) => (
                 StructuralIndex::new_for_section(config, base, end)?,

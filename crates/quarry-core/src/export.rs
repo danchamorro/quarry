@@ -38,11 +38,11 @@ use crate::{
 static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy)]
-struct ExportConfig {
-    source_encoding: crate::Encoding,
-    output_encoding: crate::Encoding,
-    chunk_bytes: usize,
-    max_record_bytes: usize,
+pub(crate) struct ExportConfig {
+    pub(crate) source_encoding: crate::Encoding,
+    pub(crate) output_encoding: crate::Encoding,
+    pub(crate) chunk_bytes: usize,
+    pub(crate) max_record_bytes: usize,
 }
 
 const DEFAULT_EXPORT_CONFIG: ExportConfig = ExportConfig {
@@ -51,7 +51,7 @@ const DEFAULT_EXPORT_CONFIG: ExportConfig = ExportConfig {
     chunk_bytes: DEFAULT_READ_CHUNK,
     max_record_bytes: DEFAULT_MAX_RECORD_BYTES,
 };
-const UTF8_BOM: &[u8] = b"\xEF\xBB\xBF";
+pub(crate) const UTF8_BOM: &[u8] = b"\xEF\xBB\xBF";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FilterExportSummary {
@@ -82,6 +82,8 @@ pub struct FilterExportProgress {
 pub struct SaveAsSummary {
     pub destination: PathBuf,
     pub bytes_written: u64,
+    /// Present when this save completed an in-place guarded section splice-save (ADR 0015).
+    pub splice: Option<crate::SpliceSaveSummary>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -697,25 +699,25 @@ fn split_field(field: &[u8], separator: &[u8], output_count: usize) -> Vec<Vec<u
     parts
 }
 
-struct SharedState {
-    preparing: AtomicBool,
-    preparation_bytes_scanned: AtomicU64,
-    estimated_output_bytes: AtomicU64,
-    bytes_scanned: AtomicU64,
-    rows_scanned: AtomicU64,
-    rows_written: AtomicU64,
-    bytes_written: AtomicU64,
-    finished_nanos: AtomicU64,
-    done: AtomicBool,
-    cancel_requested: AtomicBool,
-    cancelled: AtomicBool,
-    error: Mutex<Option<String>>,
-    started: Instant,
-    total_bytes: u64,
+pub(crate) struct SharedState {
+    pub(crate) preparing: AtomicBool,
+    pub(crate) preparation_bytes_scanned: AtomicU64,
+    pub(crate) estimated_output_bytes: AtomicU64,
+    pub(crate) bytes_scanned: AtomicU64,
+    pub(crate) rows_scanned: AtomicU64,
+    pub(crate) rows_written: AtomicU64,
+    pub(crate) bytes_written: AtomicU64,
+    pub(crate) finished_nanos: AtomicU64,
+    pub(crate) done: AtomicBool,
+    pub(crate) cancel_requested: AtomicBool,
+    pub(crate) cancelled: AtomicBool,
+    pub(crate) error: Mutex<Option<String>>,
+    pub(crate) started: Instant,
+    pub(crate) total_bytes: u64,
 }
 
 impl SharedState {
-    fn new(total_bytes: u64) -> Self {
+    pub(crate) fn new(total_bytes: u64) -> Self {
         Self {
             preparing: AtomicBool::new(false),
             preparation_bytes_scanned: AtomicU64::new(0),
@@ -735,7 +737,7 @@ impl SharedState {
     }
 }
 
-struct WorkerCompletion<'a>(&'a SharedState);
+pub(crate) struct WorkerCompletion<'a>(pub(crate) &'a SharedState);
 
 impl Drop for WorkerCompletion<'_> {
     fn drop(&mut self) {
@@ -858,6 +860,7 @@ impl FilterExportJob {
         source_path: PathBuf,
         section_base: u64,
         section_end: u64,
+        section_is_interior: bool,
         source_had_bom: bool,
         delimiter: u8,
         has_header: bool,
@@ -873,7 +876,7 @@ impl FilterExportJob {
                 "filter export chunk must be non-zero",
             ));
         }
-        let data_start = u64::from(has_header && section_base == 0);
+        let data_start = u64::from(has_header && !section_is_interior);
         validate_query(&query)?;
         validate_filter_edits(&edits.cells, data_start, config.max_record_bytes)?;
         if !has_header && !edits.headers.is_empty() {
@@ -900,6 +903,7 @@ impl FilterExportJob {
                     output,
                     section_base,
                     section_end,
+                    section_is_interior,
                     source_had_bom,
                     delimiter,
                     has_header,
@@ -1122,7 +1126,7 @@ impl Drop for SplitAnalysisJob {
     }
 }
 
-enum SaveWorkerOutcome {
+pub(crate) enum SaveWorkerOutcome {
     Complete {
         summary: SaveAsSummary,
         replacements: u64,
@@ -1635,6 +1639,19 @@ impl SaveAsJob {
         })
     }
 
+    pub(crate) fn from_worker(
+        publication: Option<Arc<PrivatePublication>>,
+        shared: Arc<SharedState>,
+        handle: JoinHandle<Result<SaveWorkerOutcome, QuarryError>>,
+    ) -> Self {
+        Self {
+            publication,
+            shared,
+            handle: Some(handle),
+            _compressed: None,
+        }
+    }
+
     /// Keeps a compressed document's private copy until the worker is joined, even
     /// when the session that owned it closes first.
     fn retaining(mut self, compressed: Option<Arc<crate::compressed::CompressedBacking>>) -> Self {
@@ -1648,6 +1665,7 @@ impl SaveAsJob {
         source_stamp: SourceStamp,
         section_base: u64,
         section_end: u64,
+        section_is_interior: bool,
         source_had_bom: bool,
         delimiter: u8,
         has_header: bool,
@@ -1665,7 +1683,7 @@ impl SaveAsJob {
                 "header renames require a header row",
             ));
         }
-        let data_start = u64::from(has_header && section_base == 0);
+        let data_start = u64::from(has_header && !section_is_interior);
         if cell_edits
             .first_key_value()
             .is_some_and(|((row, _), _)| *row < data_start)
@@ -1707,6 +1725,7 @@ impl SaveAsJob {
                     output,
                     section_base,
                     section_end,
+                    section_is_interior,
                     source_had_bom,
                     delimiter,
                     has_header,
@@ -1807,6 +1826,10 @@ impl Drop for SaveAsJob {
 }
 
 impl ReplaceAllJob {
+    pub(crate) fn from_inner(inner: SaveAsJob) -> Self {
+        Self { inner }
+    }
+
     /// Retain the owning private directory until publication or cancellation.
     /// Call before wait; publication verifies the captured destination identity.
     pub fn retain_working_storage(
@@ -1919,11 +1942,13 @@ impl Session {
                     "Saving a section with reordered or hidden columns is not supported yet. Reset the column layout in the Columns panel and retry Save Section As New.",
                 ));
             }
+            let (read_base, read_end) = self.active_byte_range();
             return SaveAsJob::start_section_as(
                 self.path.clone(),
                 self.source_stamp.clone(),
-                meta.bounds.snapped.base,
-                meta.bounds.snapped_end(),
+                read_base,
+                read_end,
+                self.section_is_interior(),
                 meta.bom_len > 0,
                 self.dialect.delimiter,
                 self.dialect.has_header,
@@ -1995,10 +2020,12 @@ impl Session {
         self.check_uncompressed_destination(destination.as_ref())?;
         self.ensure_source_unchanged()?;
         if let Some(meta) = &self.section {
+            let (read_base, read_end) = self.active_byte_range();
             return FilterExportJob::start_section_filtered_export(
                 self.path.clone(),
-                meta.bounds.snapped.base,
-                meta.bounds.snapped_end(),
+                read_base,
+                read_end,
+                self.section_is_interior(),
                 meta.bom_len > 0,
                 self.dialect.delimiter,
                 self.dialect.has_header,
@@ -2098,11 +2125,13 @@ impl Session {
                     "Saving a section with reordered or hidden columns is not supported yet. Reset the column layout in the Columns panel and retry Save Section As New.",
                 ));
             }
+            let (read_base, read_end) = self.active_byte_range();
             return SaveAsJob::start_section_as(
                 self.path.clone(),
                 self.source_stamp.clone(),
-                meta.bounds.snapped.base,
-                meta.bounds.snapped_end(),
+                read_base,
+                read_end,
+                self.section_is_interior(),
                 meta.bom_len > 0,
                 self.dialect.delimiter,
                 self.dialect.has_header,
@@ -2139,6 +2168,11 @@ impl Session {
         transformation: ColumnTransformation,
         destination: impl AsRef<Path>,
     ) -> Result<SaveAsJob, QuarryError> {
+        if self.is_section() {
+            return Err(QuarryError::InvalidOption(
+                "Column schema changes are disabled on bounded section documents. Use Save Section As New to edit columns on a standalone copy.",
+            ));
+        }
         SaveAsJob::start_with_edits(
             self.path.clone(),
             self.file_size,
@@ -2165,6 +2199,23 @@ impl Session {
         insertion: RowInsertion,
         destination: impl AsRef<Path>,
     ) -> Result<SaveAsJob, QuarryError> {
+        if let Some(meta) = &self.section {
+            let (read_base, read_end) = self.active_byte_range();
+            return crate::splice::start_section_working_copy_op(
+                self.path.clone(),
+                self.source_stamp.clone(),
+                meta.bounds,
+                read_base,
+                read_end,
+                self.dialect.delimiter,
+                self.dialect.has_header,
+                header_renames,
+                cell_edits,
+                crate::splice::SectionWorkingOp::InsertRows(insertion),
+                destination.as_ref().to_path_buf(),
+                self.export_config(),
+            );
+        }
         SaveAsJob::start_worker_with_row_insertion(
             self.path.clone(),
             self.file_size,
@@ -2198,6 +2249,23 @@ impl Session {
                 "select at least one row to delete",
             ));
         }
+        if let Some(meta) = &self.section {
+            let (read_base, read_end) = self.active_byte_range();
+            return crate::splice::start_section_working_copy_op(
+                self.path.clone(),
+                self.source_stamp.clone(),
+                meta.bounds,
+                read_base,
+                read_end,
+                self.dialect.delimiter,
+                self.dialect.has_header,
+                header_renames,
+                cell_edits,
+                crate::splice::SectionWorkingOp::DeleteRows(deleted_rows),
+                destination.as_ref().to_path_buf(),
+                self.export_config(),
+            );
+        }
         SaveAsJob::start_worker_with_deleted_rows(
             self.path.clone(),
             self.file_size,
@@ -2226,6 +2294,11 @@ impl Session {
         cleanup: ColumnCleanup,
         destination: impl AsRef<Path>,
     ) -> Result<CleanupJob, QuarryError> {
+        if self.is_section() {
+            return Err(QuarryError::InvalidOption(
+                "Column cleanup is disabled on bounded section documents. Use Save Section As New to clean columns on a standalone copy.",
+            ));
+        }
         cleanup.validate()?;
         let inner = SaveAsJob::start_with_edits(
             self.path.clone(),
@@ -2272,6 +2345,23 @@ impl Session {
         destination: impl AsRef<Path>,
         options: ReplaceAllOptions<'_>,
     ) -> Result<ReplaceAllJob, QuarryError> {
+        if let Some(meta) = &self.section {
+            let (read_base, read_end) = self.active_byte_range();
+            return crate::splice::start_section_replace_all(
+                self.path.clone(),
+                self.source_stamp.clone(),
+                meta.bounds,
+                read_base,
+                read_end,
+                self.dialect.delimiter,
+                self.dialect.has_header,
+                header_renames,
+                cell_edits,
+                replacement,
+                destination.as_ref().to_path_buf(),
+                self.export_config(),
+            );
+        }
         let requested_workers = crate::pool::resolve_worker_count(options.threads)?;
         let completed_records = self.completed_record_count();
         let validated_index = options
@@ -2318,9 +2408,27 @@ impl Session {
         if self.is_compressed() || original.is_compressed() {
             return Err(QuarryError::CompressedReadOnly);
         }
-        if self.is_section() || original.is_section() {
+        if let Some(parent_meta) = &original.section {
+            let (read_base, read_end) = self.active_byte_range();
+            return crate::splice::start_section_splice(
+                original.path.clone(),
+                original.source_stamp.clone(),
+                original.file_size,
+                parent_meta.bounds,
+                self.path.clone(),
+                self.source_stamp.clone(),
+                read_base,
+                read_end,
+                self.dialect.delimiter,
+                self.dialect.has_header,
+                header_renames,
+                cell_edits,
+                self.export_config(),
+            );
+        }
+        if self.is_section() {
             return Err(QuarryError::InvalidOption(
-                "In-place save is not enabled for section documents yet; use Save Section As to export a new file.",
+                "Original session does not carry section provenance for splice-save.",
             ));
         }
         SaveAsJob::start_with_edits(
@@ -2385,10 +2493,33 @@ impl Session {
         if self.is_compressed() {
             return Err(QuarryError::CompressedReadOnly);
         }
-        if self.is_section() {
-            return Err(QuarryError::InvalidOption(
-                "In-place save is not enabled for section documents yet; use Save Section As to export a new file.",
-            ));
+        if let Some(meta) = &self.section {
+            if transformation.is_some() {
+                return Err(QuarryError::InvalidOption(
+                    "Column schema changes cannot be splice-saved into the parent file. Use Save Section As New instead.",
+                ));
+            }
+            if meta.backed_by_working_copy {
+                return Err(QuarryError::InvalidOption(
+                    "Section working copies must be splice-saved via start_save_to_original with the parent section session.",
+                ));
+            }
+            let (read_base, read_end) = self.active_byte_range();
+            return crate::splice::start_section_splice(
+                self.path.clone(),
+                self.source_stamp.clone(),
+                self.file_size,
+                meta.bounds,
+                self.path.clone(),
+                self.source_stamp.clone(),
+                read_base,
+                read_end,
+                self.dialect.delimiter,
+                self.dialect.has_header,
+                header_renames,
+                cell_edits,
+                self.export_config(),
+            );
         }
         SaveAsJob::start_with_edits(
             self.path.clone(),
@@ -2862,6 +2993,10 @@ impl ExportTarget {
     pub(crate) fn flush_for_inspection(&mut self) -> Result<PathBuf, QuarryError> {
         self.writer.as_mut().expect("writer is present").flush()?;
         Ok(self.temporary.clone())
+    }
+
+    pub(crate) fn destination(&self) -> &Path {
+        &self.destination
     }
 
     pub(crate) fn bytes_written(&self) -> u64 {
@@ -3623,6 +3758,7 @@ fn run_section_filtered_export(
     mut output: ExportTarget,
     section_base: u64,
     section_end: u64,
+    section_is_interior: bool,
     source_had_bom: bool,
     delimiter: u8,
     has_header: bool,
@@ -3670,11 +3806,11 @@ fn run_section_filtered_export(
     let scan_outcome = (|| -> Result<ScanOutcome, QuarryError> {
         let matchers = compile_matchers(query)?;
         let groups = predicate_groups(query);
-        let data_start = u64::from(has_header && section_base == 0);
+        let data_start = u64::from(has_header && !section_is_interior);
         let mut rows_written = 0u64;
         let mut bytes_written = 0u64;
 
-        if section_base > 0 && has_header {
+        if section_is_interior && has_header {
             let header = header_row.ok_or(QuarryError::InvalidOption(
                 "source does not contain a header row",
             ))?;
@@ -3701,7 +3837,7 @@ fn run_section_filtered_export(
             )?;
             bytes_written = output.bytes_written();
             shared.bytes_written.store(bytes_written, Ordering::Release);
-        } else if section_base > 0 && source_had_bom {
+        } else if section_is_interior && source_had_bom {
             // Preserve the source BOM for headerless interior sections (critical for UTF-16LE/BE
             // auto-detection when reopening the exported file).
             output.write_all(UTF8_BOM)?;
@@ -3765,7 +3901,7 @@ fn run_section_filtered_export(
                             if let Err(err) = process_record(
                                 rec,
                                 local_row,
-                                section_base == 0 && local_row == 0,
+                                !section_is_interior && local_row == 0,
                                 data_start,
                                 delimiter,
                                 query,
@@ -3773,7 +3909,7 @@ fn run_section_filtered_export(
                                 &matchers,
                                 &groups,
                                 config.max_record_bytes,
-                                source_had_bom && section_base == 0,
+                                source_had_bom && !section_is_interior,
                                 &mut output,
                                 &mut rows_written,
                                 &mut bytes_written,
@@ -3821,7 +3957,7 @@ fn run_section_filtered_export(
                 process_record(
                     &record,
                     local_row,
-                    section_base == 0 && local_row == 0,
+                    !section_is_interior && local_row == 0,
                     data_start,
                     delimiter,
                     query,
@@ -3829,7 +3965,7 @@ fn run_section_filtered_export(
                     &matchers,
                     &groups,
                     config.max_record_bytes,
-                    source_had_bom && section_base == 0,
+                    source_had_bom && !section_is_interior,
                     &mut output,
                     &mut rows_written,
                     &mut bytes_written,
@@ -4106,6 +4242,7 @@ fn run_save_as(
                     summary: SaveAsSummary {
                         destination: published.destination,
                         bytes_written: published.bytes_written,
+                        splice: None,
                     },
                     replacements: published.rows_written,
                     output_index: summary.output_index.zip(output_stamp).and_then(
@@ -5706,7 +5843,7 @@ fn write_transformed_record(
     )
 }
 
-fn write_serialized_fields(
+pub(crate) fn write_serialized_fields(
     output: &mut ExportTarget,
     prefix: &[u8],
     fields: &[Vec<u8>],
@@ -5762,6 +5899,7 @@ fn run_save_section_as(
     mut output: ExportTarget,
     section_base: u64,
     section_end: u64,
+    section_is_interior: bool,
     source_had_bom: bool,
     delimiter: u8,
     has_header: bool,
@@ -5806,7 +5944,7 @@ fn run_save_section_as(
     let same_encoding = config.source_encoding == config.output_encoding;
     let mut rows_written = 0u64;
 
-    if section_base > 0 && has_header {
+    if section_is_interior && has_header {
         let header = header_row.ok_or(QuarryError::InvalidOption(
             "source does not contain a header row",
         ))?;
@@ -5835,7 +5973,7 @@ fn run_save_section_as(
         shared
             .bytes_written
             .store(output.bytes_written(), Ordering::Release);
-    } else if section_base > 0 && source_had_bom {
+    } else if section_is_interior && source_had_bom {
         // Preserve the source BOM for headerless interior sections so UTF-16LE/BE outputs
         // reopen with the right encoding under Auto detection.
         output.write_all(UTF8_BOM)?;
@@ -5861,7 +5999,7 @@ fn run_save_section_as(
                        rows_written: &mut u64,
                        next_edit: &mut Option<u64>|
      -> Result<(), QuarryError> {
-        let is_header_in_section = section_base == 0 && has_header && row_idx == 0;
+        let is_header_in_section = !section_is_interior && has_header && row_idx == 0;
         let has_header_rename = is_header_in_section && !header_renames.is_empty();
         let has_cell_edit = *next_edit == Some(row_idx);
         if has_cell_edit {
@@ -5878,7 +6016,7 @@ fn run_save_section_as(
                 .decode(raw, config.max_record_bytes)
                 .map_err(|error| crate::record_encoding_error(row_idx.saturating_add(1), error))?;
             let text = decoded.as_ref();
-            let (prefix, body) = if section_base == 0 && row_idx == 0 {
+            let (prefix, body) = if !section_is_interior && row_idx == 0 {
                 text.strip_prefix(UTF8_BOM)
                     .map_or((&[][..], text), |rest| (UTF8_BOM, rest))
             } else {
@@ -5934,7 +6072,7 @@ fn run_save_section_as(
         } else {
             let guard_first = *rows_written == 0
                 && output.bytes_written() == 0
-                && !(section_base == 0 && row_idx == 0 && source_had_bom);
+                && !(!section_is_interior && row_idx == 0 && source_had_bom);
             if guard_first {
                 output.begin_first_record_bom_guard(false);
             }
@@ -6070,6 +6208,7 @@ fn run_save_section_as(
             summary: SaveAsSummary {
                 destination: summary.destination,
                 bytes_written: summary.bytes_written,
+                splice: None,
             },
             replacements: 0,
             output_index: None,

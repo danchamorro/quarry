@@ -157,6 +157,12 @@ scheduler in `crates/quarry-workbench` (`dormancy.rs`) while keeping the global 
    drops every tab, removing all Quarry-owned private working files with zero orphans.
 10. **Write-job cap retained:** `MAX_WRITE_JOBS = 2` remains unchanged unless a later benchmark
     explicitly justifies raising it.
+11. **Parent/section dirty mutual exclusion and post-splice refresh (`2026-11-24`, [ADR 0015](0015-guarded-section-splice-save.md)):**
+    Across all windows and hard-link aliases (hydrated and dormant), at most one tab for a given
+    underlying file (parent or section) may hold unsaved edits at a time. Guarded section
+    splice-save reserves the parent path in `write_destination`, reloads the spliced section at its
+    updated `Verified` byte span, and marks clean sibling/parent tabs `source_changed = true` with
+    `SOURCE_CHANGED_NOTICE` rather than silently reloading.
 
 ### Verification
 

@@ -686,6 +686,63 @@ impl WorkbenchScheduler {
         }
     }
 
+    /// Returns the `(file_identity, canonical_path)` alias key for `id` across hydrated, dormant,
+    /// and stub states so parent/section tabs (including hard-link aliases) coordinate cleanly.
+    fn tab_file_alias_key(&self, id: DocumentId) -> Option<(Option<FileIdentity>, PathBuf)> {
+        let slot = self.tabs.get(&id)?;
+        match &slot.residency {
+            SlotResidency::Stub(stub) => Some((None, canonicalize_best_effort(&stub.logical_path))),
+            SlotResidency::Dormant(dormant) => {
+                Some((dormant.file_identity, dormant.canonical_path.clone()))
+            }
+            SlotResidency::Hydrated { .. } => {
+                let doc = slot.tab.document.as_ref()?;
+                let identity = doc
+                    .original_session
+                    .as_ref()
+                    .unwrap_or(&doc.session)
+                    .file_identity();
+                Some((identity, canonicalize_best_effort(&doc.logical_path)))
+            }
+        }
+    }
+
+    /// ADR 0015 dirty mutual exclusion: across all windows and hard-link aliases (including
+    /// hydrated and dormant dirty tabs), at most one tab (parent or section) per underlying file
+    /// may hold unsaved edits at a time. Returns an actionable warning if another tab aliasing the
+    /// same file already has unsaved edits or an active in-place save/structural write.
+    pub fn sibling_dirty_conflict(&self, id: DocumentId) -> Option<String> {
+        let (target_identity, target_canonical) = self.tab_file_alias_key(id)?;
+        for (&other_id, slot) in &self.tabs {
+            if other_id == id {
+                continue;
+            }
+            let other_dirty_or_mutating = slot_is_dirty(slot)
+                || slot.tab.document.as_ref().is_some_and(|doc| {
+                    (doc.save_job.is_some() && doc.saving_in_place) || doc.structural_job.is_some()
+                });
+            if !other_dirty_or_mutating {
+                continue;
+            }
+            let Some((other_identity, other_canonical)) = self.tab_file_alias_key(other_id) else {
+                continue;
+            };
+            let same_file = match (target_identity, other_identity) {
+                (Some(a), Some(b)) => a == b || target_canonical == other_canonical,
+                _ => target_canonical == other_canonical,
+            };
+            if same_file {
+                let other_label = self
+                    .tab_display_name(other_id)
+                    .unwrap_or_else(|| "another tab".into());
+                return Some(format!(
+                    "Another tab for this file ({other_label}) already has unsaved changes. Save or discard edits in that tab before editing this one."
+                ));
+            }
+        }
+        None
+    }
+
     /// True when `id` has unsaved edits (whether currently hydrated or dormant-dirty).
     pub fn tab_is_dirty(&self, id: DocumentId) -> bool {
         self.tabs.get(&id).is_some_and(slot_is_dirty)
@@ -2533,9 +2590,48 @@ impl WorkbenchScheduler {
             .try_reserve(FdCategory::BackgroundJob, 1)
             .map_err(|error| AppMessage::warning(error.to_string()))?;
 
-        let mut replacement =
+        let is_section = current.is_section();
+        let section_quote_free = current.section_quote_free_confirmed;
+        let mut replacement = if is_section {
+            let original = current.original_session.as_ref().ok_or_else(|| {
+                AppMessage::error("Missing original section provenance for undo/redo.")
+            })?;
+            if target.path == logical_path {
+                let orig_bounds = original.section_bounds().ok_or_else(|| {
+                    AppMessage::error("Original session is missing section bounds.")
+                })?;
+                let sec_opts = SectionOpenOptions {
+                    open: options,
+                    encoding: Some(encoding),
+                    parent_index: None,
+                    quote_free_confirmed: section_quote_free,
+                    ..SectionOpenOptions::default()
+                };
+                Document::prepare_section_preserved(
+                    &logical_path,
+                    orig_bounds,
+                    &original.source_guard(),
+                    original.dialect.delimiter,
+                    original.encoding(),
+                    sec_opts,
+                )
+                .map_err(|error| match error {
+                    QuarryError::SourceChanged => AppMessage::warning(SOURCE_CHANGED_NOTICE),
+                    other => AppMessage::core_error(other),
+                })?
+            } else {
+                Document::prepare_section_working_copy(
+                    &target.path,
+                    original,
+                    options,
+                    section_quote_free,
+                )
+                .map_err(AppMessage::error)?
+            }
+        } else {
             Document::prepare_with_encoding(&target.path, options, Some(encoding))
-                .map_err(AppMessage::error)?;
+                .map_err(AppMessage::error)?
+        };
         replacement.header_renames = Arc::new(target.overlay.header_renames.clone());
         replacement.cell_edits = Arc::new(target.overlay.cell_edits.clone());
         replacement.edit_history = target.edit_history;
@@ -2600,6 +2696,16 @@ impl WorkbenchScheduler {
         let options = doc.current_open_options();
         let encoding = Some(doc.session.encoding());
         let had_working_copy = doc.working_copy.is_some() || doc.original_session.is_some();
+        let is_section = doc.is_section();
+        let section_bounds = doc.section_bounds();
+        let section_quote_free = doc.section_quote_free_confirmed;
+        let orig_guard = doc
+            .original_session
+            .as_ref()
+            .unwrap_or(&doc.session)
+            .source_guard();
+        let orig_delimiter = doc.session.dialect.delimiter;
+        let orig_encoding = doc.session.encoding();
         if had_working_copy {
             let temp_open_fd = self
                 .fd_budget
@@ -2609,8 +2715,33 @@ impl WorkbenchScheduler {
                 .fd_budget
                 .try_reserve(FdCategory::BackgroundJob, 1)
                 .map_err(|error| AppMessage::warning(error.to_string()))?;
-            let mut replacement = Document::prepare_with_encoding(&logical_path, options, encoding)
-                .map_err(AppMessage::error)?;
+            let mut replacement = if is_section && let Some(bounds) = section_bounds {
+                let sec_opts = SectionOpenOptions {
+                    open: options,
+                    encoding,
+                    parent_index: None,
+                    quote_free_confirmed: section_quote_free,
+                    ..SectionOpenOptions::default()
+                };
+                match Document::prepare_section_preserved(
+                    &logical_path,
+                    bounds,
+                    &orig_guard,
+                    orig_delimiter,
+                    orig_encoding,
+                    sec_opts.clone(),
+                ) {
+                    Ok(doc) => doc,
+                    Err(QuarryError::SourceChanged) => {
+                        Document::prepare_section(&logical_path, bounds.requested, sec_opts)
+                            .map_err(AppMessage::error)?
+                    }
+                    Err(error) => return Err(AppMessage::core_error(error)),
+                }
+            } else {
+                Document::prepare_with_encoding(&logical_path, options, encoding)
+                    .map_err(AppMessage::error)?
+            };
             replacement.working_directory = self.config.working_directory.clone();
             replacement.custom_working_directory = self.config.custom_working_directory;
             replacement.index_cache_enabled = self.config.index_cache_enabled;
@@ -2637,6 +2768,12 @@ impl WorkbenchScheduler {
     pub fn poll_saves(&mut self) -> Vec<SaveCompletion> {
         let mut results = Vec::new();
         let mut any_finished = false;
+        let mut in_place_saved_aliases: Vec<(
+            DocumentId,
+            Option<FileIdentity>,
+            Option<FileIdentity>,
+            PathBuf,
+        )> = Vec::new();
         for (&id, slot) in &mut self.tabs {
             if !matches!(slot.residency, SlotResidency::Hydrated { .. }) {
                 continue;
@@ -2659,6 +2796,14 @@ impl WorkbenchScheduler {
                         });
                         continue;
                     }
+                    let old_identity = doc
+                        .original_session
+                        .as_ref()
+                        .unwrap_or(&doc.session)
+                        .file_identity();
+                    let canonical_dest = canonicalize_best_effort(&destination);
+                    let splice_summary = doc.last_splice_summary.take();
+                    let section_quote_free = doc.section_quote_free_confirmed;
                     let dialect = doc.session.dialect;
                     let options = OpenOptions {
                         delimiter: Some(dialect.delimiter),
@@ -2675,11 +2820,34 @@ impl WorkbenchScheduler {
                     let source_encoding = doc.session.encoding();
                     let prior_encoding_mode = slot.tab.encoding_mode;
 
-                    let reload = Document::prepare_with_encoding(
-                        &destination,
-                        options,
-                        Some(output_encoding),
-                    )
+                    let reload = if let Some(splice) = splice_summary {
+                        SourceGuard::capture_path(&destination)
+                            .map_err(|error| error.to_string())
+                            .and_then(|new_guard| {
+                                let sec_opts = SectionOpenOptions {
+                                    open: options,
+                                    encoding: Some(output_encoding),
+                                    parent_index: None,
+                                    quote_free_confirmed: section_quote_free,
+                                    ..SectionOpenOptions::default()
+                                };
+                                Document::prepare_section_preserved(
+                                    &destination,
+                                    splice.new_bounds,
+                                    &new_guard,
+                                    dialect.delimiter,
+                                    output_encoding,
+                                    sec_opts,
+                                )
+                                .map_err(|error| error.to_string())
+                            })
+                    } else {
+                        Document::prepare_with_encoding(
+                            &destination,
+                            options,
+                            Some(output_encoding),
+                        )
+                    }
                     .and_then(|mut replacement| {
                         replacement.working_directory = self.config.working_directory.clone();
                         replacement.custom_working_directory = self.config.custom_working_directory;
@@ -2692,6 +2860,7 @@ impl WorkbenchScheduler {
 
                     match reload {
                         Ok(replacement) => {
+                            let new_identity = replacement.session.file_identity();
                             doc.shutdown();
                             slot.tab.document = Some(replacement);
                             slot.tab.encoding_mode = if output_encoding == source_encoding {
@@ -2700,6 +2869,12 @@ impl WorkbenchScheduler {
                                 Some(output_encoding)
                             };
                             slot.tab.notice = None;
+                            in_place_saved_aliases.push((
+                                id,
+                                old_identity,
+                                new_identity,
+                                canonical_dest,
+                            ));
                             results.push(SaveCompletion {
                                 document_id: id,
                                 result: Ok((destination, true)),
@@ -2708,6 +2883,7 @@ impl WorkbenchScheduler {
                         Err(error) => {
                             doc.shutdown();
                             slot.tab.document = None;
+                            in_place_saved_aliases.push((id, old_identity, None, canonical_dest));
                             results.push(SaveCompletion {
                                 document_id: id,
                                 result: Err(AppMessage::error(format!(
@@ -2733,6 +2909,46 @@ impl WorkbenchScheduler {
                         document_id: id,
                         result: Err(error),
                     });
+                }
+            }
+        }
+        // ADR 0015 post-splice tab refresh: immediately mark all other open clean/dormant parent
+        // and sibling section tabs aliasing a file that was just saved in-place as `source_changed`
+        // rather than silently reloading them.
+        for (saved_id, old_identity, new_identity, saved_canonical) in in_place_saved_aliases {
+            let other_ids: Vec<DocumentId> = self
+                .tabs
+                .keys()
+                .copied()
+                .filter(|&other_id| other_id != saved_id)
+                .collect();
+            for other_id in other_ids {
+                let Some((other_identity, other_canonical)) = self.tab_file_alias_key(other_id)
+                else {
+                    continue;
+                };
+                let aliases = other_canonical == saved_canonical
+                    || other_identity
+                        .is_some_and(|oid| old_identity == Some(oid) || new_identity == Some(oid));
+                if !aliases {
+                    continue;
+                }
+                let Some(other_slot) = self.tabs.get_mut(&other_id) else {
+                    continue;
+                };
+                match &mut other_slot.residency {
+                    SlotResidency::Hydrated { .. } => {
+                        if let Some(other_doc) = other_slot.tab.document.as_mut() {
+                            other_doc.invalidate_changed_source();
+                            other_slot.tab.notice =
+                                Some(AppMessage::warning(SOURCE_CHANGED_NOTICE));
+                        }
+                    }
+                    SlotResidency::Dormant(dormant) => {
+                        dormant.source_changed = true;
+                        other_slot.tab.notice = Some(AppMessage::warning(SOURCE_CHANGED_NOTICE));
+                    }
+                    SlotResidency::Stub(_) => {}
                 }
             }
         }
@@ -2873,6 +3089,7 @@ impl WorkbenchScheduler {
         replacement.logical_path = current.logical_path.clone();
         replacement.original_session = current.original_session.take();
         replacement.working_copy = current.working_copy.take();
+        replacement.section_quote_free_confirmed = current.section_quote_free_confirmed;
         replacement.working_directory = self.config.working_directory.clone();
         replacement.custom_working_directory = self.config.custom_working_directory;
         replacement.working_cleanup = self.working_cleanup.clone();
@@ -3024,12 +3241,18 @@ impl WorkbenchScheduler {
         }
 
         for (id, mut ready) in ready_to_install {
-            let Some((options, encoding)) = self.tabs.get(&id).and_then(|slot| {
-                slot.tab
-                    .document
-                    .as_ref()
-                    .map(|doc| (doc.current_open_options(), doc.session.encoding()))
-            }) else {
+            let Some((options, encoding, is_section, section_quote_free)) =
+                self.tabs.get(&id).and_then(|slot| {
+                    slot.tab.document.as_ref().map(|doc| {
+                        (
+                            doc.current_open_options(),
+                            doc.session.encoding(),
+                            doc.is_section(),
+                            doc.section_quote_free_confirmed,
+                        )
+                    })
+                })
+            else {
                 continue;
             };
             let needs_index_worker = ready.output_index.is_none();
@@ -3061,7 +3284,35 @@ impl WorkbenchScheduler {
                 None
             };
             let output_index = ready.output_index.take();
-            match self.prepare_materialized_document(&ready.path, options, encoding, output_index) {
+            let prepared = if is_section {
+                let original_parent = self.tabs.get(&id).and_then(|slot| {
+                    slot.tab
+                        .document
+                        .as_ref()
+                        .and_then(|doc| doc.original_session.as_ref())
+                });
+                match original_parent {
+                    Some(original) => Document::prepare_section_working_copy(
+                        &ready.path,
+                        original,
+                        options,
+                        section_quote_free,
+                    )
+                    .and_then(|mut replacement| {
+                        replacement.working_directory = self.config.working_directory.clone();
+                        replacement.custom_working_directory = self.config.custom_working_directory;
+                        replacement.index_cache_enabled = self.config.index_cache_enabled;
+                        replacement.working_cleanup = self.working_cleanup.clone();
+                        replacement.decompression_slots = self.decompression_slots.clone();
+                        replacement.start_indexing()?;
+                        Ok(replacement)
+                    }),
+                    None => Err("Missing original section session for working copy.".into()),
+                }
+            } else {
+                self.prepare_materialized_document(&ready.path, options, encoding, output_index)
+            };
+            match prepared {
                 Ok(replacement) => {
                     let notice = ready.notice.clone();
                     self.install_prepared_working_copy(id, replacement, ready, index_job_fd);

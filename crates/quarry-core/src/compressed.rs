@@ -1623,6 +1623,7 @@ impl CompressedDecompressJob {
             crate::DEFAULT_MAX_RECORD_BYTES,
             self.encoding,
             snapshot.indexed_bytes(),
+            true,
         )
     }
 

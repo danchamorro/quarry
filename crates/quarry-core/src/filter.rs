@@ -39,6 +39,7 @@ struct FilterSource {
     data_start: u64,
     encoding: Encoding,
     section_range: (u64, u64),
+    strip_bom_at_zero: bool,
 }
 
 impl FilterSource {
@@ -331,10 +332,17 @@ struct SharedState {
     scan_end: u64,
     file_size: u64,
     bounded_scan: bool,
+    strip_bom_at_zero: bool,
 }
 
 impl SharedState {
-    fn new(index: FilterIndex, section_base: u64, scan_end: u64, bounded_scan: bool) -> Self {
+    fn new(
+        index: FilterIndex,
+        section_base: u64,
+        scan_end: u64,
+        bounded_scan: bool,
+        strip_bom_at_zero: bool,
+    ) -> Self {
         Self {
             index: RwLock::new(index),
             bytes_scanned: AtomicU64::new(0),
@@ -350,6 +358,7 @@ impl SharedState {
             scan_end,
             file_size: scan_end.saturating_sub(section_base),
             bounded_scan,
+            strip_bom_at_zero,
         }
     }
 }
@@ -454,6 +463,7 @@ impl FilterJob {
             tuning,
             bounded_scan,
             false,
+            true,
         )
     }
 
@@ -473,6 +483,7 @@ impl FilterJob {
         tuning: FilterParallelTuning,
         bounded_scan: bool,
         is_section: bool,
+        strip_bom_at_zero: bool,
     ) -> Result<Self, QuarryError> {
         if config.chunk_bytes == 0 {
             return Err(QuarryError::InvalidOption(
@@ -490,6 +501,7 @@ impl FilterJob {
             data_start,
             encoding,
             section_range: (section_base, section_end),
+            strip_bom_at_zero,
         };
         source.check_file(&file)?;
         let guard_file = file.try_clone()?;
@@ -503,6 +515,7 @@ impl FilterJob {
             section_base,
             scan_end,
             bounded_scan,
+            strip_bom_at_zero,
         ));
         let worker_state = Arc::clone(&shared);
         let handle = thread::Builder::new()
@@ -510,6 +523,7 @@ impl FilterJob {
             .spawn(move || {
                 let _completion = WorkerCompletion(&worker_state);
                 let result = if section_base == 0
+                    && strip_bom_at_zero
                     && let Some(byte_class) = encoding.simd_byte_class()
                     && tuning.requested_threads > 1
                     && scan_end >= tuning.min_parallel_bytes
@@ -809,7 +823,8 @@ impl Session {
         let requested_threads = resolve_worker_count(threads)?;
         self.ensure_source_unchanged()?;
         let (section_base, section_end) = self.active_byte_range();
-        let data_start = u64::from(self.dialect.has_header && section_base == 0);
+        let strip_bom_at_zero = !self.section_is_interior();
+        let data_start = u64::from(self.dialect.has_header && strip_bom_at_zero);
         // `max_bytes` is an absolute file offset (e.g. `StructuralIndex::committed_record_end()`),
         // so clamp it within `[section_base, section_end]` instead of adding `section_base` again.
         let scan_limit = max_bytes
@@ -830,20 +845,23 @@ impl Session {
             FilterParallelTuning::for_production(requested_threads),
             scan_limit < section_end,
             self.is_section(),
+            strip_bom_at_zero,
         )
     }
 
     fn check_filter_index(&self, index: &FilterIndex) -> Result<(), QuarryError> {
         self.ensure_source_unchanged()?;
         let (section_base, section_end) = self.active_byte_range();
-        let expected_data_start = u64::from(self.dialect.has_header && section_base == 0);
+        let strip_bom_at_zero = !self.section_is_interior();
+        let expected_data_start = u64::from(self.dialect.has_header && strip_bom_at_zero);
         if let Some(source) = &index.source
             && (source.path != self.path
                 || source.stamp != self.source_stamp
                 || source.delimiter != self.dialect.delimiter
                 || source.data_start != expected_data_start
                 || source.encoding != self.encoding
-                || source.section_range != (section_base, section_end))
+                || source.section_range != (section_base, section_end)
+                || source.strip_bom_at_zero != strip_bom_at_zero)
         {
             return Err(QuarryError::SourceChanged);
         }
@@ -1264,7 +1282,7 @@ fn run_filter(
                             &record,
                             delimiter,
                             row_number,
-                            record_start == 0,
+                            shared.strip_bom_at_zero && record_start == 0,
                             query,
                             &matchers,
                             &groups,
@@ -1333,7 +1351,7 @@ fn run_filter(
                                 rec,
                                 delimiter,
                                 row_number,
-                                record_start == 0,
+                                shared.strip_bom_at_zero && record_start == 0,
                                 query,
                                 &matchers,
                                 &groups,
@@ -1363,7 +1381,7 @@ fn run_filter(
                                 &record,
                                 delimiter,
                                 row_number,
-                                record_start == 0,
+                                shared.strip_bom_at_zero && record_start == 0,
                                 query,
                                 &matchers,
                                 &groups,
@@ -2676,6 +2694,10 @@ fn run_filtered_read(
         .source
         .as_ref()
         .map_or(Encoding::Utf8, |source| source.encoding);
+    let strip_bom_at_zero = plan
+        .source
+        .as_ref()
+        .is_none_or(|source| source.strip_bom_at_zero);
     let matchers = compile_matchers(&plan.query)?;
     let groups = predicate_groups(&plan.query);
     let mut scanner = RecordScanner::at_offset(delimiter, plan.checkpoint.offset, encoding)?;
@@ -2728,7 +2750,7 @@ fn run_filtered_read(
                     &record,
                     delimiter,
                     row_number,
-                    record_start == 0,
+                    strip_bom_at_zero && record_start == 0,
                     &plan.query,
                     &matchers,
                     &groups,
@@ -2771,7 +2793,7 @@ fn run_filtered_read(
                             &record,
                             delimiter,
                             row_number,
-                            record_start == 0,
+                            strip_bom_at_zero && record_start == 0,
                             &plan.query,
                             &matchers,
                             &groups,
@@ -3779,7 +3801,7 @@ mod tests {
             DEFAULT_FILTER_INDEX_MEMORY_BUDGET_BYTES,
         )
         .unwrap();
-        let shared = Arc::new(SharedState::new(index, 0, 0, false));
+        let shared = Arc::new(SharedState::new(index, 0, 0, false, true));
         let worker_state = Arc::clone(&shared);
         let exited = Arc::new(AtomicBool::new(false));
         let worker_exited = Arc::clone(&exited);

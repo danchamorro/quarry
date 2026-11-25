@@ -639,7 +639,9 @@ impl QuarryWindow {
             .update(cx, |panels, cx| panels.close(window, cx));
         let controller = self.controller.clone();
         let is_section = controller.read(cx).document_is_section(document_id);
-        let save_as_info = if is_section {
+        let section_requires_save_as =
+            is_section && !controller.read(cx).document_can_splice_save(document_id);
+        let save_as_info = if section_requires_save_as {
             controller.read(cx).document_save_as_info(document_id)
         } else {
             None
@@ -675,9 +677,13 @@ impl QuarryWindow {
                 .close_button(true)
                 .keyboard(true)
                 .content(move |content, _, cx| {
-                    let prompt_copy = if is_section {
+                    let prompt_copy = if section_requires_save_as {
                         format!(
-                            "{filename_msg} has unsaved section edits. Save the section as a new file, discard edits, or keep editing."
+                            "{filename_msg} has unsaved section edits with unverified boundaries. Save the section as a new file, discard edits, or keep editing."
+                        )
+                    } else if is_section {
+                        format!(
+                            "{filename_msg} has unsaved section edits. Save changes back to the parent file, discard edits, or keep editing."
                         )
                     } else {
                         format!(
@@ -754,11 +760,15 @@ impl QuarryWindow {
                         )
                         .child(
                             Button::new("close-save")
-                                .label(if is_section { "Save As…" } else { "Save" })
+                                .label(if section_requires_save_as {
+                                    "Save As…"
+                                } else {
+                                    "Save"
+                                })
                                 .primary()
                                 .small()
                                 .on_click(move |_, window, cx| {
-                                    if is_section {
+                                    if section_requires_save_as {
                                         let Some((source_path, warning)) = save_as_info.clone()
                                         else {
                                             return;

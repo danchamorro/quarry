@@ -286,6 +286,9 @@ pub(crate) struct SectionMetadata {
     pub(crate) header_row: Option<Row>,
     /// Byte length of the file's leading BOM at byte 0 (`0`, `2`, or `3`).
     pub(crate) bom_len: u64,
+    /// True when this session reads a private section-only working copy (offsets `[0, file_size)`)
+    /// rather than reading `[bounds.snapped.base, bounds.snapped_end())` directly from the parent.
+    pub(crate) backed_by_working_copy: bool,
 }
 
 /// Live progress snapshot of a background `VerifyBoundaryJob`.
@@ -1962,6 +1965,7 @@ pub(crate) fn read_header_probe_rows(
 
 /// Materialize initial rows strictly from `[section_start, section_end)` using positional `pread`
 /// (never seeking or scanning bytes before `section_start`).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn read_section_initial_rows(
     file: &File,
     section_start: u64,
@@ -1970,6 +1974,7 @@ pub(crate) fn read_section_initial_rows(
     wanted: usize,
     limit: usize,
     encoding: Encoding,
+    strip_bom_at_zero: bool,
 ) -> Result<(Vec<Row>, u64), QuarryError> {
     if section_start >= section_end || wanted == 0 {
         return Ok((Vec::new(), 0));
@@ -2013,7 +2018,7 @@ pub(crate) fn read_section_initial_rows(
                         &record,
                         delimiter,
                         physical_row,
-                        record_start == 0,
+                        strip_bom_at_zero && record_start == 0,
                         encoding,
                     ) {
                         Ok(fields) => {
@@ -2056,7 +2061,7 @@ pub(crate) fn read_section_initial_rows(
                 &record,
                 delimiter,
                 physical_row,
-                record_start == 0,
+                strip_bom_at_zero && record_start == 0,
                 encoding,
             )?
             .into_iter()
