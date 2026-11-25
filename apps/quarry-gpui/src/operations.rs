@@ -28,6 +28,42 @@ pub struct DialogTarget {
     pub doc_id: DocumentId,
 }
 
+/// Focus anchor placed inside a dialog's own footer so Cancel/Confirm buttons
+/// always dispatch actions directly to the enclosing dialog rather than to a
+/// focused child `Select`, `Input`, or `Textarea` that might intercept them.
+#[derive(Clone)]
+pub(crate) struct DialogAnchor {
+    handle: FocusHandle,
+}
+
+impl DialogAnchor {
+    pub(crate) fn new(cx: &mut App) -> Self {
+        Self {
+            handle: cx.focus_handle(),
+        }
+    }
+
+    pub(crate) fn element(&self) -> impl IntoElement {
+        div().absolute().size_0().track_focus(&self.handle)
+    }
+
+    pub(crate) fn dispatch(&self, action: &dyn Action, window: &mut Window, cx: &mut App) {
+        if self.handle.is_focused(window) || self.handle.contains(&self.handle, window) {
+            self.handle.dispatch_action(action, window, cx);
+        } else {
+            window.dispatch_action(action.boxed_clone(), cx);
+        }
+    }
+
+    pub(crate) fn confirm(&self, window: &mut Window, cx: &mut App) {
+        self.dispatch(&DialogConfirm { secondary: false }, window, cx);
+    }
+
+    pub(crate) fn cancel(&self, window: &mut Window, cx: &mut App) {
+        self.dispatch(&DialogCancel, window, cx);
+    }
+}
+
 #[derive(Clone)]
 struct Choice {
     value: usize,
@@ -270,6 +306,7 @@ pub fn open_sort_dialog(
         st
     });
     let on_closed = std::rc::Rc::new(on_closed);
+    let anchor = DialogAnchor::new(cx);
     controller.update(cx, |c, cx| c.set_window_editing(window_id, true, cx));
     window.open_dialog(cx, move |dialog, _, _cx| {
         let st_view = state.clone();
@@ -278,6 +315,9 @@ pub fn open_sort_dialog(
         let ctrl_view = controller.clone();
         let ctrl_close = controller.clone();
         let on_closed_cb = on_closed.clone();
+        let anchor_el = anchor.clone();
+        let anchor_cancel = anchor.clone();
+        let anchor_ok = anchor.clone();
 
         dialog
             .title("Sort Rows")
@@ -555,23 +595,20 @@ pub fn open_sort_dialog(
             })
             .footer(
                 div()
+                    .relative()
                     .flex()
                     .justify_end()
                     .gap_2()
+                    .child(anchor_el.element())
                     .child(Button::new("cancel-sort").label("Cancel").small().on_click(
-                        |_, window, cx| window.dispatch_action(Box::new(DialogCancel), cx),
+                        move |_, window, cx| anchor_cancel.cancel(window, cx),
                     ))
                     .child(
                         Button::new("apply-sort")
                             .label("Sort")
                             .primary()
                             .small()
-                            .on_click(|_, window, cx| {
-                                window.dispatch_action(
-                                    Box::new(DialogConfirm { secondary: false }),
-                                    cx,
-                                )
-                            }),
+                            .on_click(move |_, window, cx| anchor_ok.confirm(window, cx)),
                     ),
             )
             .on_ok(move |_, window, cx| {
@@ -631,6 +668,7 @@ pub fn open_duplicates_dialog(
         error: None,
     });
     let on_closed = std::rc::Rc::new(on_closed);
+    let anchor = DialogAnchor::new(cx);
     controller.update(cx, |c, cx| c.set_window_editing(window_id, true, cx));
     window.open_dialog(cx, move |dialog, _, _cx| {
         let st_view = state.clone();
@@ -638,6 +676,9 @@ pub fn open_duplicates_dialog(
         let ctrl_ok = controller.clone();
         let ctrl_close = controller.clone();
         let on_closed_cb = on_closed.clone();
+        let anchor_el = anchor.clone();
+        let anchor_cancel = anchor.clone();
+        let anchor_ok = anchor.clone();
         dialog
             .title("Find & Remove Duplicates")
             .w(px(460.))
@@ -727,28 +768,23 @@ pub fn open_duplicates_dialog(
             })
             .footer(
                 div()
+                    .relative()
                     .flex()
                     .justify_end()
                     .gap_2()
+                    .child(anchor_el.element())
                     .child(
                         Button::new("cancel-duplicates")
                             .label("Cancel")
                             .small()
-                            .on_click(|_, window, cx| {
-                                window.dispatch_action(Box::new(DialogCancel), cx)
-                            }),
+                            .on_click(move |_, window, cx| anchor_cancel.cancel(window, cx)),
                     )
                     .child(
                         Button::new("apply-duplicates")
                             .label("Find Duplicates")
                             .primary()
                             .small()
-                            .on_click(|_, window, cx| {
-                                window.dispatch_action(
-                                    Box::new(DialogConfirm { secondary: false }),
-                                    cx,
-                                )
-                            }),
+                            .on_click(move |_, window, cx| anchor_ok.confirm(window, cx)),
                     ),
             )
             .on_ok(move |_, window, cx| {
@@ -844,6 +880,7 @@ pub fn open_cleanup_dialog(
         }
     });
     let on_closed = std::rc::Rc::new(on_closed);
+    let anchor = DialogAnchor::new(cx);
     controller.update(cx, |c, cx| c.set_window_editing(window_id, true, cx));
     window.open_dialog(cx, move |dialog, _, _cx| {
         let st_view = state.clone();
@@ -851,6 +888,9 @@ pub fn open_cleanup_dialog(
         let ctrl_ok = controller.clone();
         let ctrl_close = controller.clone();
         let on_closed_cb = on_closed.clone();
+        let anchor_el = anchor.clone();
+        let anchor_cancel = anchor.clone();
+        let anchor_ok = anchor.clone();
         dialog
             .title("Clean Selected Columns")
             .w(px(460.))
@@ -926,28 +966,23 @@ pub fn open_cleanup_dialog(
             })
             .footer(
                 div()
+                    .relative()
                     .flex()
                     .justify_end()
                     .gap_2()
+                    .child(anchor_el.element())
                     .child(
                         Button::new("cancel-cleanup")
                             .label("Cancel")
                             .small()
-                            .on_click(|_, window, cx| {
-                                window.dispatch_action(Box::new(DialogCancel), cx)
-                            }),
+                            .on_click(move |_, window, cx| anchor_cancel.cancel(window, cx)),
                     )
                     .child(
                         Button::new("apply-cleanup")
                             .label("Clean")
                             .primary()
                             .small()
-                            .on_click(|_, window, cx| {
-                                window.dispatch_action(
-                                    Box::new(DialogConfirm { secondary: false }),
-                                    cx,
-                                )
-                            }),
+                            .on_click(move |_, window, cx| anchor_ok.confirm(window, cx)),
                     ),
             )
             .on_ok(move |_, window, cx| {
@@ -1018,6 +1053,7 @@ pub fn open_insert_dialog(
         cx.new(|cx| InputState::new(window, cx).default_value(default_position.max(1).to_string()));
     let err_state = cx.new(|_| DialogError::default());
     let on_closed = std::rc::Rc::new(on_closed);
+    let anchor = DialogAnchor::new(cx);
     controller.update(cx, |c, cx| c.set_window_editing(window_id, true, cx));
     window.open_dialog(cx, move |dialog, _, cx| {
         let count_v = count_input.clone();
@@ -1029,6 +1065,9 @@ pub fn open_insert_dialog(
         let ctrl_ok = controller.clone();
         let ctrl_close = controller.clone();
         let on_closed_cb = on_closed.clone();
+        let anchor_el = anchor.clone();
+        let anchor_cancel = anchor.clone();
+        let anchor_ok = anchor.clone();
         dialog
             .title(if insert_rows {
                 "Insert Rows"
@@ -1085,28 +1124,23 @@ pub fn open_insert_dialog(
             })
             .footer(
                 div()
+                    .relative()
                     .flex()
                     .justify_end()
                     .gap_2()
+                    .child(anchor_el.element())
                     .child(
                         Button::new("cancel-insert")
                             .label("Cancel")
                             .small()
-                            .on_click(|_, window, cx| {
-                                window.dispatch_action(Box::new(DialogCancel), cx)
-                            }),
+                            .on_click(move |_, window, cx| anchor_cancel.cancel(window, cx)),
                     )
                     .child(
                         Button::new("apply-insert")
                             .label("Insert")
                             .primary()
                             .small()
-                            .on_click(|_, window, cx| {
-                                window.dispatch_action(
-                                    Box::new(DialogConfirm { secondary: false }),
-                                    cx,
-                                )
-                            }),
+                            .on_click(move |_, window, cx| anchor_ok.confirm(window, cx)),
                     ),
             )
             .on_ok(move |_, window, cx| {
@@ -1180,6 +1214,7 @@ pub fn open_move_columns_dialog(
         }
     });
     let on_closed = std::rc::Rc::new(on_closed);
+    let anchor = DialogAnchor::new(cx);
     controller.update(cx, |c, cx| c.set_window_editing(window_id, true, cx));
     window.open_dialog(cx, move |dialog, _, _cx| {
         let st_view = state.clone();
@@ -1187,6 +1222,9 @@ pub fn open_move_columns_dialog(
         let ctrl_ok = controller.clone();
         let ctrl_close = controller.clone();
         let on_closed_cb = on_closed.clone();
+        let anchor_el = anchor.clone();
+        let anchor_cancel = anchor.clone();
+        let anchor_ok = anchor.clone();
         dialog
             .title("Move Columns")
             .w(px(440.))
@@ -1261,23 +1299,23 @@ pub fn open_move_columns_dialog(
             })
             .footer(
                 div()
+                    .relative()
                     .flex()
                     .justify_end()
                     .gap_2()
-                    .child(Button::new("cancel-move").label("Cancel").small().on_click(
-                        |_, window, cx| window.dispatch_action(Box::new(DialogCancel), cx),
-                    ))
+                    .child(anchor_el.element())
+                    .child(
+                        Button::new("cancel-move")
+                            .label("Cancel")
+                            .small()
+                            .on_click(move |_, window, cx| anchor_cancel.cancel(window, cx)),
+                    )
                     .child(
                         Button::new("apply-move")
                             .label("Move")
                             .primary()
                             .small()
-                            .on_click(|_, window, cx| {
-                                window.dispatch_action(
-                                    Box::new(DialogConfirm { secondary: false }),
-                                    cx,
-                                )
-                            }),
+                            .on_click(move |_, window, cx| anchor_ok.confirm(window, cx)),
                     ),
             )
             .on_ok(move |_, window, cx| {
@@ -1351,6 +1389,7 @@ pub fn open_split_column_dialog(
     });
     let err_state = cx.new(|_| DialogError::default());
     let on_closed = std::rc::Rc::new(on_closed);
+    let anchor = DialogAnchor::new(cx);
     controller.update(cx, |c, cx| c.set_window_editing(window_id, true, cx));
     window.open_dialog(cx, move |dialog, _, cx| {
         let col_v = col_select.clone();
@@ -1362,6 +1401,9 @@ pub fn open_split_column_dialog(
         let ctrl_ok = controller.clone();
         let ctrl_close = controller.clone();
         let on_closed_cb = on_closed.clone();
+        let anchor_el = anchor.clone();
+        let anchor_cancel = anchor.clone();
+        let anchor_ok = anchor.clone();
         dialog
             .title("Split Column")
             .w(px(420.))
@@ -1404,28 +1446,23 @@ pub fn open_split_column_dialog(
             })
             .footer(
                 div()
+                    .relative()
                     .flex()
                     .justify_end()
                     .gap_2()
+                    .child(anchor_el.element())
                     .child(
                         Button::new("cancel-split")
                             .label("Cancel")
                             .small()
-                            .on_click(|_, window, cx| {
-                                window.dispatch_action(Box::new(DialogCancel), cx)
-                            }),
+                            .on_click(move |_, window, cx| anchor_cancel.cancel(window, cx)),
                     )
                     .child(
                         Button::new("apply-split")
                             .label("Split")
                             .primary()
                             .small()
-                            .on_click(|_, window, cx| {
-                                window.dispatch_action(
-                                    Box::new(DialogConfirm { secondary: false }),
-                                    cx,
-                                )
-                            }),
+                            .on_click(move |_, window, cx| anchor_ok.confirm(window, cx)),
                     ),
             )
             .on_ok(move |_, window, cx| {
@@ -1492,6 +1529,7 @@ pub fn open_combine_columns_dialog(
         }
     });
     let on_closed = std::rc::Rc::new(on_closed);
+    let anchor = DialogAnchor::new(cx);
     controller.update(cx, |c, cx| c.set_window_editing(window_id, true, cx));
     window.open_dialog(cx, move |dialog, _, _cx| {
         let st_view = state.clone();
@@ -1499,6 +1537,9 @@ pub fn open_combine_columns_dialog(
         let ctrl_ok = controller.clone();
         let ctrl_close = controller.clone();
         let on_closed_cb = on_closed.clone();
+        let anchor_el = anchor.clone();
+        let anchor_cancel = anchor.clone();
+        let anchor_ok = anchor.clone();
         dialog
             .title("Combine Columns")
             .w(px(460.))
@@ -1606,28 +1647,23 @@ pub fn open_combine_columns_dialog(
             })
             .footer(
                 div()
+                    .relative()
                     .flex()
                     .justify_end()
                     .gap_2()
+                    .child(anchor_el.element())
                     .child(
                         Button::new("cancel-combine")
                             .label("Cancel")
                             .small()
-                            .on_click(|_, window, cx| {
-                                window.dispatch_action(Box::new(DialogCancel), cx)
-                            }),
+                            .on_click(move |_, window, cx| anchor_cancel.cancel(window, cx)),
                     )
                     .child(
                         Button::new("apply-combine")
                             .label("Combine")
                             .primary()
                             .small()
-                            .on_click(|_, window, cx| {
-                                window.dispatch_action(
-                                    Box::new(DialogConfirm { secondary: false }),
-                                    cx,
-                                )
-                            }),
+                            .on_click(move |_, window, cx| anchor_ok.confirm(window, cx)),
                     ),
             )
             .on_ok(move |_, window, cx| {

@@ -7,11 +7,11 @@
 
 use std::path::PathBuf;
 
+use crate::operations::DialogAnchor;
 use gpui_kit::component::{
     ActiveTheme, Disableable, IndexPath, Sizable, WindowExt,
     button::{Button, ButtonVariants},
     checkbox::Checkbox,
-    dialog::Cancel as DialogCancel,
     select::{SearchableVec, Select, SelectEvent, SelectItem, SelectState},
 };
 use gpui_kit::{prelude::*, *};
@@ -201,11 +201,14 @@ pub fn open_combine_dialog(
 
     let open_output_cb = std::rc::Rc::new(on_open_output);
     let on_closed = std::rc::Rc::new(on_closed);
+    let anchor = DialogAnchor::new(cx);
     window.open_dialog(cx, move |dialog, _, cx| {
         let on_closed = on_closed.clone();
         let state_body = state.clone();
         let controller_footer = controller.clone();
         let open_output = open_output_cb.clone();
+        let anchor_el = anchor.clone();
+        let anchor_close = anchor.clone();
         let wf = controller.read(cx).combine();
         let busy = wf.busy();
         let has_files = wf.paths.len() >= 2;
@@ -495,12 +498,13 @@ pub fn open_combine_dialog(
                                 }),
                         )
                     })
+                    .child(anchor_el.element())
                     .child(
                         Button::new("combine-close")
                             .label("Close")
                             .small()
-                            .on_click(|_, window, cx| {
-                                window.dispatch_action(Box::new(DialogCancel), cx);
+                            .on_click(move |_, window, cx| {
+                                anchor_close.cancel(window, cx);
                             }),
                     )
                     .child(
@@ -596,6 +600,7 @@ pub fn open_join_dialog(
     let open_output_cb = std::rc::Rc::new(on_open_output);
     let on_closed = std::rc::Rc::new(on_closed);
     let controller_close = controller.clone();
+    let anchor = DialogAnchor::new(cx);
 
     window.open_dialog(cx, move |dialog, _, cx| {
         let on_closed = on_closed.clone();
@@ -604,6 +609,8 @@ pub fn open_join_dialog(
         let c_footer = controller.clone();
         let c_close = controller_close.clone();
         let open_output = open_output_cb.clone();
+        let anchor_el = anchor.clone();
+        let anchor_close = anchor.clone();
 
         let (busy, ready_to_analyze, has_plan, can_write, finished_path) = {
             let wf = controller.read(cx).join();
@@ -1183,12 +1190,13 @@ pub fn open_join_dialog(
                                 });
                             }),
                     )
+                    .child(anchor_el.element())
                     .child(
                         Button::new("join-close")
                             .label("Close")
                             .small()
-                            .on_click(|_, window, cx| {
-                                window.dispatch_action(Box::new(DialogCancel), cx);
+                            .on_click(move |_, window, cx| {
+                                anchor_close.cancel(window, cx);
                             }),
                     )
                     .child(
@@ -1352,11 +1360,14 @@ pub fn open_inspect_dialog(
 
     let open_recovered_cb = std::rc::Rc::new(on_open_recovered);
     let on_closed = std::rc::Rc::new(on_closed);
+    let anchor = DialogAnchor::new(cx);
     window.open_dialog(cx, move |dialog, _, cx| {
         let on_closed = on_closed.clone();
         let state_body = state.clone();
         let c_footer = controller.clone();
         let open_recovered = open_recovered_cb.clone();
+        let anchor_el = anchor.clone();
+        let anchor_close = anchor.clone();
 
         let (busy, has_path, has_selected, recovered_path, suggested_dir) = {
             let wf = controller.read(cx).inspect();
@@ -1693,12 +1704,13 @@ pub fn open_inspect_dialog(
                                 }),
                         )
                     })
+                    .child(anchor_el.element())
                     .child(
                         Button::new("inspect-close")
                             .label("Close")
                             .small()
-                            .on_click(|_, window, cx| {
-                                window.dispatch_action(Box::new(DialogCancel), cx);
+                            .on_click(move |_, window, cx| {
+                                anchor_close.cancel(window, cx);
                             }),
                     )
                     .child(
@@ -1769,12 +1781,15 @@ pub fn open_temporary_storage_dialog(
     });
     let action_error = cx.new(|_| Option::<String>::None);
     let on_closed = std::rc::Rc::new(on_closed);
+    let anchor = DialogAnchor::new(cx);
 
     window.open_dialog(cx, move |dialog, _, cx| {
         let on_closed = on_closed.clone();
         let _obs = observer.read(cx);
         let c_body = controller.clone();
         let err_state = action_error.clone();
+        let anchor_el = anchor.clone();
+        let anchor_close = anchor.clone();
 
         dialog
             .title("Temporary Storage & Index Cache")
@@ -1988,15 +2003,20 @@ pub fn open_temporary_storage_dialog(
                 content.child(body)
             })
             .footer(
-                div().flex().justify_end().child(
-                    Button::new("storage-close")
-                        .label("Done")
-                        .primary()
-                        .small()
-                        .on_click(|_, window, cx| {
-                            window.dispatch_action(Box::new(DialogCancel), cx);
-                        }),
-                ),
+                div()
+                    .relative()
+                    .flex()
+                    .justify_end()
+                    .child(anchor_el.element())
+                    .child(
+                        Button::new("storage-close")
+                            .label("Done")
+                            .primary()
+                            .small()
+                            .on_click(move |_, window, cx| {
+                                anchor_close.cancel(window, cx);
+                            }),
+                    ),
             )
             .on_close(move |_, window, cx| {
                 on_closed(window, cx);
@@ -2118,6 +2138,7 @@ pub fn open_about_dialog(
         .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
     let details = format_build_details(&build_info);
     let on_closed = std::rc::Rc::new(on_closed);
+    let anchor = DialogAnchor::new(cx);
 
     window.open_dialog(cx, move |dialog, _, cx| {
         let on_closed = on_closed.clone();
@@ -2125,6 +2146,8 @@ pub fn open_about_dialog(
         let version_copy = version.clone();
         let copied_state = copied.clone();
         let copied_now = *copied.read(cx);
+        let anchor_el = anchor.clone();
+        let anchor_close = anchor.clone();
 
         dialog
             .title("About Quarry")
@@ -2193,13 +2216,14 @@ pub fn open_about_dialog(
                                 });
                             })
                     })
+                    .child(anchor_el.element())
                     .child(
                         Button::new("about-close")
                             .label("Close")
                             .primary()
                             .small()
-                            .on_click(|_, window, cx| {
-                                window.dispatch_action(Box::new(DialogCancel), cx);
+                            .on_click(move |_, window, cx| {
+                                anchor_close.cancel(window, cx);
                             }),
                     ),
             )
