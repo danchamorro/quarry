@@ -10,7 +10,7 @@ body:
     id: build
     attributes:
       label: Quarry version and revision
-      description: Paste File menu → About & Feedback → Copy build details. For older builds without that panel, include the version and Git revision from the release notes or bundle verification.
+      description: Open Quarry → About Quarry (or File → About & Feedback on older v0.1.0-beta builds) and include the version and Git revision from the build details or bundle verification.
       placeholder: Version, commit, source build or local app bundle
     validations:
       required: true
@@ -18,8 +18,8 @@ body:
     id: platform
     attributes:
       label: Operating system and hardware
-      description: Include OS version and architecture. For performance reports, include RAM and available disk space.
-      placeholder: macOS version, Apple Silicon or Intel; or Linux distribution/Windows version for source builds
+      description: Include OS version, desktop/compositor (for Linux/Omarchy, e.g. Hyprland Wayland), and architecture. For performance reports, include RAM and available disk space.
+      placeholder: macOS version (Apple Silicon / Intel), or Linux / Omarchy distribution, Wayland/Hyprland, architecture
     validations:
       required: true
   - type: textarea

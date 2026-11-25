@@ -1,29 +1,30 @@
 # Quarry Product Requirements Document
 
-**Version:** 0.5 Draft
-**Platform:** macOS first
-**Core engine:** Rust
-**Model:** Free and open source
+**Version:** 0.5 (living product requirements)
+**Platforms:** macOS and Linux / Omarchy (native Wayland / Hyprland)
+**Core engine & UI:** Rust + GPUI (`apps/quarry-gpui`, [ADR 0013](adr/0013-adopt-gpui-desktop-frontend.md))
+**Model:** Free and open source (`MIT OR Apache-2.0`)
 
-This document records product requirements and design context. All future
-roadmap items and planning decisions live in the
+This document records product requirements and design context. Current progress
+and claim verification live in [`docs/ROADMAP.md`](ROADMAP.md),
+[`docs/V1_CLAIM_LEDGER.md`](V1_CLAIM_LEDGER.md), and the
 [Quarry Roadmap project](https://github.com/users/danchamorro/projects/1).
 
 ## Product vision
-Quarry is a performance-first desktop application for people who work with delimited text files too large for conventional editors and spreadsheets.
+Quarry is a performance-first, local-only desktop and CLI application for people who work with delimited text files too large for conventional editors and spreadsheets.
 
 ### North star
-> A user should be able to open a 10 GB CSV on a Mac, see useful data within seconds, and begin navigating it without waiting for the entire file to load into memory.
+> A user should be able to open a 10 GB CSV on macOS or Linux, see useful data within milliseconds, and begin navigating, filtering, sorting, and editing it without waiting for the entire file to load into memory.
 
-Longer term, Quarry should make files substantially larger than physical RAM practical to inspect and transform.
+Longer term, Quarry makes files substantially larger than physical RAM—up to multi-terabyte files via bounded section windows—practical to inspect and transform.
 
 Quarry is fully open source under MIT or Apache-2.0. All application features
-remain available in source builds, with no paid tiers or activation. Official
-releases are intended to be free of charge when released. See the
-[project policy](../README.md#free-and-open-source).
+remain available in source builds, with no paid tiers, license keys, telemetry,
+or Contributor License Agreement. Official releases are free of charge. See the
+[project policy](../README.md#free-open-source-and-local-first).
 
 ## Problem
-Data professionals regularly receive multi-gigabyte CSV, TSV, and pipe-delimited files. Common tools may consume enormous memory, freeze, impose limits, or require importing the data elsewhere before inspection. Quarry fills that gap on macOS.
+Data professionals regularly receive multi-gigabyte CSV, TSV, and pipe-delimited files. Common tools consume enormous memory, freeze, impose row limits, or require importing the data elsewhere before inspection. Quarry solves this natively on macOS and Linux (including Omarchy).
 
 ## Target users
 Data operations professionals, data engineers, ETL developers, analysts, database professionals, integration engineers, and technical users receiving massive exports.
@@ -92,7 +93,7 @@ space, and retained versions. Folder changes preserve the active document and
 its Undo/Redo files. Save and export retain atomic staging on the destination
 volume. Failed checks, later write errors, and cancellation preserve the current
 document and remove unpublished output. The
-[user guide](USER_GUIDE.md#temporary-storage-and-free-space) documents the
+[user guide](USER_GUIDE.md#temporary-storage-index-cache-and-free-space) documents the
 controls and cleanup contract.
 
 Not required: general-purpose text-editor behavior, formulas, charts, database

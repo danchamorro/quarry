@@ -1,19 +1,24 @@
 # Quarry User Guide
 
-This guide explains how to open, inspect, edit, filter, reshape, sort, and save
-delimited files in the Quarry macOS app.
+This guide explains how to open, inspect, edit, filter, reshape, sort, slice, bookmark, and save
+delimited files in the Quarry desktop app on **macOS** and **Linux / Omarchy**.
 
 ## Contents
 
 - [Getting started](#getting-started)
 - [How to](#how-to)
-  - [Work with document tabs](#work-with-document-tabs)
+  - [Choose a theme](#choose-a-theme)
+  - [Work with tabs and multiple windows](#work-with-tabs-and-multiple-windows)
+  - [Pause indexing and read the Live Resource HUD](#pause-indexing-and-read-the-live-resource-hud)
+  - [Open a section of a huge file](#open-a-section-of-a-huge-file)
+  - [Bookmark rows for quick navigation](#bookmark-rows-for-quick-navigation)
   - [Open compressed files](#open-compressed-files)
   - [Combine files](#combine-files)
   - [Join files](#join-files)
   - [Navigate the grid](#navigate-the-grid)
   - [Inspect whitespace](#inspect-whitespace)
   - [Select and copy data](#select-and-copy-data)
+  - [Add rows and columns](#add-rows-and-columns)
   - [Delete rows](#delete-rows)
   - [Find and remove duplicates](#find-and-remove-duplicates)
   - [Edit cells and headers](#edit-cells-and-headers)
@@ -28,23 +33,21 @@ delimited files in the Quarry macOS app.
   - [Move or delete columns](#move-or-delete-columns)
   - [Sort rows](#sort-rows)
   - [Manage the visible columns](#manage-the-visible-columns)
-  - [Temporary storage and free space](#temporary-storage-and-free-space)
+  - [Temporary storage, index cache, and free space](#temporary-storage-index-cache-and-free-space)
   - [Save, Save As, and discard](#save-save-as-and-discard)
 - [Case matching](#case-matching)
 - [Mouse and keyboard reference](#mouse-and-keyboard-reference)
 - [Troubleshooting](#troubleshooting)
+- [Inspecting file issues and creating recovery copies](#inspecting-file-issues-and-creating-recovery-copies)
 - [Version and feedback](#version-and-feedback)
 
 ## Getting started
 
 ### 1. Install and open Quarry
 
-If Quarry is not installed, follow [Install Quarry](../README.md#install-quarry)
-in the README. The [macOS packaging guide](MACOS_PACKAGING.md) covers updates,
-rollback, and package-only builds.
-
-For prerelease testing, see the [beta checklist](BETA_RELEASE_CHECKLIST.md) for
-platform status, the acceptance workflow, current limits, and the feedback form.
+Follow [Install & Build from Source](../README.md#install--build-from-source) in the README.
+For macOS packaging, updates, and rollback, see the [macOS packaging guide](MACOS_PACKAGING.md).
+For Linux and Omarchy Wayland/Hyprland builds and theme sync, see the [Linux & Omarchy guide](LINUX_AND_OMARCHY.md).
 
 ### 2. Open a file
 
@@ -52,12 +55,12 @@ Quarry supports comma, tab, pipe, and semicolon-delimited files. It also opens
 gzip-compressed (`.gz`) files read-only; see
 [Open compressed files](#open-compressed-files). Open a file in any of these ways:
 
-- Double-click it in Finder after associating its file type with Quarry.
-- Open Quarry's file menu, choose **Open…**, and select the file.
-- Drop one or more local files onto Quarry.
+- Choose **File → Open…** (Command+O on macOS, Ctrl+O on Linux).
+- Double-click a CSV in Finder on macOS after associating its file type with Quarry.
+- Pass one or more file paths on the command line (for example, `quarry-gpui data.csv`).
 
 Each file opens in a tab. Selecting multiple files in **Open…** opens all of them.
-Opening the same file again selects its existing tab and preserves its state.
+Opening the same file again focuses its existing tab and preserves its state.
 
 Quarry detects the delimiter and header row automatically. If the result is
 wrong, open **Format**, choose the correct delimiter, header, and encoding settings, then
@@ -93,93 +96,162 @@ The CLI accepts **--encoding** on file commands: **auto**, **utf-8**,
 
 ### 3. Understand the grid
 
-- The top ruler contains the one-based file-column numbers for the current
-  document. View-only hiding and reordering preserve those identities.
-- The macOS menu bar holds every File, Edit, and View command with its
-  standard shortcut, such as Command+S, Command+Shift+S, and Command+F.
-- The toolbar shares the window's title bar. The tab strip below it switches
-  between open documents: an amber dot marks unsaved changes, an activity
-  marker indicates background work, and **+** opens another file. Hover a tab
-  to see its full path.
-- The row below the ruler contains the column names when the file has a header.
-- The numbers on the left identify data rows. The header is not counted as a
-  data row.
-- The **File** menu contains **Open…**, **Reload from Disk**, **Save**,
-  **Save As…**, and **Discard Changes**.
-- **Format** shows the delimiter and header mode Quarry is using, such as
-  **Comma · Header row**. Opening it also shows the applied settings, what
-  Quarry originally detected, and the resolved character encoding.
-- Text cells align left and numeric cells align right. Quarry always uses a
-  light appearance, even when macOS uses Dark mode.
-- The footer keeps the visible row range in view, adds file and selection
-  metadata when space allows, and reserves its right side for status, progress,
-  and the active operation's cancel button.
-- Warnings and errors appear in a dismissible strip below the toolbar. Ordinary
-  completion and informational messages stay in the footer.
+- The top menu bar (`Quarry`, `File`, `Edit`, `Data`, `View`, `Window`) holds
+  every command and its platform shortcut (the native system menu bar on macOS,
+  or an in-window menu bar on Linux).
+- The tab strip switches between open documents and includes **Move to Window**
+  and **+ Window** controls. An accent dot marks unsaved changes.
+- The toolbar provides quick access to the active file or section badge,
+  **Format**, **Row** jump + **Go**, **Undo** / **Redo**, **Columns**,
+  **Filters**, **Bookmarks**, **Find**, **Sort**, **Duplicates**, **Clean**,
+  **Whitespace**, and **Save** / **Save As…**.
+- The numbered column ruler identifies one-based file columns. View-only hiding
+  and reordering preserve those column numbers.
+- The row below the ruler contains column headers when the file has a header row.
+- The `#` gutter on the left shows one-based data-row numbers (excluding the
+  header) and marks bookmarked rows with an accent dot.
+- Text cells align left and numeric cells align right using tabular figures (`tnum`).
+- Quarry supports **System**, **Light**, **Dark**, and **Omarchy** themes via
+  **View → Theme**.
+- The footer shows row counts, file or section size, column counts, and encoding
+  on the left, and the indexing state plus **Live Resource HUD** (memory, free
+  disk, and tab counts) on the right.
+- Warnings and errors appear in a dismissible strip; ordinary status updates
+  stay in the footer.
 
 Quarry displays the first rows before the complete file index is ready. You can
-start reading and filtering immediately. Find actions and Sort become available
-after indexing finishes.
+start reading, editing, bookmarking, and filtering immediately. Find actions and
+Sort become available after indexing finishes.
 
 ### 4. Make a safe first edit
 
-1. Double-click a cell.
+1. Double-click a cell (or select it and press Enter or F2).
 2. Change its value and press Enter.
-3. Confirm that the footer says **● Unsaved changes**.
-4. Open the file menu, choose **Save As…**, and select a new filename.
+3. Confirm the unsaved indicator on the tab and in the footer.
+4. Choose **File → Save As…** (or click **Save As…**) and select a new filename.
 
 This creates an edited copy and preserves the original file.
 
 ## Version and feedback
 
-Open the **File menu → About & Feedback…** to see Quarry's version and beta
-status. Packaged apps also show their build number and source revision.
-**Copy build details** copies the version, build, revision, source status and
-platform, without including your file paths or document contents. Unpackaged
-source builds show the Cargo version and identify unavailable build metadata.
+Choose **Quarry → About Quarry** to view Quarry's version, build metadata, and
+open-source license details. Unpackaged source builds show the Cargo version.
 
-Choose **Report a bug or share feedback** to open the public GitHub bug form,
-or **User guide** to open this guide. Include build details, your exact macOS
-version, reproduction steps, and expected and actual results. Use a small
-synthetic example and redact private information from screenshots and logs.
-Close the panel with **Close** or Escape.
-
-This panel was added after beta 1; that release's build identity is listed in
-the [beta tester guide](BETA_TESTER_GUIDE.md#candidate-and-compatibility).
+To report a bug or request a feature, open an issue on
+[GitHub Issues](https://github.com/danchamorro/quarry/issues). Include your
+Quarry version/commit, OS and architecture (plus Wayland/Hyprland details on
+Linux/Omarchy), reproduction steps, and expected vs. actual results. Use a small
+synthetic example and never upload private data.
 
 ## How to
 
-### Work with document tabs
+### Choose a theme
 
-Use **Open…** or **⌘O**, Finder, or drag-and-drop to open files in separate tabs.
-Click a tab, or use **Ctrl-Tab** and **Ctrl-Shift-Tab**, to switch. Each tab keeps
-its edits, Undo/Redo, selection, visible columns, row position, search, filters,
-and background progress. Menus, copying, and save shortcuts act on the active tab.
-Opening a combined result also creates a tab, preserving existing unsaved work.
+Open **View → Theme** and choose:
 
-Click a tab's **×**, choose **Close Tab**, or press **⌘W** to close it. Unsaved
-changes offer Save, Save As, Keep Editing, or Discard. Active file operations
-finish before the tab closes; you can keep editing or cancel the operation.
-Quitting reviews every document. Cancelling any quit prompt retains all tabs and
-their edits, including earlier discard approvals. Files already saved stay saved.
-If Combine Files is open, quit keeps its selections and running operation intact.
-Explicitly close that dialog (or cancel its operation) before quitting. Join Files
-also offers cancellation and waits for private-data cleanup before closing.
-Final document cleanup runs in the background with visible progress; a cleanup
-failure remains visible and cancels automatic quitting.
+- **System:** follows your macOS or Linux system appearance automatically.
+- **Light:** warm paper neutrals with brand amber selection and focus accents.
+- **Dark:** WCAG AA slate dark palette with brand amber accents.
+- **Omarchy:** live local theme sync on Omarchy Linux (automatically reloads
+  when you switch Omarchy themes; falls back to Dark if no Omarchy theme is
+  present).
 
-Quarry supports eight open tabs and two simultaneous save/export/reshape
-operations. If you reach a limit, close a tab or wait for/cancel an operation.
-Indexing, searches, and filters can continue in background tabs. Temporary files
-and history remain available until their owning tab closes. Save As and export
-cannot write to a file open or being written in another tab; choose another
-destination or close that tab first.
+Your choice is saved locally and restored on next launch.
+
+### Work with tabs and multiple windows
+
+Use **File → Open…** (Command+O on macOS, Ctrl+O on Linux), Finder on macOS, or
+CLI paths to open files in separate tabs. Click a tab, or use
+**Command+Shift+] / Command+Shift+[** on macOS (**Ctrl+Tab / Ctrl+Shift+Tab** on
+Linux), to switch tabs. Choose **Window → New Window** (Command+N / Ctrl+N) to
+open another window, or **Window → Move Tab to New Window** (or **Move to Window**
+in the tab bar) to detach the active tab into its own window.
+
+Each tab keeps its edits, Undo/Redo, bookmarks, selection, visible columns, row
+position, search, filters, and background progress. Menus, copying, and save
+shortcuts act on the active tab in the focused window.
+
+Click a tab's **×**, choose **File → Close Tab**, or press Command+W / Ctrl+W to
+close it. Unsaved changes offer Save, Save As, Keep Editing, or Discard. Active
+file operations finish before the tab closes; you can keep editing or cancel the
+operation. Quitting reviews every modified document across all windows.
+Cancelling any quit prompt retains all tabs and their edits.
+
+Quarry runs in a single process and supports **up to 200 open tabs** across
+multiple windows while keeping at most **two simultaneous file-writing
+operations** running at once. Clean idle tabs automatically transition to a
+dormant state so open file descriptors stay strictly below 128 and RAM stays
+bounded; clicking a dormant tab rehydrates it automatically. Save As and export
+cannot overwrite a file currently open or being written in another tab.
+
+### Pause indexing and read the Live Resource HUD
+
+When you open a multi-gigabyte file, Quarry shows the first rows immediately and
+indexes the rest in the background:
+
+- Choose **Data → Pause / Resume Indexing** (or use the indexing controls in the
+  status bar) to pause background indexing without holding background worker
+  threads, then resume whenever you are ready.
+- While indexing is paused, you can still inspect, bookmark, and edit already
+  indexed rows. Find and Filter scans note when they reach the current partial
+  index frontier.
+- The **Live Resource HUD** in the bottom-right status bar reports live process
+  memory (`phys_footprint` on macOS, `VmRSS` on Linux), free disk space on the
+  active volume, and open vs. active tab counts without blocking the UI thread.
+
+### Open a section of a huge file
+
+For multi-gigabyte to multi-terabyte files where you only need a slice of the
+file right away, choose **File → Open Section…** (Command+Shift+O on macOS,
+Ctrl+Shift+O on Linux):
+
+1. Pick the file and enter a **From** offset and **Size** (or **To** offset) in
+   `Bytes`, `KiB`, `MiB`, `GiB`, or `TiB`. Quarry computes all offsets in
+   checked 64-bit integer arithmetic (verified on a 20 TiB sparse file).
+2. Quarry snaps boundaries outward to complete logical record boundaries so
+   valid rows are not torn in half.
+3. Inspect the section trust badge in the toolbar:
+   - **`Verified`:** Record boundaries from byte 0 to the section start are
+     proven (for example, sections starting at byte 0 or verified via a full
+     boundary scan). Both **Save** (Guarded Section Splice-Save) and **Save As…**
+     (Save Section As New File) are enabled.
+   - **`Speculative`:** Opened directly at an interior offset without scanning
+     from byte 0. You can browse, filter, bookmark, edit, and **Save As…** (Save
+     Section As New File), while in-place splice-save stays blocked until the
+     boundary is verified.
+4. To upgrade a `Speculative` section to `Verified`, choose **Data → Verify
+   Section Boundary**. Verification runs in the background and can be paused or
+   cancelled cleanly.
+5. Choosing **Save** on a `Verified` section performs a **Guarded Section
+   Splice-Save**, assembling `prefix + edited section + suffix` in private
+   staging (using APFS copy-on-write on macOS or Linux `FICLONE` when supported,
+   with a bounded streaming fallback) and atomically replacing the source only
+   after confirming the source file did not change externally.
+
+### Bookmark rows for quick navigation
+
+Mark rows of interest while inspecting large datasets without modifying the file:
+
+- **Toggle a bookmark:** Press **Command+B** (macOS) or **Ctrl+B** (Linux),
+  right-click a row number in the `#` gutter, choose **Edit → Toggle Bookmark**,
+  or click **Toggle Row** inside the **Bookmarks** popover.
+- **Jump between bookmarks:** Press **Command+] / Command+[** on macOS
+  (**Ctrl+] / Ctrl+[** on Linux), use **Edit → Next Bookmark / Previous Bookmark**,
+  or click any entry in the toolbar's **Bookmarks** popover (`View → Bookmarks…`).
+- **Clear bookmarks:** Choose **Edit → Clear Bookmarks** or click **Clear All**
+  in the **Bookmarks** popover.
+
+Bookmarks are session-only (up to **10,000** per document) and never alter saved
+file bytes. They stay attached across cell edits, filtering, and tab dormancy,
+shift deterministically when you insert or delete rows, and clear cleanly with a
+notice (restorable via Undo) when a full-file Sort or Duplicate removal reorders
+or removes rows.
 
 ### Open compressed files
 
 Quarry opens gzip-compressed delimited files, such as `sales.csv.gz`, read-only.
-Open them like any other file: **Open…**, **Open with Encoding…**, Finder, or
-drag-and-drop.
+Open them like any other file via **File → Open…**, **File → Open with Encoding**,
+Finder on macOS, or CLI arguments.
 
 1. The first rows appear at once. Quarry then decompresses the file once into a
    private temporary copy and indexes it in the same pass. The status bar shows
@@ -353,7 +425,7 @@ The result is UTF-8 without a BOM, uses Main's delimiter and LF record separator
 and correctly quotes embedded delimiters, quotes and line breaks. Original field
 values are preserved. A separate result does not enter either input's Undo
 history. Once opened, it supports normal editing, Undo/Redo, filtering and saving.
-At the eight-tab limit, the saved result remains available until a slot is freed.
+If you have reached the 200-tab limit, the saved result remains available on disk until a tab is closed.
 
 Large joins can need substantial temporary space, especially when duplicate keys
 multiply rows. Choose a suitable **File → Temporary storage…** folder before
@@ -410,26 +482,22 @@ not scan the entire file.
 ### Select and copy data
 
 - Click a cell to select it.
-- Click a number on the left to select the whole displayed row.
-- Press Command+C on macOS.
-- Right-click a cell and choose **Copy** to copy its full decoded value,
-  including embedded newlines.
+- Click a row number in the `#` gutter on the left to select the whole displayed row.
+- Press **Command+C** on macOS or **Ctrl+C** on Linux (or choose **Edit → Copy Selection**) to copy the full decoded value of the selected cell or row, including embedded newlines.
 
 A copied row is serialized as tab-separated text in the underlying file-column
 order, including columns hidden in the current view. Copy is limited to 64 MiB.
 
 ### Add rows and columns
 
-Choose **Insert → Rows…** or **Insert → Columns…** in the toolbar. You can also
-right-click a numbered row and choose **Insert Rows Above… / Below…**, or a
-numbered column and choose **Insert Columns Before… / After…**.
+Choose **Data → Insert Rows…** or **Data → Insert Columns…**.
 
 1. Set the position and number to insert. Positions start at 1; the dialog shows
    the position that adds at the end. Row positions count data rows, excluding
    the header. Column positions follow the numbered **file columns**, including
    hidden columns.
 2. For a file with headers, optionally name the first new column. Additional
-   names start blank and can be renamed directly in the grid.
+   names start blank and can be renamed with **Edit → Rename Selected Column Header…**.
 3. Choose **Insert**. Larger operations first check temporary storage; choose
    **Continue** once the check passes. Counting progress, written bytes and **Cancel** appear in the footer.
 4. Edit new cells as usual. Use **Row → Go** to reach rows added farther down
@@ -458,9 +526,9 @@ An empty file cannot retain columns until it contains a record. The existing
 
 1. Click a numbered row gutter to select one data row.
 2. Shift-click another row number to select a range.
-3. Command-click on macOS, or Ctrl-click on other platforms, to add or remove
+3. Command-click on macOS, or Ctrl-click on Linux, to add or remove
    separate rows.
-4. Right-click a selected row number and choose **Delete Selected Rows**.
+4. Choose **Data → Delete Selected Rows**.
 
 The row selection remains active while you scroll. Deletion creates an unsaved
 working version; it does not change the source until you use **Save**. If the
@@ -476,18 +544,18 @@ deleting rows so every selected number identifies a physical data row.
 
 #### Edit a cell
 
-1. Double-click the cell, or select it and press Enter or F2.
+1. Double-click the cell, or select it and press Enter or F2 (or choose **Edit → Edit Selected Cell…**).
 2. Enter the new value. Use Shift+Enter to insert a newline.
 3. Press Enter to keep the edit, or press Escape to cancel it.
 
 Clicking elsewhere also keeps the active edit. The source file is not changed
-until you choose **Save** from the file menu or press Command+S.
+until you choose **File → Save** (Command+S on macOS, Ctrl+S on Linux).
 
 #### Rename a header
 
-1. Click the header name below its numbered column ruler.
-2. Enter the new name.
-3. Press Enter or click elsewhere to keep it. Press Escape to cancel it.
+1. Select the column in the numbered column ruler.
+2. Choose **Edit → Rename Selected Column Header…**.
+3. Enter the new name and confirm (or press Escape to cancel).
 
 Header editing is available only when the file has a real, text-decodable
 header row.
@@ -554,22 +622,9 @@ disabled until you clear the filter.
 
 ### Filter rows
 
-#### Filter from a cell
-
-Right-click a cell and choose:
-
-- **Filter to This Value** to show rows whose value equals the clicked value.
-- **Filter Out This Value** to exclude rows whose value equals the clicked
-  value.
-- **Copy** to copy the value without filtering.
-
-These actions use the full decoded cell value and inherit the current Filters
-**Match case** setting. They start a new single-rule filter and replace any
-active filter. Use **Filters…** when you need multiple rules.
-
 #### Build one or more rules
 
-1. Click **Filters…**.
+1. Click **Filters** in the toolbar or choose **View → Filters…**.
 2. Open the rule's **Column** picker. Search by name or original one-based
    file-column number, then choose a column. Each result shows its number and
    name, including columns hidden or reordered in the grid.
@@ -661,17 +716,15 @@ Column operations begin from the numbered ruler above the header names:
 
 - Click a number to select one column.
 - Shift-click another number to select a visible range.
-- Command-click on macOS, or Ctrl-click on other platforms, to add or remove
+- Command-click on macOS, or Ctrl-click on Linux, to add or remove
   separate columns.
-- Right-click a numbered ruler to open the column-operation menu. Right-clicking
-  an unselected number selects that column first.
+- Once selected, invoke operations from the **Data** menu (**Sort Rows…**, **Find & Remove Duplicates…**, **Clean Selected Columns…**, **Split Selected Column…**, **Combine Selected Columns…**, **Move Selected Columns…**, **Insert Columns…**, **Delete Selected Columns**) or the matching toolbar buttons (**Sort**, **Duplicates**, **Clean**).
 
 Selected columns are highlighted in the ruler and down the grid.
 
 ### Clean up columns
 
-Select one or more numbered file columns, right-click a selected number, and
-choose **Clean Up Columns…**. Clear any active filters first: cleanup applies
+Select one or more numbered file columns, then choose **Data → Clean Selected Columns…** or click **Clean** in the toolbar. Clear any active filters first: cleanup applies
 to all data rows in the selected columns.
 
 Choose one operation:
@@ -689,10 +742,6 @@ Choose one operation:
   Fields containing only spaces and missing fields in short rows are unchanged.
   To fill whitespace-only fields too, run **Trim leading/trailing whitespace** first.
 
-The before/after preview is a bounded sample of loaded rows, not a scan of the
-whole file. Large values can be omitted from the preview; Apply still processes
-their full values. An unchanged sample does not mean later rows are unchanged.
-
 **Apply** includes pending cell edits and leaves headers, other columns, row
 order and each row's field count intact. The footer reports the exact number of
 changed cells after completion. The change stays unsaved until Save or Save As;
@@ -709,9 +758,9 @@ Use Split to replace one column with multiple columns based on an exact literal
 separator.
 
 1. Select exactly one numbered column.
-2. Right-click its number and choose **Split Columns…**.
+2. Choose **Data → Split Selected Column…**.
 3. Enter a non-empty **Separator**, such as `@`, `,`, or `|`.
-4. Click **OK**.
+4. Click **OK** (or **Split**).
 
 Quarry first scans the data to determine the required output width, then
 returns the result to the ordinary editable grid. The result is unsaved until
@@ -722,9 +771,9 @@ you use **Save** or **Save As…**.
 Use Combine to replace two or more columns with one column.
 
 1. Select at least two numbered columns.
-2. Right-click a selected number and choose **Combine Columns…**.
+2. Choose **Data → Combine Selected Columns…**.
 3. Enter an optional literal **Separator**, such as a space, comma, or hyphen.
-4. Click **OK**.
+4. Click **OK** (or **Combine**).
 
 Values are combined in current document order. A blank separator places the
 values directly next to each other. The completed result is an unsaved change.
@@ -734,7 +783,7 @@ values directly next to each other. The completed result is an unsaved change.
 #### Move columns
 
 1. Select one or more numbered columns.
-2. Right-click a selected number and choose **Move Selected Columns…**.
+2. Choose **Data → Move Selected Columns…**.
 3. Enter the one-based **Destination position** where the selected block should
    begin.
 4. Click **Move**.
@@ -742,7 +791,7 @@ values directly next to each other. The completed result is an unsaved change.
 #### Delete columns
 
 1. Select one or more numbered columns.
-2. Right-click a selected number and choose **Delete Selected Columns**.
+2. Choose **Data → Delete Selected Columns**.
 
 Delete has no separate deletion confirmation. If the storage allowance is at
 least 256 MiB, a preparation dialog checks space before it starts. Click
@@ -752,16 +801,15 @@ is still unchanged until you save.
 then restores the previous layout. **Discard Changes** restores the source
 layout and removes every unsaved change.
 
-For view-only reordering or hiding, use the **Columns…** window instead.
+For view-only reordering or hiding, use the **Columns** popover instead.
 
 ### Find and remove duplicates
 
-1. Select the numbered columns that define a duplicate. Use Command-click to
-   add columns or Shift-click for a range. Select every column to compare entire
-   records.
-2. Right-click a selected number and choose **Find Duplicates…**.
-3. Check the selected-column summary. Choose **Match case** if uppercase and
-   lowercase must match separately, then click **Find duplicates**.
+Compare either selected columns or **whole rows**:
+
+1. Optionally select the numbered columns that define a duplicate (use Command-click on macOS / Ctrl-click on Linux to add columns, or Shift-click for a range).
+2. Choose **Data → Find & Remove Duplicates…** or click **Duplicates** in the toolbar.
+3. Choose whether to compare the selected columns or whole rows, set **Match case** if uppercase and lowercase must match separately, then click **Find duplicates**.
 4. Review **Extra duplicate rows** and **Rows to keep**. The extra count excludes
    the first occurrence of each matching group.
 5. Click **Remove extra rows** to apply the result, or **Cancel** to keep the
@@ -803,17 +851,15 @@ Sort whole rows by one column or by several columns in priority order. For
 example, sort by **Account** first, then **Date** newest first, then **Amount**
 largest first. Each additional level breaks ties from the levels above it.
 
-Text, Number, Date / time, Character count, and Word count compare column values.
+Text, Number, Natural, Date / time, Character count, and Word count compare column values.
 Shuffle and Reverse reorder all data rows and ignore the selected column; they
-are used alone. Select one numbered column to open **Sort Rows…**, then choose
-any additional columns inside the window.
+are used alone.
 
-1. Select exactly one numbered column: the column to sort by for Text, Number, Date / time,
-   Character count, or Word count, or any column for Shuffle or Reverse.
-2. Right-click its number and choose **Sort Rows…**.
-3. Choose a type from **Sort as**:
+1. Optionally select a numbered column to prefill the first sort level, then choose **Data → Sort Rows…** or click **Sort** in the toolbar.
+2. Choose a type from **Sort as**:
    - **Text** (the default): alphabetical text order, such as `1, 10, 2`.
    - **Number**: exact numeric order, such as `1, 2, 10`.
+   - **Natural**: human-friendly alphanumeric order, such as `item2, item10`.
    - **Date / time**: chronological order using an explicit format. Choose
      **Oldest first** or **Newest first**, then select the matching format.
    - **Character count**: shortest or longest values first, including spaces
@@ -824,17 +870,17 @@ any additional columns inside the window.
    - **Shuffle**: randomly reorder all data rows. Each use generates a fresh
      shuffle; equal-looking or duplicate rows remain separate records.
    - **Reverse**: put the last data row first and the first data row last.
-4. Use the **Direction** buttons for Text, Number, Date / time, Character count, or Word count.
+3. Use the **Direction** buttons for Text, Number, Natural, Date / time, Character count, or Word count.
    Shuffle and Reverse operate on the current whole-row order and ignore the
    selected column, so they have no direction control.
-5. For Text, leave **Match case** off to ignore ASCII letter case, or turn it
+4. For Text, leave **Match case** off to ignore ASCII letter case, or turn it
    on for exact case ordering. This option applies only to Text.
-6. Click **Add sort level** for each tie-breaker. Choose its **Then by** column,
+5. Click **Add sort level** for each tie-breaker. Choose its **Then by** column,
    comparison type, direction, and case or date format independently.
    **Move up** and **Move down** change priority; **Remove** deletes a level.
    Up to 16 distinct columns can be used. A duplicate column must be changed or
    removed before sorting.
-7. Review the temporary-disk allowance, then click **Sort**.
+6. Review the temporary-disk allowance, then click **Sort**.
 
 Column choices show their file number and name, including hidden columns.
 Expand **Details** for the first level's value interpretation and ordering rules. The temporary-disk allowance stays above the
@@ -957,13 +1003,21 @@ to 16,384 displayed characters per cell, including escaped line breaks; larger
 values end with `...` to keep very large fields responsive. **Copy** and cell
 editing use the underlying value, not the grid preview.
 
-### Temporary storage and free space
+### Temporary storage, index cache, and free space
 
-Choose **File → Temporary storage…** to select a working folder on a drive
-with enough free space. Use **Choose another folder…**, or enter an existing folder
-and click **Check again**. **Use folder** applies the choice for this app
-session. **Use system temporary folder** restores the default. Quarry checks
-that the folder is available and can create, write, and remove a private file.
+Choose **File → Temporary Storage…** to select a persisted scratch folder on a
+drive with enough free space, or to clear Quarry's local persistent sidecar
+index cache. Use **Choose another folder…**, or enter an existing folder and
+click **Check again**. **Use folder** persists the choice across restarts and
+revalidates permissions before every use. **Use system temporary folder**
+restores the default. Quarry checks that the folder is available and can create,
+write, and remove a private file.
+
+Quarry also maintains an optional local **persistent sidecar index cache** under
+owner-only permissions (`0700`/`0600`) to reopen large unchanged files in
+milliseconds. The cache stores only structural row/byte offsets, file identity,
+and content hashes—never filenames, headers, or cell values—and can be cleared
+in one click from **File → Temporary Storage…**.
 
 Temporary data must stay private. If Quarry reports that the folder cannot
 keep temporary data private, choose another folder or use **Use system
@@ -1011,14 +1065,14 @@ destination folder's capacity. The developer fixture generator is excluded.
 
 ### Save, Save As, and discard
 
-The leftmost toolbar control is the **File** menu. It contains **Open…**,
-**Reload from Disk**, **Save**, **Save As…**, and **Discard Changes**. An amber
-dot on the document's tab and **● Unsaved changes** in the footer identify
-unsaved work.
+Use the **File** menu (or the **Save** / **Save As…** buttons on the right of
+the toolbar) to manage saving and discarding edits. An accent dot on the
+document's tab and the unsaved indicator in the footer identify unsaved work.
 
-On macOS, newly created CSV copies, exports, and recovery files are readable
-and writable only by your account. Saving over an existing file preserves that
-file's permissions. Unfinished output stays private until it is published.
+On macOS and Linux, newly created CSV copies, exports, and recovery files are
+readable and writable only by your account (`0600`). Saving over an existing
+file preserves that file's permissions. Unfinished output stays private until it
+is published.
 
 **Reload from Disk** rereads the current path with the applied format.
 **Reopen with Changes** in the Format menu applies a confirmed delimiter or
@@ -1055,62 +1109,57 @@ independent **Match case** setting:
   equivalent.
 - On: ASCII letter case is compared exactly.
 
-Cell context-menu filters inherit the Filters setting. The duplicate dialog
-starts with **Match case** off each time. Search inside the
-**Columns…** window is always case-insensitive. Split matches its separator
+The duplicate dialog starts with **Match case** off each time. Search inside the
+**Columns** popover is always case-insensitive. Split matches its separator
 exactly, while Combine inserts its separator literally. Neither has a case
 setting.
 
 ## Mouse and keyboard reference
 
-| Action | Mouse or keyboard |
-|---|---|
-| Open files in tabs | **Open…** in the file menu or empty-state target, Command+O |
-| Switch document tabs | Click a tab, Ctrl-Tab, or Ctrl-Shift-Tab |
-| Close the active tab | Tab **×**, **Close Tab**, or Command+W |
-| Jump to a data row | Enter in **Row**, or click **Go** |
-| Edit a cell | Double-click, or select and press Enter or F2 |
-| Keep a cell edit | Enter or click elsewhere |
-| Add a newline inside a cell | Shift+Enter |
-| Cancel a cell or header edit | Escape |
-| Rename a header | Click the header name |
-| Undo a committed change | **Undo**, Command+Z on macOS, or Ctrl+Z elsewhere |
-| Redo a committed change | **Redo**, Command+Shift+Z on macOS, or Ctrl+Shift+Z / Ctrl+Y elsewhere |
-| Copy the selected cell or row | Command+C, or cell context-menu **Copy** |
-| Save | Command+S, or file menu **Save** |
-| Open Find | Command+F, or **Find** |
-| Find the next match | Enter in Find, or **Find Next** |
-| Return to a prior match | Shift+Enter in Find, or **Find Previous** |
-| Close Find | **Close find**, or Escape while a Find field has focus |
-| Move by one page | **Page Up**, **Page Down**, or the matching key |
-| Select a row range | Shift-click numbered rows |
-| Add or remove selected rows | Command-click or Ctrl-click numbered rows |
-| Delete selected rows | Right-click a selected row number, then choose **Delete Selected Rows** |
-| Find duplicate rows | Select numbered columns, right-click a selected number, then choose **Find Duplicates…** |
-| Select a column range | Shift-click numbered columns |
-| Add or remove selected columns | Command-click or Ctrl-click numbered columns |
-| Open a focused context menu | Shift+F10 |
+| Action | macOS | Linux / Omarchy |
+|---|---|---|
+| New window | `Command+N` | `Ctrl+N` |
+| Open files in tabs | `Command+O` | `Ctrl+O` |
+| Open section of a huge file | `Command+Shift+O` | `Ctrl+Shift+O` |
+| Switch document tabs | `Command+Shift+]` / `Command+Shift+[` | `Ctrl+Tab` / `Ctrl+Shift+Tab` |
+| Close tab / Close window | `Command+W` / `Command+Shift+W` | `Ctrl+W` / `Ctrl+Shift+W` |
+| Save / Save As… | `Command+S` / `Command+Shift+S` | `Ctrl+S` / `Ctrl+Shift+S` |
+| Reload from Disk | `Command+R` | `Ctrl+R` |
+| Quit Quarry | `Command+Q` | `Ctrl+Q` |
+| Jump to a data row | Enter in **Row**, or click **Go** | Enter in **Row**, or click **Go** |
+| Edit selected cell | Double-click, `Enter`, or `F2` | Double-click, `Enter`, or `F2` |
+| Keep / Cancel cell edit | `Enter` / `Escape` (`Shift+Enter` for newline) | `Enter` / `Escape` (`Shift+Enter` for newline) |
+| Rename selected column header | **Edit → Rename Selected Column Header…** | **Edit → Rename Selected Column Header…** |
+| Undo / Redo | `Command+Z` / `Command+Shift+Z` | `Ctrl+Z` / `Ctrl+Shift+Z` |
+| Copy selected cell or row | `Command+C` | `Ctrl+C` |
+| Find / Find Next / Find Previous | `Command+F` / `Command+G` / `Command+Shift+G` | `Ctrl+F` / `Ctrl+G` / `Ctrl+Shift+G` |
+| Replace… | `Command+Option+F` | `Ctrl+H` |
+| Toggle row bookmark | `Command+B` or right-click `#` gutter | `Ctrl+B` or right-click `#` gutter |
+| Next / Previous row bookmark | `Command+]` / `Command+[` | `Ctrl+]` / `Ctrl+[` |
+| Move by one page | `Page Up` / `Page Down` | `Page Up` / `Page Down` |
+| Select a row or column range | `Shift+Click` row/column numbers | `Shift+Click` row/column numbers |
+| Add or remove selected rows/columns | `Command+Click` row/column numbers | `Ctrl+Click` row/column numbers |
 
 ## Troubleshooting
 
 | Problem | What to do |
 |---|---|
 | The delimiter or header is wrong | Open **Format**, choose the correct delimiter and header, then click **Reopen with Changes**. Save or discard changes first. |
-| Find or Sort is unavailable | Wait for indexing to finish. To open Sort, select exactly one numbered column and right-click its number. Sort also needs the temporary-disk estimate. |
+| Find or Sort is unavailable | Wait for indexing to finish (or resume paused indexing via **Data → Pause / Resume Indexing**). Sort also needs the temporary-disk estimate. |
 | Cell editing is unavailable | Wait for the current operation to finish. Missing and invalidly encoded cells cannot be edited. For legacy files, select the correct encoding in Format. |
 | Undo or Redo is unavailable | Commit or cancel the inline editor and wait for conflicting operations to finish. Clear filters before structural Undo/Redo. There may be no retained history in that direction. |
 | Filtering is unavailable | Cancel or finish any active search, filter, export, save, or structural change. |
-| A column operation is unavailable | Clear the filter, finish the active operation, and check that the required number of columns is selected. |
-| **Delete Selected Rows** is unavailable | Clear the filter, finish the active operation, and select at least one numbered data row. |
-| **Find Duplicates…** is unavailable | Clear the filter, finish the active operation, and select the numbered columns to compare. Accept or cancel an existing duplicate preview before editing. |
+| A column operation is unavailable | Clear the filter, finish the active operation, and check that the required number of columns is selected in the numbered ruler. |
+| **Delete Selected Rows** is unavailable | Clear the filter, finish the active operation, and select at least one numbered data row in the `#` gutter, then choose **Data → Delete Selected Rows**. |
+| **Find & Remove Duplicates…** is unavailable | Clear the filter and finish the active operation. Accept or cancel an existing duplicate preview before editing. |
+| In-place **Save** is disabled on a section | The section is `Speculative`. Choose **Data → Verify Section Boundary** to prove record boundaries for splice-save, or use **Save As…** to write the section to a new file. |
 | A filter returns no rows | Check the original column number, value or numeric bounds, **Match case** for text rules, and same-column rule logic. Numeric rules skip blank, missing, and invalid values. |
 | A numeric filter bound is rejected | Enter a nonblank dot decimal or scientific number without currency or grouping separators. Between needs two valid bounds in ascending order. |
 | Find is disabled | A filter is active. Open **Filters (N)…** and clear it. |
 | **Replace in Cell** is disabled | Use **Find Next** or **Find Previous** to establish the current matching cell first. |
-| Quarry says the source changed | Use **Discard Changes**, then choose **Reload from Disk** from the file menu. |
+| Quarry says the source changed | Use **File → Discard Changes**, then choose **File → Reload from Disk**. |
 | Save As will not use a path | Choose a destination that does not already exist. |
-| A storage check fails | Reconnect the drive, choose an existing writable folder in File → Temporary storage, or free space and click **Check again**. For Save/export, choose another destination. |
-| A dropped file does not open | Use one local file, and save or discard changes in the current file first. |
+| A storage check fails | Reconnect the drive, choose an existing writable folder in **File → Temporary Storage…**, or free space and click **Check again**. For Save/export, choose another destination. |
 | A long operation is running | Read its progress or phase in the footer. Use the matching Cancel button there if needed. |
 | A long operation appears stuck during sort | Check whether the status says **Merging sorted rows…**. This is a separate merge phase and can take substantial time on very large files. |
 

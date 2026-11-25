@@ -1,321 +1,184 @@
 <p align="center">
-  <img src="assets/quarry-wordmark.png" alt="Quarry" width="480">
+  <img src="assets/quarry-wordmark.png" alt="Quarry" width="380">
 </p>
-
-# Quarry
 
 <p align="center">
-  <strong>A free and open-source macOS editor for large CSV and delimited files, validated at 12 GB and 50 GB.</strong>
+  <strong>A free, open-source, GPU-accelerated desktop and CLI editor for multi-gigabyte CSV, TSV, and delimited text files on macOS and Linux (including Omarchy).</strong>
 </p>
 
-Quarry combines a familiar editable data grid with a bounded Rust engine. Open,
-inspect, search, filter, edit, reshape, and sort files that conventional
-spreadsheet workflows may struggle to load.
+<p align="center">
+  <a href="LICENSE-MIT">MIT</a> OR <a href="LICENSE-APACHE">Apache-2.0</a> ·
+  Zero telemetry &amp; zero network calls ·
+  <a href="docs/USER_GUIDE.md">User Guide</a> ·
+  <a href="docs/LINUX_AND_OMARCHY.md">Linux &amp; Omarchy</a> ·
+  <a href="docs/ROADMAP.md">Roadmap</a> ·
+  <a href="https://github.com/danchamorro/quarry/wiki">Wiki</a>
+</p>
 
-The first rows appear without waiting for the complete file scan. Quarry keeps
-working memory bounded and does not change the source until you choose
-**Save**.
+Quarry opens, searches, filters, cleans, sorts, deduplicates, joins, splices, and edits delimited files that are tens of gigabytes—or terabytes via bounded section windows—without loading the entire file into memory. It is written in native Rust with a GPU-rendered [GPUI](docs/adr/0013-adopt-gpui-desktop-frontend.md) frontend, parallel SIMD structural indexing, bounded out-of-core disk spilling, and atomic file-safety guards.
 
-> **Current status:** [public macOS beta](https://github.com/danchamorro/quarry/releases/tag/v0.1.0-beta.3)
-> for Apple Silicon. Core viewing, editing, transformation, filtering, sorting,
-> and file-safety workflows are implemented. Broader validation remains in progress;
-> see the [release notes](docs/BETA_RELEASE_NOTES.md) and
-> [beta checklist](docs/BETA_RELEASE_CHECKLIST.md).
+---
 
-## Free and open source
+## Screenshots
 
-Quarry's desktop app, Rust engine, and CLI are open source under
-[MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option. All application
-features are available in source builds. There are no paid editions, feature
-paywalls, license keys, or activation requirements.
+### macOS — Light Theme
+*Clean grid with right-aligned tabular numeric typography, session row bookmarks (`Bookmarks (3)`), and the Live Resource HUD (`phys_footprint`, free disk, active tabs).*
 
-Official packaged releases are free of charge. Download the signed and
-notarized [macOS beta](https://github.com/danchamorro/quarry/releases/tag/v0.1.0-beta.3),
-or build and install from source using the instructions below.
+![Quarry on macOS in Light theme](docs/images/quarry-macos-light.png)
 
-Bug reports, documentation improvements, tests, and code contributions are
-welcome. See the [contributing guide](docs/CONTRIBUTING.md) for the development
-workflow and contributor terms. Use the
-[issue tracker](https://github.com/danchamorro/quarry/issues) for questions and
-bug reports; maintainer responses are best effort.
+### macOS — Dark Theme & Session Row Bookmarks
+*WCAG AA Dark palette with the floating `Bookmarks` popover showing byte-offset anchors for quick navigation across large files.*
 
-## Documentation and roadmap
+![Quarry on macOS in Dark theme with Bookmarks popover](docs/images/quarry-macos-dark.png)
 
-Start with the [Wiki](https://github.com/danchamorro/quarry/wiki) for installation,
-common workflows, and answers to frequent questions. The
-[Quarry Roadmap project](https://github.com/users/danchamorro/projects/1) is the
-authoritative home for all future features, later ideas, priorities, and progress.
-Linked [issues](https://github.com/danchamorro/quarry/issues) contain scope and
-acceptance or discovery criteria. Propose a feature through
-[New issue](https://github.com/danchamorro/quarry/issues/new/choose).
+### Linux / Omarchy — Native Wayland on Hyprland
+*Native Wayland rendering (`xwayland: false`) with live Omarchy theme sync (`tokyo-night`), Linux in-window menu bar, multi-tab workspace, and live `VmRSS` telemetry.*
 
-## Why Quarry
+![Quarry on Linux and Omarchy native Wayland with live Omarchy theme sync](docs/images/quarry-omarchy-wayland.png)
 
-- **Start working quickly.** Progressive opening returns useful rows before the
-  structural index reaches the end of the file.
-- **Work in a real editor.** Change cells and headers directly, select numbered
-  columns, reshape data, sort rows, and keep working before saving.
-- **Keep control of the source.** Browsing is read-only, changes remain unsaved
-  until you save them, and cancelled operations publish no partial output.
+---
 
-## Capabilities
+## Free, Open Source, and Local-First
 
-| Area | What Quarry supports |
+- **Dual-licensed under [MIT](LICENSE-MIT) OR [Apache-2.0](LICENSE-APACHE):** Quarry is completely free and open source. Every feature is available in source builds and official releases free of charge—no paid editions, no license keys, no paywalled features, and no Contributor License Agreement (CLA).
+- **100% local execution, zero telemetry:** Quarry makes zero network requests and collects zero telemetry. Release dependency graphs across four build targets, linked binaries, and live offline socket audits verify zero HTTP/TLS/network transport dependencies ([v1.0 Claim Ledger](docs/V1_CLAIM_LEDGER.md)).
+- **Audited third-party attribution:** All bundled third-party notices are checked in and verified under [`packaging/licenses/`](packaging/licenses/AUDIT.md).
+
+---
+
+## What Quarry Can Do Today
+
+| Area | Capabilities on `main` |
 |---|---|
-| Open and navigate | CSV, TSV, pipe, and semicolon delimiters; progressive first rows; continuous scrolling; direct row jumps; page navigation |
-| Document tabs | Up to eight independent files; retain edits, selection, view, filters and background progress; safe per-tab close and session quit; two concurrent file operations |
-| [Compressed files](docs/USER_GUIDE.md#open-compressed-files) | Open gzip (`.gz`) files read-only: first rows at once, then one private decompression and indexing pass; search, filter, export, and inspect; Save As writes an uncompressed, editable copy; corrupt, truncated, and unsupported formats are refused |
-| Combine files | Combine two or more matching saved files in a chosen order; validate every record; keep one header and all data rows; save to a new file with progress and cancellation |
-| [Join files](docs/USER_GUIDE.md#join-files) | Match one to sixteen key pairs across two saved or current documents; choose retained rows and output columns; review duplicates and exact counts; create a separate UTF-8 file |
-| Work with wide files | Horizontal access to every shown column; persistent one-based column numbers; resize and auto-fit; view-only hide, show, and reorder |
-| Find and replace | Literal Find Next and Find Previous, Replace in Cell, and cancellable Replace All across data cells; case-insensitive by default with a per-tool Match case option |
-| Filter and export | Right-click a cell to keep or exclude its exact value; Contains, Equals, Does not equal, exact numeric comparisons, and inclusive Between; same-column alternatives with AND across columns; text is case-insensitive by default with a per-tool Match case option; incremental results; bounded match indexes; cancellable filtered export |
-| Edit | Direct cell and header editing; multiline values; insert blank rows or columns at a chosen position and count; optional new column name; individual edit Undo and Redo; one-level structural history; Discard Changes |
-| Duplicates | Match selected columns, review the extra-row count, then explicitly remove later occurrences; keep the first row in current order; include unsaved values; bounded memory and cancellation |
-| Clean up columns | Trim surrounding Unicode whitespace, convert uppercase/lowercase, or fill existing empty cells in selected columns; sampled preview, exact changed-cell counts and safe Undo/Redo |
-| Reshape columns | Select columns in the grid, then Split, Combine, Move, or delete the selected columns; continue editing the result before saving |
-| Sort | Text, exact Number, explicit Date / time, Character count, and Word count sorting; whole-row Shuffle and Reverse; fixed header; stable equal keys; cancellation and disk preflight |
-| Save safely | Atomic Save; no-clobber Save As; source-change detection; cancellation cleanup; no partial published output |
+| **Desktop & Platforms** | Native GPU-rendered Rust app (`apps/quarry-gpui`) for **macOS** and **Linux / Omarchy** (native Wayland / Hyprland, crisp fractional scaling, XDG portals, AccessKit accessibility on macOS and Linux AT-SPI). |
+| **Themes & Typography** | Built-in **Light**, WCAG AA **Dark**, **System**, and hardened live **Omarchy** theme sync (`View → Theme`). Right-aligned OpenType `tnum` tabular numeric columns and configurable `Show All Whitespace` inspection. |
+| **Multi-Window & Scale** | Single-process multi-window workbench supporting **up to 200 open tabs** with automatic dormant-tab eviction and a strict `< 128` open-file-descriptor cap. |
+| **Engine & Indexing** | Parallel positional `pread`/`seek_read` I/O (no `mmap` on user source files, preventing `SIGBUS` on external truncation), 64-byte SIMD (Apple Silicon NEON / x86_64 AVX2) structural indexing, and an optional privacy-preserving **persistent sidecar index cache** (owner-only `0700`/`0600`, stores only offsets and hashes—never filenames or cell text). |
+| **Large-File Control & Sections** | **Pause / Resume Indexing** without blocking background threads, a **Live Resource HUD** (`phys_footprint` / `VmRSS` and per-volume free disk), and **Open Section…** (`Bytes`–`TiB`, verified on a 20 TiB sparse file) with outward line-boundary snapping, `Verified` vs `Speculative` trust badges, **Verify Section Boundary**, **Save Section As New File**, and `Verified`-only **Guarded Section Splice-Save** (APFS CoW / Linux `FICLONE` with streaming fallback). |
+| **Navigation & Bookmarks** | Direct `Row → Go`, Page Up/Down, and **Session Row Bookmarks** (up to 10,000 bookmarks per document, `#` gutter markers, `Bookmarks` popover, `Cmd/Ctrl+B`, `Cmd/Ctrl+]`, `Cmd/Ctrl+[`, preserved across cell edits, row inserts/deletes, filters, and tab dormancy). |
+| **Editing & Safety** | Direct cell editing (including multiline values), header renaming, **Undo / Redo**, atomic **Save / Save As / Save As UTF-8**, **Discard Changes**, source-modification conflict detection, and **Inspect File & Recovery…** for broken or malformed records. |
+| **Search & Filtering** | Overlay-aware literal **Find**, **Replace in Cell**, and **Replace All**; multi-column **Filters** with text (`Contains`, `Equals`, `Does not equal`) and exact arbitrary-precision decimal numeric rules (`>`, `>=`, `<`, `<=`, `Between`), plus **Export Filtered…**. |
+| **Out-of-Core Transforms** | Adaptive **300 MB** in-RAM fast path with automatic bounded out-of-core disk spilling and a persisted scratch directory (`File → Temporary Storage…`). Stable multi-column **Sort** (1–16 levels: Text, exact Number, Natural, Date / time, Character count, Word count, Shuffle, Reverse), **Find & Remove Duplicates** (selected columns or whole rows), **Clean Selected Columns** (Trim, Collapse spaces, Uppercase, Lowercase, Fill empty), **Split**, **Combine**, **Move**, **Insert**, and **Delete** rows or columns. |
+| **Multi-File & Formats** | **Combine Files…** (exact-schema streaming append), **Join Files…** (Inner, Left, Right, Full with preview and partitioned multi-threaded hash-join + sort-merge skew fallback), direct **`.csv.gz`** reading, and **UTF-8**, **UTF-16 LE/BE**, **Windows-1252**, and **ISO-8859-1** encodings. |
 
-## Install Quarry
+---
 
-For the packaged beta, download the Apple Silicon ZIP from
-[GitHub Releases](https://github.com/danchamorro/quarry/releases/tag/v0.1.0-beta.3),
-extract it, and move `Quarry.app` to Applications. Save your work and quit any
-older copy before replacing it. The beta targets macOS 26 and 27; this archive
-has been tested on macOS 27.2.1, with macOS 26 validation outstanding. See the
-[tester guide](docs/BETA_TESTER_GUIDE.md) for checksums, installation and known limits.
+## Verified Benchmarks
 
-### Build from source
+Measured on real public ClickHouse datasets (`weather`, **9.10 GiB**, 131,990,024 rows; `hacker-news`, **11.84 GiB**, 28,737,558 rows) and synthetic join suites using the headless `quarry-cli` engine on Apple M3 Max (warm OS page cache, `--threads 8`), with 14/14 golden SHA-256 output parity against the Phase 1 single-threaded baseline.
 
-Source builds require macOS, Xcode command line tools, Python 3,
-and the Rust toolchain pinned in `rust-toolchain.toml`. Clone the repository
-with its full Git history:
+| Workload | Weather (9.10 GiB · 132.0M rows) | Hacker News (11.84 GiB · 28.7M rows) | Peak RSS |
+|---|---:|---:|---:|
+| **First 100 rows (bootstrap)** | `0.787 ms` | `0.772 ms` | `4.6 MiB` |
+| **Full structural index (cold sidecar miss)** | `0.311 s` (`29.22 GiB/s`) | `0.472 s` (`25.12 GiB/s`) | `20.2–25.0 MiB` |
+| **Sidecar cache hit + seek to row 100M / 20M** | `19.1 ms` wall (`4.4 ms` cache load) | `20.8 ms` wall (`5.5 ms` cache load) | `5.1–6.2 MiB` |
+| **Random 100-row viewport read (p95)** | `0.231 ms` | `0.325 ms` | — |
+| **Find (absent literal scan)** | `0.303 s` | `0.510 s` | `14.5–23.0 MiB` |
+| **Multi-column AND Filter** | `1.086 s` | `1.617 s` | `17.5–21.8 MiB` |
+| **Replace All (full rewrite)** | `2.800 s` (`60.2×` vs Phase 1) | `2.760 s` (`14.0×` vs Phase 1) | `72.7–73.1 MiB` |
+| **Stable Number Sort (out-of-core)** | `50.968 s` | `38.974 s` | `164.5–172.1 MiB` |
+| **Delete Duplicates (out-of-core)** | `121.441 s` (`2.18×` vs Phase 1) | `75.822 s` (`4.66×` vs Phase 1) | `189.2–194.3 MiB` |
+
+Partitioned multi-threaded **Hash-Join** (with automatic sort-merge skew fallback, 100% SHA-256 oracle parity):
+- **18 GiB large join:** `19.40 s` (`4.99×` faster than sort-merge baseline), `16.30 MiB` peak RSS, `9.68 GB` peak temp disk.
+- **10M rows/side narrow join:** `12.49 s` (`33.8×` faster than sort-merge baseline), `490.52 MiB` peak RSS (under the 512 MiB cap).
+
+<details>
+<summary>Benchmark methodology, reports, and full evidence archive</summary>
+
+- All Phase 2 & 3 CLI measurements above were run on bare-metal Apple M3 Max (warm cache, 8 workers) with full environment metadata and SHA-256 parity tables:
+  - [Phase 2 engine benchmarks (SIMD indexing, sidecar cache, parallel find/filter)](docs/benchmarks/2026-11-21-phase2-engine-benchmarks.md)
+  - [Phase 3 out-of-core benchmarks (parallel sort, dedup, replace-all, 300 MB budget, hash-join)](docs/benchmarks/2026-11-22-phase3-out-of-core-benchmarks.md)
+  - [Phase 4B-3 GPUI cutover verification (macOS ARM64 & Linux/Omarchy Wayland, 200-tab RSS/FD, AT-SPI/AccessKit, zero-socket audit)](docs/benchmarks/2026-11-23-phase4b3-gpui-cutover-verification.md)
+  - [Public ClickHouse dataset setup and reproduction commands](docs/BENCHMARK_DATASETS.md)
+- Historical single-threaded baselines and earlier capability reports:
+  - [2026-09-11 public ClickHouse single-threaded baseline](docs/benchmarks/2026-09-11-public-datasets.md)
+  - [50 GB capability suite](docs/benchmarks/2026-08-22-50gb-capability-suite.md)
+  - [Compressed `.csv.gz` validation](docs/benchmarks/2026-11-20-compressed-files.md)
+  - [All benchmark & validation reports (`docs/benchmarks/`)](docs/benchmarks/)
+
+</details>
+
+---
+
+## Install & Build from Source
+
+Quarry pins its Rust toolchain in [`rust-toolchain.toml`](rust-toolchain.toml) (currently **Rust `1.100.0`**). Install `rustup` first if you do not have it.
+
+### macOS (Current GPUI App from Source)
+
+Build, package, install into `/Applications/Quarry.app`, and verify the local bundle:
 
 ```bash
 git clone https://github.com/danchamorro/quarry.git
 cd quarry
-```
-
-Save or discard any unsaved work and quit Quarry, then install and verify the
-application:
-
-```bash
 ./scripts/macos-app.sh install
 ./scripts/macos-app.sh verify
 open /Applications/Quarry.app
 ```
 
-The installer verifies the new bundle before replacing the active app and
-retains a valid prior build for rollback. See the
-[macOS packaging guide](docs/MACOS_PACKAGING.md) for update, rollback, signing,
-and package-only instructions.
+See [macOS Packaging & Verification](docs/MACOS_PACKAGING.md) for ad-hoc vs Developer ID signing, rollback archives (`./scripts/macos-app.sh rollback`), and third-party license bundling.
 
-## Quick start
+### Linux & Omarchy (Current GPUI App from Source)
 
-1. Install Quarry, then open a CSV, TSV, pipe-delimited, or semicolon-delimited
-   file from Finder, through **Open…** in Quarry's file menu, or by dropping it
-   onto the Quarry window.
-2. Edit the grid directly. Save or discard cell edits before using **Filters…**
-   to narrow or export rows. Use **Save As…** for a checkpoint that preserves the
-   original. Use the numbered column rulers to select columns for reshaping or
-   sorting.
-3. Use **Save** to update the source or **Save As…** to create a separate file.
-
-See the [User guide](docs/USER_GUIDE.md) for navigation, editing, case matching,
-filter rules, column tools, sorting, and safe save behavior.
-
-## Public benchmark datasets
-
-Quarry's official public benchmark inputs are the **Taiwan weather CSV
-(9.10 GiB)** and **Hacker News CSV (11.84 GiB)** from ClickHouse's sample
-datasets. Anyone can download the same files and repeat the measurements.
-
-- [Download, extract, verify, and run the datasets](docs/BENCHMARK_DATASETS.md)
-- [September 11 public dataset results and methodology](docs/benchmarks/2026-09-11-public-datasets.md)
-
-| Measurement | Taiwan weather | Hacker News |
-|---|---:|---:|
-| Data rows | 131,985,329 | 28,737,557 |
-| First 100 parsed rows | 9.541 ms | 2.211 ms |
-| Complete structural index | 34.556 s | 7.947 s |
-| Random 100-row viewport p95 | 4.542 ms | 1.402 ms |
-| Stable Number sort | 141.508 s | 67.258 s |
-| Peak temporary disk during sort | 22.00 GiB | 24.40 GiB |
-
-These are release CLI measurements on an Apple M3 Max with 128 GiB of memory,
-after input checksum reads. Caches were not purged. Sort timings exclude source
-indexing and independent benchmark validation; the report records those
-separately. First-row and viewport times measure engine reads, not GUI rendering.
-
-## Historical performance at 12 GB and 50 GB
-
-Earlier benchmarks used two complementary tracks with different local fixtures.
-These remain evidence for those files and revisions, separate from the public
-dataset suite above:
-
-| Track | What it validates | Dataset |
-|---|---|---|
-| **12 GB feature suite** | Depth across viewing, searching, filtering, exporting, editing, Replace All, Split, Combine, and Sort | Two 12 GB-class fixtures |
-| **50 GB scale suite** | The same bounded architecture across every major full-file engine path at a larger scale | Private 48.25 GiB file with 225,437,755 rows |
-
-The 12 GB track uses an 11.33 GiB viewer file with 117,168,829 rows and a
-separate deterministic 12,000,000,037-byte write fixture with 61,413,211 rows.
-
-### Opening and navigation
-
-| Measurement | 12 GB suite | 50 GB suite |
-|---|---:|---:|
-| First 100 parsed rows | 4.828 ms | 3.085 ms |
-| Complete structural index | 21.521 s | 72.957 s |
-| Index throughput | 539.20 MiB/s | 677.23 MiB/s |
-| Random 100-row viewport p50 | 1.699 ms | 1.263 ms |
-| Random 100-row viewport p95 | 1.843 ms | 1.570 ms |
-| Peak RSS for the viewport run | 14.64 MiB | 5.41 MiB |
-
-### Major full-file operations
-
-| Operation | 12 GB evidence | 50 GB evidence |
-|---|---|---|
-| Find, absent literal | Complete scan in 44.491 s | Complete scan in 121.591 s |
-| Filter, match-retaining | Match-heavy filter: 100,295,554 matches in 42.779 s | Two-rule filter: 5,368,672 matches in 109.659 s |
-| Filtered export | Two-match export in 45.511 s | Zero-match export in 119.399 s |
-| Sparse-edit Save As | Three edits rewritten in 16.581 s | Two edits rewritten in 79.776 s |
-| Replace All | 291,058 replacements in 61.541 s | 1,044,664 replacements in 328.476 s |
-| Split | Explicit two-way rewrite in 65.314 s | Automatic analysis and rewrite in 455.508 s |
-| Combine | Two-column rewrite in 63.289 s | Two-column rewrite in 328.264 s |
-| Stable Sort | 117,168,829 rows by `FIRSTNAME` in 2 min 22.211 s | 225,437,755 rows in 18 min 33.443 s (pre-optimization run) |
-
-Across these full-file operations, the largest reported non-sort peak RSS was
-25.62 MiB at 12 GB and 24.53 MiB at 50 GB. The August 23 12 GB Stable Sort used
-49.89 MiB peak RSS and 25.91 GiB peak temporary disk. The earlier 50 GB sort
-used 19.38 MiB peak RSS and 102.91 GiB peak temporary disk.
-
-These are verified results at two scales, not a controlled scaling contest.
-The fixtures, predicates, cache states, and application revisions differ.
-Operation times exclude later benchmark-only validation passes. macOS caches
-were not purged, so no result is presented as a controlled cold-cache claim.
-The 50 GB sort still proves completion and correctness, but its timing predates
-the adaptive merge optimization and is not a current throughput estimate.
-
-The historical sorting results in this section measure Text mode. Number,
-Date / time, Character count, Word count, Shuffle, and Reverse have separate 1 GB validations
-linked below.
-Numeric filters and their exported results also have a separate 1 GB validation.
-
-<details>
-<summary><strong>Benchmark reports and methodology</strong></summary>
-
-- [12 GB progressive open and navigation](docs/benchmarks/2026-08-14-large-file.md)
-- [12 GB continuous desktop scrolling](docs/benchmarks/2026-08-15-continuous-scroll.md)
-- [12 GB streaming Find](docs/benchmarks/2026-08-15-streaming-search.md)
-- [12 GB streaming Filter](docs/benchmarks/2026-08-16-streaming-filter.md)
-- [12 GB filtered export](docs/benchmarks/2026-08-16-filtered-export.md)
-- [12 GB direct editing and Save As](docs/benchmarks/2026-08-18-direct-cell-editing.md)
-- [12 GB Replace All](docs/benchmarks/2026-08-22-12gb-replace-all.md)
-- [12 GB Split and Combine](docs/benchmarks/2026-08-19-split-join-transformations.md)
-- [Original deterministic stable Sort validation](docs/benchmarks/2026-08-21-stable-text-sort.md)
-- [August 23 12 GB `FIRSTNAME` sort optimization](docs/benchmarks/2026-08-23-12gb-sort-performance.md)
-- [1 GB exact numeric sorting validation](docs/benchmarks/2026-09-04-numeric-sort.md)
-- [Date and time sorting validation in VMPal](docs/benchmarks/2026-10-10-date-time-sorting.md)
-- [1 GB exact numeric filtering and export validation](docs/benchmarks/2026-09-05-numeric-filters.md)
-- [1 GB duplicate matching and removal validation](docs/benchmarks/2026-09-05-find-remove-duplicates.md)
-- [1 GB Character count, Word count, Shuffle, and Reverse validation](docs/benchmarks/2026-09-04-additional-sort-modes.md)
-- [Matching-file combination and 20 GB write cancellation in VMPal](docs/benchmarks/2026-10-10-combine-files.md)
-- [Complete file joining, 18 GiB inputs, skewed keys and native workflows](docs/benchmarks/2026-10-19-join-acceptance.md)
-- [Gzip-compressed files: 18 GiB larger than RAM, cancellation, size limit and corrupt input](docs/benchmarks/2026-11-20-compressed-files.md)
-- [50 GB capability and stress suite](docs/benchmarks/2026-08-22-50gb-capability-suite.md)
-
-</details>
-
-## Safety by default
-
-- Browsing, navigation, Find, Filter, column views, and copy never rewrite the
-  source.
-- Cell edits and structural changes remain sparse or use private working files
-  until an explicit Save or Save As succeeds.
-- Save publishes only after a complete same-directory temporary file is
-  flushed and synchronized. It also checks for external source changes before
-  publication; see the [source guard contract](docs/ARCHITECTURE.md#document-editing-and-persistence).
-- Save As refuses to overwrite an existing destination. Cancellation or
-  failure removes unpublished temporary artifacts.
-- Choose a temporary working folder and review required and available storage
-  before large operations. Document edits, Save, and export check capacity and keep
-  atomic staging on the destination volume. See [temporary storage](docs/USER_GUIDE.md#temporary-storage-and-free-space).
-- Sort checks a conservative temporary-disk allowance and verifies ordering,
-  row preservation, and stable ties before publication.
-
-## How Quarry stays responsive
-
-- The Rust engine scans delimited records incrementally instead of loading the
-  file into an in-memory table.
-- An adaptive structural index stores sparse checkpoints for direct row access
-  without retaining one entry per row.
-- The grid materializes only visible rows plus a small overscan and paints a
-  bounded horizontal column window while keeping every shown column reachable.
-- Find, Filter, export, Replace All, Save, and column transformations use
-  cancellable background workers with bounded buffers.
-- Stable Sort uses disk-backed runs and guarded publication rather than keeping
-  every row in memory.
-
-The production desktop interface uses GPUI (`apps/quarry-gpui`) over the
-frontend-neutral `crates/quarry-workbench` and `crates/quarry-core` crates.
-The data engine remains independent of the UI framework and is exercised
-directly by the benchmark CLI.
-
-## Development
-
-Launch the desktop app directly from Cargo:
+Build and run the native Wayland GPUI app on Linux (`x86_64` or `arm64`) or Omarchy (Hyprland):
 
 ```bash
-cargo run --release -p quarry-gpui -- huge.csv
+git clone https://github.com/danchamorro/quarry.git
+cd quarry
+cargo build --release -p quarry-gpui --locked
+./target/release/quarry-gpui /path/to/file.csv
 ```
 
-Run the benchmark-oriented CLI:
+On Omarchy, select **View → Theme → Omarchy** to follow your active Omarchy theme automatically. See the [Linux & Omarchy Guide](docs/LINUX_AND_OMARCHY.md) for system dependencies, Wayland/Vulkan notes, fractional scaling, and AT-SPI accessibility.
+
+### Prebuilt macOS Beta Snapshot (`v0.1.0-beta.3`)
+
+An earlier signed and notarized Apple Silicon macOS ZIP is available on GitHub Releases:
+
+- [Quarry `v0.1.0-beta.3` (Apple Silicon macOS ZIP)](https://github.com/danchamorro/quarry/releases/tag/v0.1.0-beta.3)
+
+> **Note:** `v0.1.0-beta.3` is an earlier macOS-only pre-GPUI (`egui`) snapshot. Current `main` uses the GPU-accelerated GPUI desktop app for both macOS and Linux/Omarchy; updated signed macOS and Linux release packages will be published once v1.0 cross-platform validation is complete.
+
+### CLI (`quarry-cli`)
+
+Build and run the headless engine CLI on macOS or Linux:
 
 ```bash
-cargo run --release -p quarry-cli --bin quarry-bench -- open huge.csv \
-  --rows 100 --cache-state unknown
+cargo build --release -p quarry-cli --locked
+./target/release/quarry-cli --help
 ```
 
-Generate a deterministic local fixture:
+---
 
-```bash
-cargo run --release -p quarry-cli --bin quarry -- generate \
-  --size 10GB --columns 40 --delimiter , \
-  --output fixtures/generated/test-10gb.csv --seed 1
-```
+## What's Next
 
-The benchmark reports contain the complete reproduction commands, validation
-rules, cache declarations, resource measurements, and limitations.
+Quarry is actively working toward v1.0. High-level upcoming areas include:
 
-## Project documents
+- **Large-File Ergonomics & Streaming:** Adaptive word wrap with automatic scale-back on large files, and opt-in append-only **Live Watch Mode** for growing logs/exports.
+- **Power-User UX & Querying:** Interactive `/` regex & expression query bar, keyboard-first navigation (`hjkl`, `gg`, `G`) and fuzzy Command Palette (`Cmd/Ctrl+K`), Cell Inspector Drawer for embedded JSON/Markdown/stack traces, Smart Copy (`CSV`, `Markdown`, `JSON`, `SQL IN`), multi-row freeze & column pinning, async column summary headers, Focus Mode, and custom TOML themes.
+- **File Split, Combine & Format Conversion:** Guided File Splitter (every N rows or at bookmarked rows with header/footer injection), Combine Files v2 (opt-in column alignment, schema-drift flagging, `_source_file` column), `.csv.zst` support, format converters (`CSV`/`TSV`/`PSV`/`JSON`/`NDJSON`/`Markdown`), and reusable custom CSV format profiles.
+- **Analysis & Data Tools:** Out-of-core Pivot Tables (`SUM`, `AVG`, `COUNT`, `MIN`, `MAX`), Autofill (series/dates) & Flash Fill by example, Combine Lines rollup, Transpose, and Extract Frequent Strings.
+- **Cross-Platform Packaging & Release Verification:** Signed/notarized macOS builds (Apple Silicon and Intel), Linux packages, bare-metal 120 Hz & accessibility verification, and full [v1.0 Claim Ledger](docs/V1_CLAIM_LEDGER.md) reconciliation.
 
-- [Wiki documentation home](https://github.com/danchamorro/quarry/wiki)
-- [Live roadmap project](https://github.com/users/danchamorro/projects/1)
-- [User guide](docs/USER_GUIDE.md)
-- [Product requirements](docs/PRD.md)
-- [Architecture](docs/ARCHITECTURE.md)
-- [Design guide](docs/DESIGN.md)
-- [Product direction](docs/ROADMAP.md)
-- [Priority checklist before beta](docs/PRE_BETA_CHECKLIST.md)
-- [Beta release checklist and testing guidance](docs/BETA_RELEASE_CHECKLIST.md)
-- [Engineering principles](docs/ENGINEERING_PRINCIPLES.md)
-- [Official benchmark datasets and downloads](docs/BENCHMARK_DATASETS.md)
-- [Benchmark archive](docs/benchmarks/)
-- [Contributing](docs/CONTRIBUTING.md)
+Track active issues and priorities in the [Roadmap](docs/ROADMAP.md) and the [Quarry GitHub Project](https://github.com/users/danchamorro/projects/1).
 
-## Built with AI, in the open
+---
 
-Quarry is built with AI coding agents under human product direction. Agents
-implement, benchmark, test, document, and iterate. The human owner sets the
-product vision, evaluates the experience, and accepts the decisions. Source,
-architecture decisions, performance evidence, tests, and commit history remain
-public so the process and results can be inspected.
+## Documentation
+
+- [User Guide](docs/USER_GUIDE.md) — complete desktop workflows, shortcuts (macOS & Linux), filters, sorting, sections, bookmarks, and safety guards
+- [Linux & Omarchy Guide](docs/LINUX_AND_OMARCHY.md) — building, native Wayland/Hyprland ergonomics, live Omarchy theme sync, and AT-SPI
+- [macOS Packaging Guide](docs/MACOS_PACKAGING.md) — bundling, verification, rollback, and signing
+- [Architecture](docs/ARCHITECTURE.md) — streaming engine, parallel positional I/O, SIMD indexing, sidecar cache, bounded memory, and atomic saves
+- [Design System](docs/DESIGN.md) — Light, Dark, and Omarchy semantic palettes, GPUI layout, typography, and accessibility
+- [Architecture Decision Records (`docs/adr/`)](docs/adr/) — key technical decisions (`ADR 0001`–`ADR 0015`)
+- [v1.0 Claim Contract Ledger](docs/V1_CLAIM_LEDGER.md) — quantitative and behavioral engineering contracts with evidence links
+- [Roadmap](docs/ROADMAP.md) & [Changelog](CHANGELOG.md)
+- [Contributing](docs/CONTRIBUTING.md) & [GitHub Wiki](https://github.com/danchamorro/quarry/wiki)
+
+---
 
 ## License
 
-Quarry is dual-licensed under [MIT](LICENSE-MIT) or
-[Apache-2.0](LICENSE-APACHE), at your option (`MIT OR Apache-2.0`). Bundled
-dependencies retain their own licenses; packages include the required
-[third-party notices](packaging/licenses/THIRD_PARTY_NOTICES.html).
+Dual-licensed under [MIT](LICENSE-MIT) OR [Apache-2.0](LICENSE-APACHE), at your option. Third-party notices are maintained in [`packaging/licenses/THIRD_PARTY_NOTICES.html`](packaging/licenses/THIRD_PARTY_NOTICES.html) and audited in [`packaging/licenses/AUDIT.md`](packaging/licenses/AUDIT.md).

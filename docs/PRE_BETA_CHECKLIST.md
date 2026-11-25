@@ -145,7 +145,7 @@ was installed and verified; a native smoke check passed editing, sort,
 Undo/Redo, and exact Save As output with the original source unchanged. This
 smoke check does not repeat the earlier 1 GB or cross-volume measurements.
 Controls and limits are documented in the
-[user guide](USER_GUIDE.md#temporary-storage-and-free-space) and
+[user guide](USER_GUIDE.md#temporary-storage-index-cache-and-free-space) and
 [ADR 0005](adr/0005-temporary-storage.md).
 
 ## Completion and release handoff
@@ -233,7 +233,7 @@ it.
 
 ## Follow-ups that do not block this checklist
 
-- Date/time sorting remains planned in [Phase 6D](ROADMAP.md#phase-6d-date-and-time-sorting-planned).
+- Date/time sorting remains planned in [Phase 6D](ROADMAP_HISTORY.md) (later completed; see [ADR 0008](adr/0008-date-time-sorting.md)).
 - Multi-column sorting.
 - Inserting rows and columns.
 - Editing and deleting rows while a filter is active.

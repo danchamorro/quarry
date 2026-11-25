@@ -67,8 +67,10 @@ sha256sum daily_weather_preprocessed_1896_2023.csv hacknernews.csv
 Compare the weather MD5 values with the table above. The Hacker News source
 page does not publish a checksum. Compare both extracted files' SHA-256 values
 with the measured input identities in the
-[public-dataset benchmark report](benchmarks/2026-09-11-public-datasets.md).
-Matching hashes establish that a repeat run used the same bytes as the report.
+[Phase 2 engine benchmarks](benchmarks/2026-11-21-phase2-engine-benchmarks.md),
+the [Phase 3 out-of-core benchmarks](benchmarks/2026-11-22-phase3-out-of-core-benchmarks.md),
+or the historical [2026-09-11 single-threaded baseline](benchmarks/2026-09-11-public-datasets.md).
+Matching hashes establish that a repeat run used the same bytes as the reports.
 
 ## Repeat the benchmarks
 

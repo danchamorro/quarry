@@ -1,121 +1,76 @@
 # Contributing to Quarry
 
-Quarry is a free and open-source, performance-first project. Contributions are
-welcome under the existing MIT OR Apache-2.0 licenses. All application features
-are available in source builds, and official packaged releases will be free of
-charge when available. See the [project direction](../README.md#free-and-open-source).
+Thank you for your interest in Quarry.
 
-## Priorities
-In the early project, contributions should favor:
-1. Correctness
-2. Large-file scalability
-3. Measured performance
-4. Reliability/data safety
-5. Maintainability
-6. Feature breadth
+Quarry is a free, open-source (`MIT OR Apache-2.0`), local-first desktop and CLI editor for multi-gigabyte CSV, TSV, and delimited text files on **macOS** and **Linux / Omarchy**. There is no Contributor License Agreement (CLA): by submitting a pull request, you agree to license your contributions under the repository's existing `MIT OR Apache-2.0` terms.
 
-## Proposing and tracking work
+Before making substantial changes, read:
 
-The [Quarry Roadmap project](https://github.com/users/danchamorro/projects/1) is
-the authoritative home for every future feature, later idea, and engineering
-investigation. Record each as an issue in the project, even when it is exploratory.
-Use the `idea` label for possibilities needing discovery; agree on scope and
-remove that label when accepting an implementation item. Keep current status,
-priority, area, and release target in Projects. Do not add parallel future-work
-lists to the repository or Wiki. Design documents may link to the relevant issue.
+- [`README.md`](../README.md)
+- [`docs/PRD.md`](PRD.md)
+- [`docs/ARCHITECTURE.md`](ARCHITECTURE.md)
+- [`docs/DESIGN.md`](DESIGN.md)
+- [`docs/ROADMAP.md`](ROADMAP.md)
 
-Search [existing issues](https://github.com/danchamorro/quarry/issues) and the
-[Quarry Roadmap project](https://github.com/users/danchamorro/projects/1) before
-opening a [feature request](https://github.com/danchamorro/quarry/issues/new?template=feature_request.yml).
-Explain the user problem, the smallest useful scope, acceptance criteria, and
-how the workflow scales beyond RAM. Use synthetic examples; public issues must
-not contain production data, credentials, or confidential logs.
+## Repository Layout
 
-Discuss material scope and architectural decisions before implementation.
-Maintainers move work through **Backlog → Ready → In progress → In review → Done**:
-Ready means the scope and acceptance criteria are agreed; Done means the criteria
-are met and the change is merged. A packaged release may follow separately.
-**Priority**, **Area**, and **Target release** support planning. An **Unscheduled**
-release target is not a delivery promise. New repository issues are added to the
-project automatically for triage.
+- `crates/quarry-delimited` — quote-aware streaming delimited scanner and runtime-dispatched 64-byte SIMD structural scanner (Apple Silicon NEON, x86_64 AVX2, scalar fallback).
+- `crates/quarry-core` — streaming engine: parallel positional I/O, persistent sidecar index cache, search, filter, sort, duplicates, join, combine, section windows, guarded splice-save, inspection/recovery, and atomic saves.
+- `crates/quarry-workbench` — frontend-neutral desktop workbench state: document/tab lifecycle, multi-window dormancy scheduler, undo/redo, bookmarks, and semantic Light/Dark/Omarchy theme palettes.
+- `apps/quarry-gpui` — active GPU-rendered Rust desktop application for macOS and Linux/Omarchy ([ADR 0013](adr/0013-adopt-gpui-desktop-frontend.md)).
+- `apps/quarry-cli` — headless CLI (`quarry-cli`) for scripting, validation, and benchmarking.
+- `apps/quarry-appkit` — frozen macOS AppKit comparator retained for historical reference.
+- `docs/` — architecture, design system, user guide, Linux/Omarchy and macOS packaging guides, ADRs, claim ledger, and benchmark reports.
+- `scripts/` — macOS app packaging/verification, third-party notice generation, and benchmark runners.
+- `packaging/` — macOS `Info.plist` and audited third-party license notices.
 
-Link implementation pull requests to their issue. Use `Closes #<number>` only
-when the pull request completes its acceptance criteria; otherwise link the issue
-without closing it. Keep implementation checklists in issues and live status in
-the project, rather than duplicating them in documentation.
+## Development Workflow
 
-The [Wiki](https://github.com/danchamorro/quarry/wiki) is a navigation and onboarding
-layer. Detailed guides, architectural decisions, benchmarks, and release evidence
-remain in `docs/` so they can be reviewed and versioned with the code.
+Quarry pins its Rust toolchain in [`rust-toolchain.toml`](../rust-toolchain.toml) (currently **Rust `1.100.0`**).
 
-## Development expectations
-Rust code should use `rustfmt`, `clippy`, focused tests, clear error handling, and documented unsafe code. Unsafe code is allowed only when justified by measurement and accompanied by invariants and tests.
+### Validation on macOS
 
-UI changes follow the [design guide](DESIGN.md): use the shared theme tokens and
-components, keep Quarry's light-only appearance, and keep VoiceOver labels intact.
-
-## Performance-sensitive changes
-A pull request affecting parsing, indexing, caching, search, viewport access, sorting, or export should include relevant benchmark results.
-
-Include:
-- Machine/CPU/RAM
-- macOS version
-- Rust version/toolchain
-- Release/debug mode
-- Dataset profile and size
-- Cold/warm cache status where relevant
-- Before/after measurements
-
-Do not submit performance claims based only on tiny files.
-
-## Data correctness
-Add regression fixtures/tests for parsing bugs. Important cases include quoted delimiters, escaped quotes, embedded newlines, CRLF/LF, empty fields, empty records, malformed quoting, huge fields, and Unicode boundaries.
-
-## Architecture changes
-Material architectural changes should use an ADR under `docs/adr/` describing context, options considered, decision, consequences, and benchmark evidence when performance-related.
-
-## UI contributions
-The measured UI bake-off selected egui for the production viewer. UI changes
-must keep the engine contract independent, preserve accessibility, and include
-focused interaction regressions. [ADR 0003](adr/0003-select-egui-ui.md) records
-the decision.
-
-## Scope discipline
-Quarry is not trying to become a generic IDE or spreadsheet. Feature proposals should explain how they help the core massive-delimited-file workflow and how they scale beyond RAM.
-
-## Suggested local workflow
 ```bash
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
-cargo build --workspace --release --locked
+./scripts/generate-notices.sh --check
 ```
 
-These commands match the required CI checks and release-build validation.
-Changes to macOS packaging, identity, icons, or bundle resources must also run:
+To build, install, and verify the macOS app bundle:
 
 ```bash
-./scripts/macos-app.sh self-test
 ./scripts/macos-app.sh package
-./scripts/macos-app.sh verify target/package/Quarry.app
+./scripts/macos-app.sh verify
 ```
 
-Installation is not part of the normal contributor loop. Maintainer release
-validation follows the installed-app checklist in
-[`MACOS_PACKAGING.md`](MACOS_PACKAGING.md).
+### Validation on Linux / Omarchy
 
-## Pull requests
-Keep changes focused. Explain the problem, design, tradeoffs, tests, and performance impact. Screenshots are useful for UI work; benchmark tables are useful for engine work.
+`apps/quarry-appkit` is macOS-only, so scope Linux Clippy and test commands to the cross-platform crates:
 
-## Contribution licensing
+```bash
+cargo fmt --all -- --check
+cargo clippy -p quarry-delimited -p quarry-core -p quarry-workbench -p quarry-gpui -p quarry-cli --all-targets --locked -- -D warnings
+cargo test -p quarry-delimited -p quarry-core -p quarry-workbench -p quarry-gpui -p quarry-cli --locked
+cargo build --release -p quarry-gpui --locked
+```
 
-Contributions submitted for inclusion in Quarry are accepted under the same
-[MIT](../LICENSE-MIT) OR [Apache-2.0](../LICENSE-APACHE) terms as the project,
-allowing recipients to choose either license. You retain ownership of your
-contributions. No separate Contributor License Agreement (CLA) or signing
-comment is required.
+See [`docs/LINUX_AND_OMARCHY.md`](LINUX_AND_OMARCHY.md) for required Linux system libraries and Wayland/Hyprland testing details.
 
-Submit only work you have the right to contribute, including any necessary
-employer permission. Identify third-party material, its source, and its license
-in your pull request, and preserve the required notices. This also applies to
-work created with AI assistance; disclose any uncertain provenance for review.
+## Engineering & Design Rules
+
+- **Bounded memory rule:** Never add a feature that loads an entire CSV file into memory just to make it work. Every operation must scale with bounded RAM, explicit disk-spill preflight when needed, and cancellation cleanup.
+- **No `mmap` on user source files:** Use the shared positional `pread`/`seek_read` I/O layer so external truncation produces a clean error instead of `SIGBUS` ([ADR 0001](adr/0001-initial-engine.md)).
+- **Safe writes & source guards:** Preserve atomic staging, no-clobber publication, and source-modification checks ([ADR 0005](adr/0005-temporary-storage.md), [ADR 0015](adr/0015-guarded-section-splice-save.md)).
+- **Zero network / zero telemetry:** Do not introduce HTTP, TLS, telemetry, update-check, or network-transport dependencies into shipping crates.
+- **Frontend & visual consistency:** New UI changes belong in `apps/quarry-gpui` and `crates/quarry-workbench` following [`docs/DESIGN.md`](DESIGN.md). Support all built-in palettes (**Light**, **Dark**, **System**, and **Omarchy**) using the semantic tokens in `crates/quarry-workbench/src/theme.rs`—never hardcode ad-hoc colors—and keep macOS AccessKit and Linux AT-SPI labels accurate.
+- **Third-party notices:** Whenever workspace dependencies or bundled assets change, audit licenses and check `./scripts/generate-notices.sh --check` per [`packaging/licenses/AUDIT.md`](../packaging/licenses/AUDIT.md).
+- **Changelog:** Update [`CHANGELOG.md`](../CHANGELOG.md) in the same PR with concise, plain-English user-facing bullets under the merge date.
+
+## Pull Requests
+
+- Use Conventional Commit titles in plain language (for example, `fix(ui): keep tab labels readable in narrow windows`).
+- Explain the problem and fix concisely in the PR description.
+- Include before/after screenshots (or a short clip for motion/timing) for UI changes, using synthetic data only.
+- Include unit or integration tests covering correctness, edge cases, cancellation, and error handling.
+- Keep `main` green: formatting, strict Clippy, tests, and notice checks must pass before merging.

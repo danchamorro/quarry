@@ -45,7 +45,7 @@ and feedback. Download details are supplied privately to invited testers.
 Follow the [packaging guide](MACOS_PACKAGING.md) for build, signing, installation, and
 rollback procedures. Do not upload app bundles to GitHub.
 
-Quarry's [free and open-source policy](../README.md#free-and-open-source)
+Quarry's [free and open-source policy](../README.md#free-open-source-and-local-first)
 applies to release preparation: official releases are intended to be free of
 charge, and source builds include all application features without paid tiers
 or activation. This direction does not close the candidate acceptance or
@@ -258,7 +258,7 @@ can be shared safely; an original dataset is not required.
 Current boundaries to include in candidate notes:
 
 - One document per application window; CSV append, document tabs, and a terminal
-  interface are future work. See the [ordered follow-ups](ROADMAP.md#post-beta-sequence).
+  interface are future work. See the [roadmap](ROADMAP.md).
 - Editing and deleting rows require clearing an active filter. Unsaved cell
   edits must be saved or discarded before filtering.
 - Structural history retains the adjacent working version. Individual edit

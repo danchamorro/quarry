@@ -43,7 +43,9 @@ on macOS 26 and 27**. Publication was subsequently authorized as a beta with
 the current validation limits documented. Full acceptance on both remains
 follow-up work, not a claim that every version in those families has passed.
 Keep app bundles out of Git source history; upload approved archives as release
-assets. The main application remains egui.
+assets. Note: `v0.1.0-beta.3` (build 167) was the final pre-GPUI (`egui`) macOS
+beta snapshot; `main` has since cut over to the GPU-accelerated GPUI desktop
+application for macOS and Linux/Omarchy ([ADR 0013](adr/0013-adopt-gpui-desktop-frontend.md)).
 
 ## Historical beta 2 acceptance
 
