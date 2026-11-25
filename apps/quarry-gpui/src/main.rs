@@ -165,6 +165,22 @@ impl QuarryWindow {
                 &table,
                 window,
                 |this, table, event, window, cx| match event {
+                    TableEvent::SelectRow(row) => {
+                        if table.read(cx).delegate().take_gutter_mouse_selection(*row) {
+                            return;
+                        }
+                        if let Some(src_row) = table.read(cx).delegate().source_row_at(*row, cx) {
+                            this.controller.update(cx, |controller, cx| {
+                                controller.select_row_keyboard_active(this.window_id, src_row, cx);
+                            });
+                        }
+                    }
+                    TableEvent::ClearSelection => {
+                        table.read(cx).delegate().clear_gutter_mouse_selection();
+                        this.controller.update(cx, |controller, cx| {
+                            controller.clear_selection_active(this.window_id, cx);
+                        });
+                    }
                     TableEvent::SelectCell(row, column) => {
                         if *column == 0 {
                             if table.read(cx).delegate().take_gutter_mouse_selection(*row) {
@@ -1846,7 +1862,7 @@ impl QuarryWindow {
                     )
                     .on_click(move |_, window, cx| {
                         let _ = w_delete.update(cx, |this, cx| {
-                            this.close_grid_context_menu(cx);
+                            this.close_grid_context_menu_and_restore_focus(window, cx);
                             this.delete_selected_columns_action(&DeleteSelectedColumns, window, cx);
                         });
                     }),
@@ -1982,7 +1998,7 @@ impl QuarryWindow {
                     .disabled(!can_delete_rows)
                     .on_click(move |_, window, cx| {
                         let _ = w_del.update(cx, |this, cx| {
-                            this.close_grid_context_menu(cx);
+                            this.close_grid_context_menu_and_restore_focus(window, cx);
                             this.delete_selected_rows_action(&DeleteSelectedRows, window, cx);
                         });
                     }),
@@ -2115,6 +2131,15 @@ impl QuarryWindow {
                     .on_click(move |_, window, cx| {
                         let _ = w_edit.update(cx, |this, cx| {
                             this.close_grid_context_menu(cx);
+                            let current = this
+                                .table
+                                .read(cx)
+                                .delegate()
+                                .cell_at(table_row, table_col, cx);
+                            if current != Some((source_row, source_col)) {
+                                this.restore_grid_focus(window, cx);
+                                return;
+                            }
                             this.edit_cell(table_row, table_col, window, cx);
                         });
                     }),
@@ -4252,6 +4277,8 @@ impl QuarryWindow {
                     let label = if info.filter_done {
                         if info.index_paused {
                             "Filter complete (indexing paused)".into()
+                        } else if info.index_cancelled {
+                            "Filter complete (index cancelled)".into()
                         } else {
                             "Filter complete".into()
                         }
@@ -4272,6 +4299,16 @@ impl QuarryWindow {
                     (label, control, None, info.can_cancel_indexing)
                 } else if info.index_done {
                     ("Index complete".into(), None, None, false)
+                } else if info.index_cancelled {
+                    (
+                        format!(
+                            "Index cancelled ({} rows) · Reload from disk to re-index",
+                            number(info.index_committed_rows)
+                        ),
+                        None,
+                        None,
+                        false,
+                    )
                 } else if info.index_paused {
                     (
                         format!(

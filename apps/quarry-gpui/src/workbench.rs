@@ -108,6 +108,7 @@ pub struct DocumentSnapshot {
     pub selected_rows_count: u64,
     pub selected_columns: Vec<usize>,
     pub index_done: bool,
+    pub index_cancelled: bool,
     pub index_paused: bool,
     pub index_pausing: bool,
     pub index_fraction: f32,
@@ -1089,7 +1090,8 @@ impl WorkbenchController {
             pending_split_confirm_bytes,
             selected_rows_count: doc.selected_rows.count(),
             selected_columns: doc.selected_columns.iter().copied().collect(),
-            index_done: doc.job.is_none() && doc.progress.done,
+            index_done: doc.job.is_none() && doc.progress.done && !doc.progress.cancelled,
+            index_cancelled: doc.job.is_none() && doc.progress.cancelled,
             index_paused: doc.is_indexing_paused(),
             index_pausing: doc.is_indexing_pausing(),
             index_fraction: if active_byte_len == 0 {
@@ -2711,17 +2713,41 @@ impl WorkbenchController {
                     doc.selection = None;
                 }
             } else {
-                doc.selected_rows.select(
-                    source_row,
-                    SelectionModifiers {
-                        shift,
-                        command: toggle,
-                    },
-                );
+                if shift && doc.filter_active() {
+                    let anchor = doc
+                        .selected_rows
+                        .anchor
+                        .or_else(|| doc.selected_rows.first())
+                        .unwrap_or(source_row);
+                    let anchor_ix = doc.filtered_rows.iter().position(|r| r.row == anchor);
+                    let target_ix = doc.filtered_rows.iter().position(|r| r.row == source_row);
+                    if let (Some(a), Some(b)) = (anchor_ix, target_ix) {
+                        let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+                        let matching: Vec<u64> =
+                            doc.filtered_rows[lo..=hi].iter().map(|r| r.row).collect();
+                        doc.selected_rows.select_rows(matching, anchor);
+                    } else {
+                        doc.selected_rows
+                            .select(source_row, SelectionModifiers::NONE);
+                    }
+                } else {
+                    doc.selected_rows.select(
+                        source_row,
+                        SelectionModifiers {
+                            shift,
+                            command: toggle,
+                        },
+                    );
+                }
                 let active_row = doc
                     .selected_rows
                     .contains(source_row)
                     .then_some(source_row)
+                    .or_else(|| {
+                        (0..doc.visible_row_count())
+                            .filter_map(|ix| doc.visible_row(ix).map(|(row, _)| row))
+                            .find(|&row| doc.selected_rows.contains(row))
+                    })
                     .or_else(|| doc.selected_rows.first());
                 doc.selection = active_row.map(|row| GridSelection::Row { row });
                 if !doc.selected_rows.is_empty() {
@@ -2729,6 +2755,17 @@ impl WorkbenchController {
                     doc.column_selection_anchor = None;
                 }
             }
+            cx.notify();
+        }
+    }
+
+    /// Clears cell, row, and column selections on the active document (e.g., on Escape).
+    pub fn clear_selection_active(&mut self, window: WindowId, cx: &mut Context<Self>) {
+        if let Some(doc) = self.active_document_mut(window) {
+            doc.selection = None;
+            doc.selected_rows.clear();
+            doc.selected_columns.clear();
+            doc.column_selection_anchor = None;
             cx.notify();
         }
     }
@@ -4111,13 +4148,16 @@ impl WorkbenchController {
             let (doc_instance, doc_dir, phase, committed_rows, committed_bytes, file_size) =
                 match self.active_document(window) {
                     Some(doc) => {
-                        let phase = if doc.job.is_none() && doc.progress.done {
-                            HudIndexPhase::Complete
-                        } else if doc.is_indexing_paused() {
-                            HudIndexPhase::Paused
-                        } else {
-                            HudIndexPhase::Indexing
-                        };
+                        let phase =
+                            if doc.job.is_none() && doc.progress.done && !doc.progress.cancelled {
+                                HudIndexPhase::Complete
+                            } else if doc.job.is_none() && doc.progress.cancelled {
+                                HudIndexPhase::Cancelled
+                            } else if doc.is_indexing_paused() {
+                                HudIndexPhase::Paused
+                            } else {
+                                HudIndexPhase::Indexing
+                            };
                         (
                             Some(doc.instance_id),
                             doc.logical_path.parent().map(Path::to_path_buf),

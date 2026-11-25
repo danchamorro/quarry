@@ -72,18 +72,24 @@ pub fn render_whitespace(
         let edge = summary.is_some_and(|s| offset < s.leading_end || offset >= s.trailing_start);
         let mark = c.is_whitespace()
             && (all || c != ' ' || leading || repeated || edge || offset + width == bytes.len());
-        let piece: std::borrow::Cow<'static, str> = if mark {
+        let mut char_buf = [0u8; 4];
+        let mut unicode_buf = String::new();
+        let piece: &str = if mark {
             visible_marks = true;
             match c {
-                ' ' => "·".into(),
-                '\t' => "[TAB]".into(),
-                '\r' => "[CR]".into(),
-                '\n' => "[LF]".into(),
-                '\u{a0}' => "[NBSP]".into(),
-                _ => format!("[U+{:04X}]", c as u32).into(),
+                ' ' => "·",
+                '\t' => "[TAB]",
+                '\r' => "[CR]",
+                '\n' => "[LF]",
+                '\u{a0}' => "[NBSP]",
+                _ => {
+                    use std::fmt::Write;
+                    let _ = write!(&mut unicode_buf, "[U+{:04X}]", c as u32);
+                    &unicode_buf
+                }
             }
         } else {
-            c.to_string().into()
+            c.encode_utf8(&mut char_buf)
         };
         let count = piece.chars().count();
         if output_chars + count > max_chars {
@@ -103,7 +109,7 @@ pub fn render_whitespace(
         } else if let Some(mark_start) = current_mark_start.take() {
             mark_ranges.push(mark_start..start);
         }
-        text.push_str(&piece);
+        text.push_str(piece);
         output_chars += count;
         if output_chars <= ellipsis_limit {
             safe_text_len = text.len();

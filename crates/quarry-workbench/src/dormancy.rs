@@ -3005,10 +3005,19 @@ impl WorkbenchScheduler {
                 }
                 Ok(None) => {
                     if doc.save_job.is_none() {
-                        // Save was cancelled cleanly.
+                        // Save was cancelled cleanly; report a terminal outcome so any
+                        // in-flight close/quit review cancels cleanly while keeping edits.
                         any_finished = true;
                         slot.tab.write_destination = None;
                         slot.tab.close_after_save = false;
+                        let notice = doc
+                            .save_status
+                            .take()
+                            .unwrap_or_else(|| "Save cancelled.".into());
+                        results.push(SaveCompletion {
+                            document_id: id,
+                            result: Err(AppMessage::status(notice)),
+                        });
                     }
                 }
                 Err(error) => {

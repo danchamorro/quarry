@@ -4114,6 +4114,25 @@ fn row_copy_works_after_cell_selection_and_under_active_filter(cx: &mut TestAppC
             .unwrap_or_default()
     });
     assert_eq!(copied_navigated, "1\talpha\ta");
+
+    // Shift-selecting across filtered rows (source rows 1 and 3 match; row 2 does not) must
+    // select only the 2 matching rows rather than physical range 1..=3 (count 3).
+    cx.update(|cx| {
+        controller.update(cx, |c, cx| {
+            c.select_row_active(win_id, 3, true, false, cx);
+        });
+    });
+    let filtered_shift_count = cx.update(|cx| {
+        controller
+            .read(cx)
+            .active_snapshot(win_id)
+            .expect("active snapshot")
+            .selected_rows_count
+    });
+    assert_eq!(
+        filtered_shift_count, 2,
+        "Shift-selection under a filter must select only matching rows, not hidden rows between them"
+    );
 }
 
 #[gpui_kit::test]

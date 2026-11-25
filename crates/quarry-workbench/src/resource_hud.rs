@@ -355,6 +355,7 @@ pub enum HudIndexPhase {
     Indexing,
     Paused,
     Complete,
+    Cancelled,
 }
 
 /// Screen-reader announcement emitted strictly on state transitions (never on polling ticks).
@@ -426,6 +427,15 @@ impl HudAnnouncementTracker {
                 (HudIndexPhase::Indexing | HudIndexPhase::Paused, HudIndexPhase::Complete) => {
                     Some(HudAnnouncement {
                         text: format!("Indexing complete ({} rows).", group_digits(committed_rows),),
+                        is_alert: false,
+                    })
+                }
+                (HudIndexPhase::Indexing | HudIndexPhase::Paused, HudIndexPhase::Cancelled) => {
+                    Some(HudAnnouncement {
+                        text: format!(
+                            "Indexing cancelled at row {}. Reload from disk to re-index.",
+                            group_digits(committed_rows),
+                        ),
                         is_alert: false,
                     })
                 }
