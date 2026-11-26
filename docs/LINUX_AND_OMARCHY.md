@@ -25,7 +25,7 @@ Prebuilt Linux tarballs for **`x86_64`** (most desktops and laptops) and **`arm6
 ```bash
 ARCH="x86_64" # or "arm64"
 ARCHIVE="Quarry-v0.2.0-beta.2-linux-${ARCH}.tar.gz"
-grep " $ARCHIVE$" "SHA256SUMS-linux-${ARCH}.txt" | sha256sum -c - &&
+awk -v archive="$ARCHIVE" 'substr($0, 67) == archive' "SHA256SUMS-linux-${ARCH}.txt" | sha256sum -c - &&
   tar -xzf "$ARCHIVE" &&
   cd "${ARCHIVE%.tar.gz}" &&
   ./install.sh
