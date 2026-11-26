@@ -7,6 +7,8 @@
 </p>
 
 <p align="center">
+  <a href="#download--install"><strong>Download</strong></a> ·
+  <a href="https://github.com/danchamorro/quarry/releases">Releases</a> ·
   <a href="LICENSE-MIT">MIT</a> OR <a href="LICENSE-APACHE">Apache-2.0</a> ·
   Zero telemetry &amp; zero network calls ·
   <a href="docs/USER_GUIDE.md">User Guide</a> ·
@@ -16,6 +18,37 @@
 </p>
 
 Quarry opens, searches, filters, cleans, sorts, deduplicates, joins, splices, and edits delimited files that are tens of gigabytes—or terabytes via bounded section windows—without loading the entire file into memory. It is written in native Rust with a GPU-rendered [GPUI](docs/adr/0013-adopt-gpui-desktop-frontend.md) frontend, parallel SIMD structural indexing, bounded out-of-core disk spilling, and atomic file-safety guards.
+
+---
+
+## Download & Install
+
+Prebuilt releases for **macOS (Apple Silicon)** and **Linux / Omarchy (`x86_64` & `arm64`)** are available on [GitHub Releases](https://github.com/danchamorro/quarry/releases) (latest: **[v0.2.0-beta.2](https://github.com/danchamorro/quarry/releases/tag/v0.2.0-beta.2)**)—no Rust toolchain required.
+
+### macOS (Apple Silicon)
+
+1. Download **`Quarry-v0.2.0-beta.2-macos-arm64.dmg`** (or `.zip`) from [GitHub Releases](https://github.com/danchamorro/quarry/releases/tag/v0.2.0-beta.2).
+2. Open the `.dmg` and drag **Quarry** into **Applications**.
+3. Launch **Quarry**—official releases are Developer ID signed, Apple-notarized, and stapled.
+
+Optionally verify the checksum with `shasum -a 256 -c SHA256SUMS-macos-arm64.txt`.
+
+### Linux & Omarchy (`x86_64` & `arm64`)
+
+1. Download **`Quarry-v0.2.0-beta.2-linux-x86_64.tar.gz`** (most desktops/laptops) or **`Quarry-v0.2.0-beta.2-linux-arm64.tar.gz`** along with its `SHA256SUMS-linux-*.txt` from [GitHub Releases](https://github.com/danchamorro/quarry/releases/tag/v0.2.0-beta.2).
+2. Verify, extract, and run the included user installer (no `sudo` required):
+
+```bash
+ARCHIVE="Quarry-v0.2.0-beta.2-linux-x86_64.tar.gz"
+sha256sum -c SHA256SUMS-linux-x86_64.txt &&
+  tar -xzf "$ARCHIVE" &&
+  cd "${ARCHIVE%.tar.gz}" &&
+  ./install.sh
+```
+
+This installs the GPU-rendered desktop app (`~/.local/bin/quarry-gpui`), the headless CLI (`~/.local/bin/quarry`), an XDG launcher entry (**Quarry** in Omarchy's app launcher / Walker and *"Open With"* for `.csv`/`.tsv`), the app icon, and third-party notices into `~/.local/bin` and `${XDG_DATA_HOME:-~/.local/share}`. On Omarchy, choose **View → Theme → Omarchy** to follow your active theme live. To uninstall cleanly (keeping `~/.config/quarry`), run `"${XDG_DATA_HOME:-$HOME/.local/share}/doc/quarry/uninstall.sh"`.
+
+See the [Linux & Omarchy Guide](docs/LINUX_AND_OMARCHY.md) for Wayland/Hyprland, theme sync, system-wide `--prefix /usr/local` installs, and AT-SPI accessibility, or jump to [Build from Source](#build-from-source) below.
 
 ---
 
@@ -100,42 +133,6 @@ Partitioned multi-threaded **Hash-Join** (with automatic sort-merge skew fallbac
   - [All benchmark & validation reports (`docs/benchmarks/`)](docs/benchmarks/)
 
 </details>
-
----
-
-## Download & Install
-
-Prebuilt betas are published on [GitHub Releases](https://github.com/danchamorro/quarry/releases) (no Rust toolchain required).
-
-### macOS (Apple Silicon)
-
-1. Download **`Quarry-<tag>-macos-arm64.dmg`** (or `.zip`) from the [latest GitHub Release](https://github.com/danchamorro/quarry/releases).
-2. Open the `.dmg` and drag **Quarry** into **Applications**.
-3. Launch **Quarry**—official releases are Developer ID signed, Apple-notarized, and stapled.
-
-Optionally verify your download against `SHA256SUMS-macos-arm64.txt`:
-
-```bash
-shasum -a 256 -c SHA256SUMS-macos-arm64.txt
-```
-
-### Linux & Omarchy (`x86_64` & `arm64`)
-
-Prebuilt Linux tarballs (`Quarry-<tag>-linux-x86_64.tar.gz` and `Quarry-<tag>-linux-arm64.tar.gz`) are built in CI for upcoming releases starting with `v0.2.0-beta.2` (use `./scripts/linux-app.sh install` under [Build from Source](#linux--omarchy-from-source) if no Linux archive is attached to the latest release yet):
-
-1. Download **`Quarry-<tag>-linux-x86_64.tar.gz`** (most desktops/laptops) or **`Quarry-<tag>-linux-arm64.tar.gz`** from [GitHub Releases](https://github.com/danchamorro/quarry/releases).
-2. Extract and run the included user installer (no `sudo` required):
-
-```bash
-ARCHIVE="Quarry-<tag>-linux-x86_64.tar.gz"
-tar -xzf "$ARCHIVE" &&
-  cd "${ARCHIVE%.tar.gz}" &&
-  ./install.sh
-```
-
-This installs the GPU-rendered desktop app (`~/.local/bin/quarry-gpui`), the headless CLI (`~/.local/bin/quarry`), an XDG launcher entry (`Quarry` in Omarchy's app launcher / Walker and *"Open With"* for `.csv`/`.tsv`), the app icon, and third-party notices into `~/.local/bin` and `${XDG_DATA_HOME:-~/.local/share}`. On Omarchy, choose **View → Theme → Omarchy** to follow your active theme live. To uninstall cleanly (keeping `~/.config/quarry`), run `${XDG_DATA_HOME:-~/.local/share}/doc/quarry/uninstall.sh`.
-
-See the [Linux & Omarchy Guide](docs/LINUX_AND_OMARCHY.md) for Wayland/Hyprland, theme sync, runtime library notes, and AT-SPI accessibility.
 
 ---
 
