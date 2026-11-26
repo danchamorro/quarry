@@ -1,0 +1,220 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to build/draft (e.g. v0.2.0-beta.1)"
+        required: true
+        type: string
+      previous_tag:
+        description: "Previous tag for CHANGELOG diff (auto-detected if empty)"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  draft-release:
+    runs-on: macos-latest
+    permissions:
+      contents: write
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      commit_sha: ${{ steps.meta.outputs.commit_sha }}
+      is_prerelease: ${{ steps.meta.outputs.is_prerelease }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', github.event.inputs.tag) || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@d5e4d57b030548f435d0befec15ff413a2c60eff # 1.100.0
+      - name: Resolve release metadata
+        id: meta
+        env:
+          INPUT_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+          EVENT_NAME: ${{ github.event_name }}
+          TRIGGER_SHA: ${{ github.sha }}
+        run: |
+          TAG="$INPUT_TAG"
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "error: invalid release tag '$TAG' (expected vX.Y.Z or vX.Y.Z-prerelease)" >&2
+            exit 1
+          fi
+          TAG_COMMIT="$(git rev-parse --verify "refs/tags/$TAG^{commit}")"
+          HEAD_COMMIT="$(git rev-parse --verify HEAD)"
+          if [[ "$EVENT_NAME" == "push" && "$HEAD_COMMIT" != "$TRIGGER_SHA" ]]; then
+            echo "error: checked-out HEAD ($HEAD_COMMIT) does not match triggering commit ($TRIGGER_SHA)" >&2
+            exit 1
+          fi
+          if [[ "$TAG_COMMIT" != "$HEAD_COMMIT" ]]; then
+            echo "error: checked-out HEAD ($HEAD_COMMIT) does not match tag $TAG ($TAG_COMMIT)" >&2
+            exit 1
+          fi
+          IS_PRE=false
+          if [[ "$TAG" == *-* ]]; then
+            IS_PRE=true
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "commit_sha=$HEAD_COMMIT" >> "$GITHUB_OUTPUT"
+          echo "is_prerelease=$IS_PRE" >> "$GITHUB_OUTPUT"
+      - name: Verify reviewed macOS notice inventory
+        run: ./scripts/generate-notices.sh --release-check
+      - name: Verify release note extractor tests
+        run: python3 -B scripts/test_extract_release_notes.py
+      - name: Extract release notes from CHANGELOG.md
+        env:
+          TAG: ${{ steps.meta.outputs.tag }}
+          PREV: ${{ github.event.inputs.previous_tag }}
+        run: |
+          ARGS=(--tag "$TAG" --output release-notes.md)
+          if [[ -n "$PREV" ]]; then
+            ARGS+=(--since-tag "$PREV")
+          fi
+          python3 -B scripts/extract-release-notes.py "${ARGS[@]}"
+          cat release-notes.md
+      - name: Create or update Draft GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          IS_PRE: ${{ steps.meta.outputs.is_prerelease }}
+        run: |
+          TITLE="Quarry ${TAG#v}"
+          PRE_FLAG=()
+          if [[ "$IS_PRE" == "true" ]]; then
+            PRE_FLAG+=(--prerelease)
+          fi
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            IS_DRAFT="$(gh release view "$TAG" --json isDraft --jq '.isDraft')"
+            if [[ "$IS_DRAFT" != "true" ]]; then
+              echo "error: release $TAG is already published; refusing to overwrite or convert it back to a draft." >&2
+              exit 1
+            fi
+            gh release edit "$TAG" --title "$TITLE" --notes-file release-notes.md --draft
+          else
+            gh release create "$TAG" \
+              --title "$TITLE" \
+              --notes-file release-notes.md \
+              --draft \
+              "${PRE_FLAG[@]}"
+          fi
+
+  macos-arm64-release:
+    needs: draft-release
+    runs-on: macos-latest
+    environment: release
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.draft-release.outputs.commit_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify checked-out commit matches release tag
+        env:
+          TAG: ${{ needs.draft-release.outputs.tag }}
+          EXPECTED_SHA: ${{ needs.draft-release.outputs.commit_sha }}
+        run: |
+          TAG_COMMIT="$(git rev-parse --verify "refs/tags/$TAG^{commit}")"
+          HEAD_COMMIT="$(git rev-parse --verify HEAD)"
+          if [[ "$HEAD_COMMIT" != "$EXPECTED_SHA" || "$TAG_COMMIT" != "$EXPECTED_SHA" ]]; then
+            echo "error: commit mismatch (HEAD=$HEAD_COMMIT, tag $TAG=$TAG_COMMIT, expected=$EXPECTED_SHA)" >&2
+            exit 1
+          fi
+      - uses: dtolnay/rust-toolchain@d5e4d57b030548f435d0befec15ff413a2c60eff # 1.100.0
+      - name: Check signing secret availability
+        id: signing
+        env:
+          TAG: ${{ needs.draft-release.outputs.tag }}
+          P12_B64: ${{ secrets.MACOS_DEVELOPER_ID_P12_BASE64 }}
+          P12_PASS: ${{ secrets.MACOS_DEVELOPER_ID_P12_PASSWORD }}
+          KEY_B64: ${{ secrets.APPLE_API_KEY_P8_BASE64 }}
+          KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+        run: |
+          if [[ -n "$P12_B64" && -n "$P12_PASS" && -n "$KEY_B64" && -n "$KEY_ID" && -n "$ISSUER_ID" ]]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            cat >> "$GITHUB_STEP_SUMMARY" <<EOF
+          ### Local Keychain Signing Mode (CI Secrets Not Configured)
+
+          Draft release \`${TAG}\` has been created from \`CHANGELOG.md\`.
+          To sign, notarize, staple, and upload the Apple Silicon macOS release locally using your Keychain \`quarry-notary\` profile:
+
+          \`\`\`bash
+          ./scripts/macos-app.sh release --tag "${TAG}"
+          gh release upload "${TAG}" \\
+            "target/release-artifacts/${TAG}/Quarry-${TAG}-macos-arm64.dmg" \\
+            "target/release-artifacts/${TAG}/Quarry-${TAG}-macos-arm64.zip" \\
+            "target/release-artifacts/${TAG}/SHA256SUMS-macos-arm64.txt" \\
+            --clobber
+          # Then verify the quarantined download inside macOS VM 1 before publishing.
+          \`\`\`
+
+          To enable automatic CI signing/notarization in the future, add these secrets to the GitHub \`release\` environment:
+          \`MACOS_DEVELOPER_ID_P12_BASE64\`, \`MACOS_DEVELOPER_ID_P12_PASSWORD\`, \`APPLE_API_KEY_P8_BASE64\`, \`APPLE_API_KEY_ID\`, \`APPLE_API_ISSUER_ID\`.
+          EOF
+          fi
+      - name: Import Developer ID certificate and notary key
+        if: steps.signing.outputs.enabled == 'true'
+        env:
+          P12_B64: ${{ secrets.MACOS_DEVELOPER_ID_P12_BASE64 }}
+          P12_PASS: ${{ secrets.MACOS_DEVELOPER_ID_P12_PASSWORD }}
+          KEY_B64: ${{ secrets.APPLE_API_KEY_P8_BASE64 }}
+        run: |
+          KEYCHAIN_PATH="$RUNNER_TEMP/quarry-release.keychain-db"
+          KEYCHAIN_PASS="$(uuidgen)"
+          P12_PATH="$RUNNER_TEMP/developer-id.p12"
+          API_KEY_PATH="$RUNNER_TEMP/AuthKey.p8"
+          echo "$P12_B64" | base64 --decode > "$P12_PATH"
+          echo "$KEY_B64" | base64 --decode > "$API_KEY_PATH"
+          chmod 600 "$P12_PATH" "$API_KEY_PATH"
+          security create-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN_PATH"
+          security import "$P12_PATH" -P "$P12_PASS" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security list-keychain -d user -s "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASS" "$KEYCHAIN_PATH"
+          rm -f "$P12_PATH"
+          echo "APPLE_API_KEY_PATH=$API_KEY_PATH" >> "$GITHUB_ENV"
+          echo "QUARRY_RELEASE_KEYCHAIN=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
+      - name: Build, sign, notarize, and staple macOS ARM64 artifacts
+        if: steps.signing.outputs.enabled == 'true'
+        env:
+          TAG: ${{ needs.draft-release.outputs.tag }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+        run: |
+          cargo fetch --locked
+          ./scripts/macos-app.sh release --tag "$TAG"
+      - name: Upload signed macOS artifacts to Draft Release
+        if: steps.signing.outputs.enabled == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.draft-release.outputs.tag }}
+        run: |
+          OUT="target/release-artifacts/$TAG"
+          gh release upload "$TAG" \
+            "$OUT/Quarry-$TAG-macos-arm64.dmg" \
+            "$OUT/Quarry-$TAG-macos-arm64.zip" \
+            "$OUT/SHA256SUMS-macos-arm64.txt" \
+            --clobber
+      - name: Clean up temporary signing credentials
+        if: always() && steps.signing.outputs.enabled == 'true'
+        run: |
+          if [[ -n "${QUARRY_RELEASE_KEYCHAIN:-}" ]]; then
+            security delete-keychain "$QUARRY_RELEASE_KEYCHAIN" || true
+          fi
+          rm -f "${APPLE_API_KEY_PATH:-}" "$RUNNER_TEMP/developer-id.p12"

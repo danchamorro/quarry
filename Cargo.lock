@@ -5488,7 +5488,7 @@ dependencies = [
 
 [[package]]
 name = "quarry-appkit"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "objc2 0.6.4",
  "objc2-app-kit 0.3.2",
@@ -5498,7 +5498,7 @@ dependencies = [
 
 [[package]]
 name = "quarry-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "flate2",
  "libc",
@@ -5507,7 +5507,7 @@ dependencies = [
 
 [[package]]
 name = "quarry-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "flate2",
  "libc",
@@ -5520,14 +5520,14 @@ dependencies = [
 
 [[package]]
 name = "quarry-delimited"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "memchr",
 ]
 
 [[package]]
 name = "quarry-gpui"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "gpui-kit",
  "quarry-core",
@@ -5537,7 +5537,7 @@ dependencies = [
 
 [[package]]
 name = "quarry-workbench"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "flate2",
  "quarry-core",

@@ -12,11 +12,14 @@ parentheses are GitHub pull requests.
 
 ### Added
 
+- Added `./scripts/macos-app.sh release` to build, Developer ID sign, Apple-notarize, staple, and checksum Apple Silicon `.dmg` and `.zip` release artifacts using either the local Keychain profile or CI credentials. (#223)
+- Added a tag-triggered GitHub Actions release workflow (`.github/workflows/release.yml`) and changelog extractor (`scripts/extract-release-notes.py`) that create Draft GitHub Releases directly from `CHANGELOG.md`. (#223)
 - Added opt-in adaptive word wrap for grid cells via **View → Word Wrap**, `Option+Z` (macOS) / `Alt+Z` (Linux), and the toolbar **Wrap** toggle, displaying up to two wrapped lines per row while preserving top-row scroll position and bounded frame budgets. (#221)
 - Added a configurable word-wrap auto-disable file-size threshold (default `300 MB`, with one-click per-tab override) under **File → Temporary Storage…** that persists across restarts. (#221)
 
 ### Changed
 
+- Bumped the Quarry workspace version from `0.1.0` to `0.2.0` for the GPUI beta series and refreshed third-party license notices accordingly (zero third-party dependency changes). (#223)
 - Scoped GitHub Actions `push` triggers to `main` and enabled `cancel-in-progress` workflow concurrency for pull requests so superseded commits no longer exhaust macOS runner slots. (#222)
 
 ## [2026-11-25]
