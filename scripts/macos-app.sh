@@ -519,6 +519,13 @@ release_app() {
     fi
     [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] \
         || fail "release tag must match vX.Y.Z or vX.Y.Z-prerelease: $tag"
+    local tag_commit
+    if tag_commit="$(git -C "$ROOT" rev-parse --verify "refs/tags/$tag^{commit}" 2>/dev/null)"; then
+        [[ "$tag_commit" == "$revision" ]] \
+            || fail "tag $tag points to $tag_commit, not packaged HEAD $revision (check out $tag first)."
+    else
+        fail "git tag $tag does not exist locally; create tag $tag on $revision before cutting a release."
+    fi
     if [[ -z "$out_dir" ]]; then
         out_dir="$ROOT/target/release-artifacts/$tag"
     fi

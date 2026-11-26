@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import importlib.util
+import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -68,6 +70,59 @@ class ExtractReleaseNotesTests(unittest.TestCase):
         )
         self.assertEqual(dates, ["2026-11-26", "2026-11-25", "2026-11-21"])
         self.assertIn("- Old beta 3 feature. (#147)", grouped["Added"])
+
+    def test_diff_since_previous_changelog_handles_same_day_releases(self) -> None:
+        previous = """# Changelog
+
+## [2026-11-26]
+
+### Added
+
+- Earlier same-day entry. (#220)
+"""
+        current = """# Changelog
+
+## [2026-11-26]
+
+### Added
+
+- Newer same-day entry. (#224)
+- Earlier same-day entry. (#220)
+"""
+        notes = MOD.format_release_notes(
+            current,
+            tag="v0.2.0-beta.2",
+            previous_tag="v0.2.0-beta.1",
+            previous_changelog_text=previous,
+        )
+        self.assertIn("- Newer same-day entry. (#224)", notes)
+        self.assertNotIn("Earlier same-day entry", notes)
+        self.assertIn("(2026-11-26)", notes)
+
+    def test_previous_tag_for_selects_ancestor_not_newer_tag(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="quarry-tag-test-") as tmp:
+            repo = Path(tmp)
+            env = {
+                "GIT_AUTHOR_NAME": "Test",
+                "GIT_AUTHOR_EMAIL": "test@example.com",
+                "GIT_COMMITTER_NAME": "Test",
+                "GIT_COMMITTER_EMAIL": "test@example.com",
+            }
+            subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+            for idx, tag in enumerate(["v0.1.0", "v0.2.0", "v0.3.0"], start=1):
+                (repo / "f.txt").write_text(f"{idx}\n", encoding="utf-8")
+                subprocess.run(["git", "add", "f.txt"], cwd=repo, check=True)
+                subprocess.run(
+                    ["git", "commit", "-q", "-m", f"commit {tag}"],
+                    cwd=repo,
+                    env=env,
+                    check=True,
+                )
+                subprocess.run(["git", "tag", tag], cwd=repo, env=env, check=True)
+
+            self.assertEqual(MOD.previous_tag_for(repo, "v0.2.0"), "v0.1.0")
+            self.assertEqual(MOD.previous_tag_for(repo, "v0.3.0"), "v0.2.0")
+            self.assertIsNone(MOD.previous_tag_for(repo, "v0.1.0"))
 
     def test_format_release_notes_includes_compare_link_and_groups(self) -> None:
         notes = MOD.format_release_notes(

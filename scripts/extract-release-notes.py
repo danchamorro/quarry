@@ -16,21 +16,53 @@ GROUP_HEADING_RE = re.compile(r"^### (Added|Changed|Removed|Fixed|Security)\s*$"
 GROUP_ORDER = ("Added", "Changed", "Removed", "Fixed", "Security")
 
 
-def previous_tag_for(repo_root: Path, current_tag: str | None) -> str | None:
-    """Return the most recent `v*` tag before `current_tag` (or latest `v*` tag)."""
+def ref_exists(repo_root: Path, ref: str) -> bool:
     result = subprocess.run(
-        ["git", "-C", str(repo_root), "tag", "--list", "v*", "--sort=-creatordate"],
+        ["git", "-C", str(repo_root), "rev-parse", "--verify", f"{ref}^{{commit}}"],
         text=True,
         capture_output=True,
         check=False,
     )
-    if result.returncode != 0:
+    return result.returncode == 0
+
+
+def previous_tag_for(repo_root: Path, current_tag: str | None) -> str | None:
+    """Return the nearest reachable predecessor `v*` tag before `current_tag` (or HEAD)."""
+    target_ref = current_tag if (current_tag and ref_exists(repo_root, current_tag)) else "HEAD"
+    parent_ref = f"{target_ref}^" if ref_exists(repo_root, f"{target_ref}^") else target_ref
+    described = subprocess.run(
+        ["git", "-C", str(repo_root), "describe", "--tags", "--abbrev=0", "--match", "v*", parent_ref],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if described.returncode == 0:
+        candidate = described.stdout.strip()
+        if candidate and candidate != current_tag:
+            return candidate
+
+    merged = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo_root),
+            "tag",
+            "--merged",
+            parent_ref,
+            "--list",
+            "v*",
+            "--sort=-creatordate",
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if merged.returncode != 0:
         return None
-    tags = [line.strip() for line in result.stdout.splitlines() if line.strip()]
-    for tag in tags:
-        if current_tag and tag == current_tag:
-            continue
-        return tag
+    for line in merged.stdout.splitlines():
+        tag = line.strip()
+        if tag and tag != current_tag:
+            return tag
     return None
 
 
@@ -46,6 +78,17 @@ def tag_commit_date(repo_root: Path, tag: str) -> str | None:
         return None
     date_str = result.stdout.strip()
     return date_str if re.fullmatch(r"\d{4}-\d{2}-\d{2}", date_str) else None
+
+
+def read_changelog_at_ref(repo_root: Path, ref: str, rel_path: str = "CHANGELOG.md") -> str | None:
+    """Read `CHANGELOG.md` from a Git ref, or None if unavailable."""
+    result = subprocess.run(
+        ["git", "-C", str(repo_root), "show", f"{ref}:{rel_path}"],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    return result.stdout if result.returncode == 0 else None
 
 
 def extract_sections(
@@ -96,21 +139,72 @@ def extract_sections(
     return included_dates, grouped
 
 
+def extract_diff_since_changelog(
+    current_text: str,
+    previous_text: str,
+) -> tuple[list[str], dict[str, list[str]]]:
+    """Extract bullets added to `current_text` relative to `previous_text`, even on the same date."""
+    _, prev_grouped = extract_sections(previous_text)
+    prev_bullets: dict[str, set[str]] = {
+        group: set(bullets) for group, bullets in prev_grouped.items()
+    }
+
+    included_dates: list[str] = []
+    grouped: dict[str, list[str]] = {group: [] for group in GROUP_ORDER}
+    current_date: str | None = None
+    current_group: str | None = None
+    pending_bullets: list[tuple[str, str, str]] = []
+
+    for raw_line in current_text.splitlines():
+        line = raw_line.rstrip()
+        date_match = DATE_HEADING_RE.match(line)
+        if date_match:
+            current_date = date_match.group(1)
+            current_group = None
+            continue
+        group_match = GROUP_HEADING_RE.match(line)
+        if group_match:
+            current_group = group_match.group(1)
+            continue
+        if current_date is None or current_group is None:
+            continue
+        if line.startswith("- "):
+            pending_bullets.append((current_date, current_group, line))
+        elif line.startswith("  ") and pending_bullets:
+            d, g, prev_line = pending_bullets[-1]
+            pending_bullets[-1] = (d, g, prev_line + " " + line.strip())
+
+    seen_dates: set[str] = set()
+    for date_str, group, bullet in pending_bullets:
+        if bullet in prev_bullets[group]:
+            continue
+        grouped[group].append(bullet)
+        if date_str not in seen_dates:
+            seen_dates.add(date_str)
+            included_dates.append(date_str)
+
+    return included_dates, grouped
+
+
 def format_release_notes(
     changelog_text: str,
     *,
     tag: str | None = None,
     previous_tag: str | None = None,
+    previous_changelog_text: str | None = None,
     since_date: str | None = None,
     include_since_date: bool = False,
     repo: str = "danchamorro/quarry",
 ) -> str:
     """Format extracted CHANGELOG entries into GitHub Release Markdown."""
-    dates, grouped = extract_sections(
-        changelog_text,
-        since_date=since_date,
-        include_since_date=include_since_date,
-    )
+    if previous_changelog_text is not None and since_date is None:
+        dates, grouped = extract_diff_since_changelog(changelog_text, previous_changelog_text)
+    else:
+        dates, grouped = extract_sections(
+            changelog_text,
+            since_date=since_date,
+            include_since_date=include_since_date,
+        )
 
     lines: list[str] = []
     if tag and previous_tag:
@@ -165,11 +259,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--tag", help="Release tag being prepared (e.g. v0.2.0-beta.1)")
     parser.add_argument(
         "--since-tag",
-        help="Previous release tag (auto-detected from Git tags when omitted)",
+        help="Previous release tag (auto-detected from Git ancestry when omitted)",
     )
     parser.add_argument(
         "--since-date",
-        help="Explicit YYYY-MM-DD cutoff date (overrides --since-tag lookup)",
+        help="Explicit YYYY-MM-DD cutoff date (overrides tag-based changelog diff)",
     )
     parser.add_argument(
         "--include-since-date",
@@ -182,14 +276,18 @@ def main(argv: list[str] | None = None) -> int:
 
     previous_tag = args.since_tag or previous_tag_for(ROOT, args.tag)
     since_date = args.since_date
+    previous_changelog_text = None
     if since_date is None and previous_tag:
-        since_date = tag_commit_date(ROOT, previous_tag)
+        previous_changelog_text = read_changelog_at_ref(ROOT, previous_tag)
+        if previous_changelog_text is None:
+            since_date = tag_commit_date(ROOT, previous_tag)
 
     text = args.changelog.read_text(encoding="utf-8")
     notes = format_release_notes(
         text,
         tag=args.tag,
         previous_tag=previous_tag,
+        previous_changelog_text=previous_changelog_text,
         since_date=since_date,
         include_since_date=args.include_since_date,
         repo=args.repo,

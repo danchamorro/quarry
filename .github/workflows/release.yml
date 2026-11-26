@@ -83,6 +83,11 @@ jobs:
             PRE_FLAG+=(--prerelease)
           fi
           if gh release view "$TAG" >/dev/null 2>&1; then
+            IS_DRAFT="$(gh release view "$TAG" --json isDraft --jq '.isDraft')"
+            if [[ "$IS_DRAFT" != "true" ]]; then
+              echo "error: release $TAG is already published; refusing to overwrite or convert it back to a draft." >&2
+              exit 1
+            fi
             gh release edit "$TAG" --title "$TITLE" --notes-file release-notes.md --draft
           else
             gh release create "$TAG" \

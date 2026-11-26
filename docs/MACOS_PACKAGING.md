@@ -242,7 +242,7 @@ Milestone pre-releases (such as `v0.2.0-beta.1`) use `.github/workflows/release.
      ```
      This validates clean Git status and `--release-check`, builds `Quarry.app`, signs it with Developer ID (`--options runtime --timestamp`), submits to Apple notarization via the Keychain `quarry-notary` profile, staples and Gatekeeper-validates the `.app`, creates a verified `Quarry-<tag>-macos-arm64.zip` and a signed/notarized/stapled `Quarry-<tag>-macos-arm64.dmg`, and writes `SHA256SUMS-macos-arm64.txt` + `release-manifest.json` under `target/release-artifacts/<tag>/`.
    - **CI signing mode (optional):** When the GitHub `release` environment defines `MACOS_DEVELOPER_ID_P12_BASE64`, `MACOS_DEVELOPER_ID_P12_PASSWORD`, `APPLE_API_KEY_P8_BASE64`, `APPLE_API_KEY_ID`, and `APPLE_API_ISSUER_ID`, `.github/workflows/release.yml` runs `./scripts/macos-app.sh release` automatically and uploads the signed `.dmg`, `.zip`, and `SHA256SUMS` to the Draft Release.
-3. **Verify quarantined download in a macOS VM** (checksum, `spctl`, `stapler validate`, launch, smoke test), upload verified local artifacts to the Draft Release with `gh release upload <tag> ... --clobber` if built locally, and publish the release explicitly.
+3. **Upload local artifacts to the Draft Release, then verify the quarantined download in a macOS VM:** If built locally, upload `Quarry-<tag>-macos-arm64.dmg`, `Quarry-<tag>-macos-arm64.zip`, and `SHA256SUMS-macos-arm64.txt` to the Draft Release (`gh release upload <tag> ... --clobber`), then verify the exact quarantined download inside `macOS VM 1` (SHA-256 checksum, `spctl`, `stapler validate`, launch, and smoke test) before explicitly publishing the release.
 
 ## Signing limitation
 
