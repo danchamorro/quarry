@@ -839,3 +839,71 @@ fn live_watch_prepare_async_buffer_read_returns_background_plan() {
     assert_eq!(rows[0].fields[0], b"1");
     let _ = scheduler.stop_live_watch(doc_id).unwrap();
 }
+
+#[test]
+fn live_watch_filtered_page_reads_run_in_background_worker() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("async_filtered.csv");
+    let mut content = String::from("id,level\n");
+    for i in 1..=200 {
+        let level = if i % 10 == 0 { "ERR" } else { "INFO" };
+        content.push_str(&format!("{i},{level}\n"));
+    }
+    std::fs::write(&path, content.as_bytes()).unwrap();
+
+    let (mut scheduler, doc_id) = open_completed_scheduler(&path);
+    scheduler
+        .start_live_watch_with_config(
+            doc_id,
+            WatchConfig {
+                poll_interval: Duration::from_millis(50),
+                cache_config: quarry_core::IndexCacheConfig::disabled(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    let query = FilterQuery::single(1, FilterOperator::Equals, b"ERR".to_vec());
+    scheduler
+        .tab_mut(doc_id)
+        .unwrap()
+        .document
+        .as_mut()
+        .unwrap()
+        .start_filter(query)
+        .unwrap();
+
+    // Wait for filter attachment and background filter page read to populate rows.
+    assert!(wait_until(Duration::from_secs(3), || {
+        let _ = scheduler.poll_all();
+        let doc = scheduler.tab(doc_id).unwrap().document.as_ref().unwrap();
+        doc.live_watch_filter_attach.is_none()
+            && doc.filter_index.as_ref().map(|idx| idx.matches_found()) == Some(20)
+            && !doc.filtered_rows.is_empty()
+    }));
+
+    // Clear the cached filtered buffer and request page 0 -> must schedule a background FilterReadJob.
+    {
+        let doc = scheduler
+            .tab_mut(doc_id)
+            .unwrap()
+            .document
+            .as_mut()
+            .unwrap();
+        doc.filtered_rows.clear();
+        doc.navigate_filter(0).unwrap();
+        assert!(
+            doc.filter_read.is_some(),
+            "watched filter-page reads must schedule a background FilterReadJob"
+        );
+    }
+
+    assert!(wait_until(Duration::from_secs(3), || {
+        let _ = scheduler.poll_all();
+        let doc = scheduler.tab(doc_id).unwrap().document.as_ref().unwrap();
+        doc.filter_read.is_none() && !doc.filtered_rows.is_empty()
+    }));
+    let doc = scheduler.tab(doc_id).unwrap().document.as_ref().unwrap();
+    assert_eq!(doc.filtered_rows[0].fields[0], b"10");
+    let _ = scheduler.stop_live_watch(doc_id).unwrap();
+}

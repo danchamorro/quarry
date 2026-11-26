@@ -1250,6 +1250,35 @@ impl LiveWatchJob {
         )
     }
 
+    /// Starts a cancellable background [`crate::FilterReadJob`] against the watcher's pinned open
+    /// descriptor so filtered viewport reads stay off the UI thread.
+    pub fn start_filtered_read(
+        &self,
+        start_match: u64,
+        count: usize,
+    ) -> Result<crate::FilterReadJob, QuarryError> {
+        let (committed_end, filter_index) = {
+            let index_guard = self.shared.index.read().unwrap();
+            let filter_guard = self.shared.filter.read().unwrap();
+            let committed_end = index_guard.committed_record_end();
+            let filter_index = filter_guard.as_ref().map(|f| f.index.clone());
+            (committed_end, filter_index)
+        };
+        let filter_index = filter_index.ok_or(QuarryError::InvalidOption(
+            "no active filter is attached to this Live Watch session",
+        ))?;
+        crate::FilterReadJob::start_from_open_file(
+            Arc::clone(&self.shared.open_file),
+            self.shared.delimiter,
+            self.shared.encoding,
+            committed_end,
+            filter_index,
+            start_match,
+            count,
+            self.shared.max_record_bytes,
+        )
+    }
+
     /// Starts attaching a freshly evaluated filter index to the running watch off the UI thread,
     /// catching up to the latest committed frontier and atomically handing off to incremental
     /// evaluation with zero missed rows.

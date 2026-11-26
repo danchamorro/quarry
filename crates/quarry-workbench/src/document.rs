@@ -2466,6 +2466,7 @@ impl Document {
     }
 
     pub fn stop_live_watch(&mut self) -> Result<Option<WatchAlert>, AppMessage> {
+        self.stop_filter_read();
         let cancelled_attach = if let Some(attach) = self.live_watch_filter_attach.take() {
             attach.cancel();
             drop(attach);
@@ -5718,24 +5719,11 @@ impl Document {
             return Ok(());
         }
 
-        if let Some(watch) = &self.live_watch {
-            let began = Instant::now();
-            let rows = watch
-                .read_filtered_rows(window.start_match, window.count)
-                .map_err(|error| self.diagnostic_error(error))?;
-            let loaded_columns = rows.iter().map(|row| row.fields.len()).max().unwrap_or(0);
-            if loaded_columns > self.total_columns {
-                self.ensure_column_count(loaded_columns);
-                self.refresh_column_headers();
-            }
-            self.last_viewport_read = Some(began.elapsed());
-            self.filter_buffer_start = window.start_match;
-            self.whitespace.invalidate_rows();
-            self.filtered_rows = rows.into_iter().map(Arc::new).collect();
-            return Ok(());
+        if self.live_watch.is_none() {
+            self.refresh_filter_snapshot_for(
+                window.start_match.saturating_add(window.count as u64),
+            );
         }
-
-        self.refresh_filter_snapshot_for(window.start_match.saturating_add(window.count as u64));
         if let Some(active) = self.filter_read.as_mut() {
             if active.window == window && !active.cancel_requested {
                 self.pending_filter_read = None;
@@ -5754,21 +5742,26 @@ impl Document {
 
     pub fn start_filter_read(&mut self, window: FilterReadWindow) -> Result<(), String> {
         self.pending_filter_read = None;
-        let index = self
-            .filter_index
-            .as_ref()
-            .ok_or_else(|| "No filter index is available.".to_owned())?;
-        let job = self
-            .session
-            .start_filtered_read(index, window.start_match, window.count)
-            .map_err(|error| {
-                if matches!(error, QuarryError::SourceChanged) {
-                    self.invalidate_changed_source();
-                    SOURCE_CHANGED_NOTICE.to_owned()
-                } else {
-                    self.diagnostic_error(error)
-                }
-            })?;
+        let job = if let Some(watch) = &self.live_watch {
+            watch
+                .start_filtered_read(window.start_match, window.count)
+                .map_err(|error| self.diagnostic_error(error))?
+        } else {
+            let index = self
+                .filter_index
+                .as_ref()
+                .ok_or_else(|| "No filter index is available.".to_owned())?;
+            self.session
+                .start_filtered_read(index, window.start_match, window.count)
+                .map_err(|error| {
+                    if matches!(error, QuarryError::SourceChanged) {
+                        self.invalidate_changed_source();
+                        SOURCE_CHANGED_NOTICE.to_owned()
+                    } else {
+                        self.diagnostic_error(error)
+                    }
+                })?
+        };
         self.filter_read = Some(ActiveFilterRead {
             window,
             job,

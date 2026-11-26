@@ -395,8 +395,35 @@ impl FilterIndex {
         count: usize,
         max_record_bytes: usize,
     ) -> Result<Vec<FilterMatch>, QuarryError> {
+        match self.read_matches_from_file_cancellable(
+            file,
+            delimiter,
+            encoding,
+            committed_end,
+            start_match,
+            count,
+            max_record_bytes,
+            None,
+        )? {
+            FilterReadOutcome::Complete(rows) => Ok(rows),
+            FilterReadOutcome::Cancelled => Ok(Vec::new()),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn read_matches_from_file_cancellable(
+        &self,
+        file: &File,
+        delimiter: u8,
+        encoding: Encoding,
+        committed_end: u64,
+        start_match: u64,
+        count: usize,
+        max_record_bytes: usize,
+        shared: Option<&FilterReadSharedState>,
+    ) -> Result<FilterReadOutcome, QuarryError> {
         let Some(mut plan) = prepare_filtered_read(self, start_match, count)? else {
-            return Ok(Vec::new());
+            return Ok(FilterReadOutcome::Complete(Vec::new()));
         };
         plan.scan_limit = Some(committed_end);
         let matchers = compile_matchers(&plan.query)?;
@@ -424,6 +451,9 @@ impl FilterIndex {
         let mut field_ranges = Vec::new();
 
         while match_ordinal < plan.target_end {
+            if shared.is_some_and(|state| state.cancel_requested.load(Ordering::Acquire)) {
+                return Ok(FilterReadOutcome::Cancelled);
+            }
             let remaining = committed_end.saturating_sub(absolute_start);
             if remaining == 0 {
                 break;
@@ -521,6 +551,19 @@ impl FilterIndex {
             if let Some(error) = deferred_error {
                 return Err(error);
             }
+            if let Some(state) = shared {
+                state.bytes_scanned.store(
+                    (absolute_start + effective_read as u64).saturating_sub(plan.checkpoint.offset),
+                    Ordering::Relaxed,
+                );
+                state.rows_scanned.store(
+                    row_number.saturating_sub(plan.checkpoint.row),
+                    Ordering::Relaxed,
+                );
+                state
+                    .matches_read
+                    .store(rows.len() as u64, Ordering::Relaxed);
+            }
             if match_ordinal >= plan.target_end {
                 break;
             }
@@ -533,7 +576,7 @@ impl FilterIndex {
             absolute_start += effective_read as u64;
         }
 
-        Ok(rows)
+        Ok(FilterReadOutcome::Complete(rows))
     }
 
     fn nearest_checkpoint(&self, match_ordinal: u64) -> Option<FilterCheckpoint> {
@@ -979,6 +1022,56 @@ impl FilterReadJob {
             })?;
         Ok(Self {
             source,
+            shared,
+            handle: Some(handle),
+        })
+    }
+
+    /// Spawns a cancellable background filter-page read against a pinned open file descriptor
+    /// bounded by `committed_end` (used by Live Watch Mode so filtered page reads never block the
+    /// UI thread).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn start_from_open_file(
+        file: Arc<File>,
+        delimiter: u8,
+        encoding: Encoding,
+        committed_end: u64,
+        filter_index: FilterIndex,
+        start_match: u64,
+        count: usize,
+        max_record_bytes: usize,
+    ) -> Result<Self, QuarryError> {
+        let plan = prepare_filtered_read(&filter_index, start_match, count)?;
+        let total_bytes = plan
+            .as_ref()
+            .map_or(0, |p| committed_end.saturating_sub(p.checkpoint.offset));
+        let shared = Arc::new(FilterReadSharedState::new(total_bytes));
+        let worker_state = Arc::clone(&shared);
+        let handle = thread::Builder::new()
+            .name("quarry-watch-filter-read".into())
+            .spawn(move || {
+                let _completion = FilterReadCompletion(&worker_state);
+                let result = if plan.is_some() {
+                    filter_index.read_matches_from_file_cancellable(
+                        &file,
+                        delimiter,
+                        encoding,
+                        committed_end,
+                        start_match,
+                        count,
+                        max_record_bytes,
+                        Some(&worker_state),
+                    )
+                } else {
+                    Ok(FilterReadOutcome::Complete(Vec::new()))
+                };
+                if matches!(&result, Ok(FilterReadOutcome::Cancelled)) {
+                    worker_state.cancelled.store(true, Ordering::Release);
+                }
+                result
+            })?;
+        Ok(Self {
+            source: None,
             shared,
             handle: Some(handle),
         })
