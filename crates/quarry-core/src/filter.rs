@@ -24,7 +24,7 @@ use crate::sort::numeric_key;
 use crate::source_stamp::SourceStamp;
 use crate::{
     CaseSensitivity, DEFAULT_MAX_RECORD_BYTES, DEFAULT_READ_CHUNK, QuarryError, Session,
-    parse_encoded_record_with_bom,
+    parse_encoded_record_with_bom, parse_encoded_record_with_bom_and_field_limit,
 };
 
 /// Immutable sparse working values, keyed by physical source row and column.
@@ -449,7 +449,7 @@ impl FilterIndex {
                             limit: max_record_bytes,
                         });
                     } else {
-                        match matching_fields_with_edits(
+                        match matching_fields_with_edits_bounded(
                             &record,
                             delimiter,
                             row_number,
@@ -459,6 +459,7 @@ impl FilterIndex {
                             &groups,
                             &plan.edits,
                             encoding,
+                            Some(crate::MAX_TRANSFORMATION_COLUMNS),
                         ) {
                             Ok(Some(fields)) => {
                                 if match_ordinal >= plan.start_match {
@@ -1283,8 +1284,46 @@ pub(crate) fn matching_fields_with_edits<'a>(
     edits: &FilterEdits,
     encoding: Encoding,
 ) -> Result<Option<Vec<Cow<'a, [u8]>>>, QuarryError> {
-    let fields =
-        parse_encoded_record_with_bom(record, delimiter, physical_row, strip_bom, encoding)?;
+    matching_fields_with_edits_bounded(
+        record,
+        delimiter,
+        physical_row,
+        strip_bom,
+        query,
+        matchers,
+        groups,
+        edits,
+        encoding,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn matching_fields_with_edits_bounded<'a>(
+    record: &'a [u8],
+    delimiter: u8,
+    physical_row: u64,
+    strip_bom: bool,
+    query: &FilterQuery,
+    matchers: &[PredicateMatcher<'_>],
+    groups: &[Vec<usize>],
+    edits: &FilterEdits,
+    encoding: Encoding,
+    max_fields: Option<usize>,
+) -> Result<Option<Vec<Cow<'a, [u8]>>>, QuarryError> {
+    let fields = match max_fields {
+        Some(limit) => parse_encoded_record_with_bom_and_field_limit(
+            record,
+            delimiter,
+            physical_row,
+            strip_bom,
+            encoding,
+            limit,
+        )?,
+        None => {
+            parse_encoded_record_with_bom(record, delimiter, physical_row, strip_bom, encoding)?
+        }
+    };
     if edits
         .range((physical_row, 0)..=(physical_row, usize::MAX))
         .next_back()

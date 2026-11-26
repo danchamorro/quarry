@@ -671,3 +671,132 @@ fn live_watch_tab_stays_pinned_when_replacing_active_tab_under_hydration_limit()
     );
     let _ = scheduler.stop_live_watch(doc_a).unwrap();
 }
+
+#[test]
+fn live_watch_refreshes_headers_when_unterminated_header_row_commits_and_after_stop() {
+    // Case 1: unterminated header expands from 1 column ("sta") to 2 columns ("status", "detail").
+    let dir = tempfile::tempdir().unwrap();
+    let path1 = dir.path().join("partial_header_grow.csv");
+    std::fs::write(&path1, b"sta").unwrap();
+
+    let (mut scheduler, doc1) = open_completed_scheduler(&path1);
+    assert_eq!(
+        scheduler
+            .tab(doc1)
+            .unwrap()
+            .document
+            .as_ref()
+            .unwrap()
+            .headers,
+        vec!["sta"]
+    );
+    scheduler
+        .start_live_watch_with_config(
+            doc1,
+            WatchConfig {
+                poll_interval: Duration::from_millis(15),
+                cache_config: quarry_core::IndexCacheConfig::disabled(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    let mut f1 = FsOpenOptions::new().append(true).open(&path1).unwrap();
+    f1.write_all(b"tus,detail\nOK,info\n").unwrap();
+    f1.flush().unwrap();
+    scheduler
+        .tab(doc1)
+        .unwrap()
+        .document
+        .as_ref()
+        .unwrap()
+        .live_watch
+        .as_ref()
+        .unwrap()
+        .nudge();
+
+    assert!(wait_until(Duration::from_secs(3), || {
+        let _ = scheduler.poll_all();
+        scheduler
+            .tab(doc1)
+            .unwrap()
+            .document
+            .as_ref()
+            .unwrap()
+            .headers
+            == vec!["status", "detail"]
+    }));
+    let _ = scheduler.stop_live_watch(doc1).unwrap();
+    assert_eq!(
+        scheduler
+            .tab(doc1)
+            .unwrap()
+            .document
+            .as_ref()
+            .unwrap()
+            .headers,
+        vec!["status", "detail"]
+    );
+
+    // Case 2: unterminated header stays at the same column count ("id", "st" -> "id", "status").
+    let path2 = dir.path().join("partial_header_same_width.csv");
+    std::fs::write(&path2, b"id,st").unwrap();
+    let (mut scheduler2, doc2) = open_completed_scheduler(&path2);
+    assert_eq!(
+        scheduler2
+            .tab(doc2)
+            .unwrap()
+            .document
+            .as_ref()
+            .unwrap()
+            .headers,
+        vec!["id", "st"]
+    );
+    scheduler2
+        .start_live_watch_with_config(
+            doc2,
+            WatchConfig {
+                poll_interval: Duration::from_millis(15),
+                cache_config: quarry_core::IndexCacheConfig::disabled(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    let mut f2 = FsOpenOptions::new().append(true).open(&path2).unwrap();
+    f2.write_all(b"atus\n1,ok\n").unwrap();
+    f2.flush().unwrap();
+    scheduler2
+        .tab(doc2)
+        .unwrap()
+        .document
+        .as_ref()
+        .unwrap()
+        .live_watch
+        .as_ref()
+        .unwrap()
+        .nudge();
+
+    assert!(wait_until(Duration::from_secs(3), || {
+        let _ = scheduler2.poll_all();
+        scheduler2
+            .tab(doc2)
+            .unwrap()
+            .document
+            .as_ref()
+            .unwrap()
+            .headers
+            == vec!["id", "status"]
+    }));
+    let _ = scheduler2.stop_live_watch(doc2).unwrap();
+    assert_eq!(
+        scheduler2
+            .tab(doc2)
+            .unwrap()
+            .document
+            .as_ref()
+            .unwrap()
+            .headers,
+        vec!["id", "status"]
+    );
+}

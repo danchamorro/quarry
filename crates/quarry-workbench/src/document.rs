@@ -306,6 +306,7 @@ pub struct Document {
     pub live_watch: Option<LiveWatchJob>,
     pub live_watch_filter_attach: Option<LiveWatchFilterJob>,
     pub live_watch_snapshot: Option<WatchSnapshot>,
+    live_watch_header_row: Option<Row>,
     pub live_watch_alert: Option<WatchAlert>,
     pub live_watch_tail_follow: bool,
     live_watch_last_ui_sync: Instant,
@@ -610,6 +611,7 @@ impl Document {
             live_watch: None,
             live_watch_filter_attach: None,
             live_watch_snapshot: None,
+            live_watch_header_row: None,
             live_watch_alert: None,
             live_watch_tail_follow: false,
             live_watch_last_ui_sync: Instant::now() - WATCH_REPAINT_THROTTLE,
@@ -2429,6 +2431,7 @@ impl Document {
         self.live_watch_last_generation = snap.generation;
         self.live_watch_last_ui_sync = Instant::now() - WATCH_REPAINT_THROTTLE;
         self.live_watch_snapshot = Some(snap);
+        self.live_watch_header_row = None;
         self.live_watch_alert = None;
         self.live_watch_tail_follow = true;
         self.live_watch = Some(job);
@@ -2484,6 +2487,9 @@ impl Document {
         self.live_watch_tail_follow = false;
         self.live_watch_last_generation = outcome.snapshot.generation;
         self.live_watch_snapshot = Some(outcome.snapshot);
+        self.live_watch_header_row = None;
+        self.apply_indexed_width(outcome.index.maximum_width());
+        self.refresh_column_headers();
 
         let alert = match outcome.final_status {
             WatchStatus::Alert(alert) => {
@@ -2655,7 +2661,15 @@ impl Document {
         self.progress.bytes_read = snap.observed_file_len;
         self.progress.file_size = snap.observed_file_len;
         self.progress.columns_found = snap.maximum_width;
-        self.apply_indexed_width(snap.maximum_width);
+        if self.session.dialect.has_header && prev_rows == 0 && snap.committed_rows > 0 {
+            if let Ok(mut rows) = job.read_rows(0, 1) {
+                self.live_watch_header_row = rows.pop();
+            }
+            self.apply_indexed_width(snap.maximum_width);
+            self.refresh_column_headers();
+        } else {
+            self.apply_indexed_width(snap.maximum_width);
+        }
 
         let rows_grew = snap.committed_rows > prev_rows;
         let matches_grew = snap.filter_matches_found.unwrap_or(0) > prev_matches;
@@ -4705,14 +4719,25 @@ impl Document {
         self.header_renames
             .get(&column)
             .map(|name| field_text(name.as_bytes()))
-            .unwrap_or_else(|| column_name(&self.session, column))
+            .unwrap_or_else(|| {
+                if self.session.dialect.has_header
+                    && let Some(row) = self.live_watch_header_row.as_ref()
+                {
+                    return row
+                        .fields
+                        .get(column)
+                        .map(|field| field_text(field))
+                        .unwrap_or_else(|| format!("Column {}", column + 1));
+                }
+                column_name(&self.session, column)
+            })
     }
 
     pub fn current_header_fields(&self) -> Vec<Vec<u8>> {
         let mut fields = self
-            .session
-            .first_rows
-            .first()
+            .live_watch_header_row
+            .as_ref()
+            .or_else(|| self.session.first_rows.first())
             .map(|row| row.fields.clone())
             .unwrap_or_default();
         for (column, name) in self.header_renames.iter() {

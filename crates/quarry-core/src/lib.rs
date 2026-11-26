@@ -101,10 +101,10 @@ pub use pool::{
     default_single_run_memory_budget_bytes, default_worker_threads, process_memory_usage,
     raise_nofile_limit,
 };
+use quarry_delimited::ParseError;
 pub use quarry_delimited::{
     ByteEncodingClass, EscapeRule, ScannerDialect, SimdBackend, active_simd_backend,
 };
-use quarry_delimited::{ParseError, parse_record};
 pub use search::{
     SearchJob, SearchMatch, SearchOutcome, SearchPosition, SearchProgress, SearchTelemetry,
 };
@@ -168,23 +168,49 @@ pub(crate) fn parse_encoded_record_with_bom(
     strip_bom: bool,
     encoding: Encoding,
 ) -> Result<Vec<Cow<'_, [u8]>>, QuarryError> {
+    parse_encoded_record_with_bom_and_field_limit(
+        record,
+        delimiter,
+        physical_row,
+        strip_bom,
+        encoding,
+        usize::MAX,
+    )
+}
+
+/// Parses native record bytes with an explicit upper bound on materialized fields so hostile
+/// delimiter-only records cannot amplify heap allocations beyond `max_fields`.
+pub(crate) fn parse_encoded_record_with_bom_and_field_limit(
+    record: &[u8],
+    delimiter: u8,
+    physical_row: u64,
+    strip_bom: bool,
+    encoding: Encoding,
+    max_fields: usize,
+) -> Result<Vec<Cow<'_, [u8]>>, QuarryError> {
     let body = if strip_bom {
         encoding.strip_bom(record).1
     } else {
         record
     };
     if encoding == Encoding::Utf8 {
-        return parse_record(body, delimiter).map_err(Into::into);
+        return quarry_delimited::parse_record_with_field_limit(body, delimiter, max_fields)
+            .map_err(Into::into);
     }
     let decoded = encoding
         .decode(body, DEFAULT_MAX_RECORD_BYTES)
         .map_err(|error| record_encoding_error(physical_row.saturating_add(1), error))?;
     match decoded {
-        Cow::Borrowed(bytes) => parse_record(bytes, delimiter).map_err(Into::into),
-        Cow::Owned(bytes) => Ok(parse_record(&bytes, delimiter)?
-            .into_iter()
-            .map(|field| Cow::Owned(field.into_owned()))
-            .collect()),
+        Cow::Borrowed(bytes) => {
+            quarry_delimited::parse_record_with_field_limit(bytes, delimiter, max_fields)
+                .map_err(Into::into)
+        }
+        Cow::Owned(bytes) => Ok(quarry_delimited::parse_record_with_field_limit(
+            &bytes, delimiter, max_fields,
+        )?
+        .into_iter()
+        .map(|field| Cow::Owned(field.into_owned()))
+        .collect()),
     }
 }
 
@@ -1730,7 +1756,37 @@ fn read_bootstrap_rows_from_open_file(
             }
         })?;
     }
-    materialize_rows(&bytes, &ends, delimiter, encoding)
+    let mut rows = Vec::with_capacity(ends.len());
+    let mut start = 0;
+    for (physical_row, &rec_end) in ends.iter().enumerate() {
+        let rec_end = rec_end as usize;
+        match parse_encoded_record_with_bom_and_field_limit(
+            &bytes[start..rec_end],
+            delimiter,
+            physical_row as u64,
+            physical_row == 0,
+            encoding,
+            MAX_TRANSFORMATION_COLUMNS,
+        ) {
+            Ok(fields) => rows.push(Row {
+                offset: start as u64,
+                fields: fields.into_iter().map(|field| field.into_owned()).collect(),
+            }),
+            Err(QuarryError::Parse(err))
+                if matches!(
+                    err.kind,
+                    quarry_delimited::ParseErrorKind::FieldLimitExceeded(_)
+                ) =>
+            {
+                // Keep any already-parsed bootstrap preview rows and stop before materializing
+                // an overly wide row during watch stop reconciliation.
+                break;
+            }
+            Err(err) => return Err(err),
+        }
+        start = rec_end;
+    }
+    Ok(rows)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1797,12 +1853,13 @@ pub(crate) fn read_rows_from_open_file(
         };
         if read == 0 {
             if !record.is_empty() && row_number >= start && row_number < target_end {
-                let fields = parse_encoded_record_with_bom(
+                let fields = parse_encoded_record_with_bom_and_field_limit(
                     &record,
                     delimiter,
                     row_number,
                     strip_bom_at_zero && record_start == 0,
                     encoding,
+                    MAX_TRANSFORMATION_COLUMNS,
                 )?
                 .into_iter()
                 .map(|field| field.into_owned())
@@ -1825,12 +1882,13 @@ pub(crate) fn read_rows_from_open_file(
                         limit: max_record_bytes,
                     });
                 } else if deferred_error.is_none() {
-                    match parse_encoded_record_with_bom(
+                    match parse_encoded_record_with_bom_and_field_limit(
                         &record,
                         delimiter,
                         row_number,
                         strip_bom_at_zero && record_start == 0,
                         encoding,
+                        MAX_TRANSFORMATION_COLUMNS,
                     ) {
                         Ok(fields) => rows.push(Row {
                             offset: record_start,
@@ -1926,12 +1984,13 @@ fn read_rows_from_index(
         };
         if read == 0 {
             if !record.is_empty() && row_number >= start && row_number < target_end {
-                let fields = parse_encoded_record_with_bom(
+                let fields = parse_encoded_record_with_bom_and_field_limit(
                     &record,
                     delimiter,
                     row_number,
                     strip_bom_at_zero && record_start == 0,
                     encoding,
+                    MAX_TRANSFORMATION_COLUMNS,
                 )?
                 .into_iter()
                 .map(|field| field.into_owned())
@@ -1954,12 +2013,13 @@ fn read_rows_from_index(
                         limit: max_record_bytes,
                     });
                 } else if deferred_error.is_none() {
-                    match parse_encoded_record_with_bom(
+                    match parse_encoded_record_with_bom_and_field_limit(
                         &record,
                         delimiter,
                         row_number,
                         strip_bom_at_zero && record_start == 0,
                         encoding,
+                        MAX_TRANSFORMATION_COLUMNS,
                     ) {
                         Ok(fields) => rows.push(Row {
                             offset: record_start,

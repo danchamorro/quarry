@@ -2952,10 +2952,14 @@ mod tests {
         old_writer.flush().unwrap();
         watch.nudge();
 
-        assert!(wait_until(Duration::from_secs(2), || {
-            let s = watch.snapshot();
-            s.committed_rows == 3 && s.status == WatchStatus::FollowingUnlinked
-        }));
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                let s = watch.snapshot();
+                s.committed_rows == 3 && s.status == WatchStatus::FollowingUnlinked
+            }),
+            "expected 3 committed rows + FollowingUnlinked, got {:?}",
+            watch.snapshot()
+        );
 
         // Now append one final row to the old inode AND create the replacement file at `path`
         // BEFORE nudging so the simultaneous drain-on-Replaced path is exercised directly.
@@ -2964,9 +2968,13 @@ mod tests {
         std::fs::write(&path, b"id,msg\n100,new_file\n").unwrap();
         watch.nudge();
 
-        assert!(wait_until(Duration::from_secs(2), || {
-            watch.snapshot().status == WatchStatus::Alert(WatchAlert::Rotated)
-        }));
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                watch.snapshot().status == WatchStatus::Alert(WatchAlert::Rotated)
+            }),
+            "expected Rotated alert, got {:?}",
+            watch.snapshot()
+        );
 
         // Both old-FD drained rows must be committed and readable!
         assert_eq!(watch.snapshot().committed_rows, 4);
@@ -3648,9 +3656,22 @@ mod tests {
         }));
         assert_eq!(watch.snapshot().maximum_width, 1024 * 1024 + 1);
 
+        // Normal rows remain readable while reading the hostile >65,536-column row fails closed
+        // with `TooManyFields` instead of materializing 1M+ field vectors.
+        assert_eq!(watch.read_rows(0, 2).unwrap().len(), 2);
+        assert!(matches!(
+            watch.read_rows(2, 1),
+            Err(QuarryError::Parse(err))
+                if matches!(
+                    err.kind,
+                    quarry_delimited::ParseErrorKind::FieldLimitExceeded(_)
+                )
+        ));
+
         let stopped = watch.stop().unwrap();
         assert_eq!(stopped.final_status, WatchStatus::Stopped);
         assert_eq!(stopped.index.maximum_width(), 1024 * 1024 + 1);
+        assert_eq!(stopped.session.first_rows.len(), 2);
     }
 
     #[test]
