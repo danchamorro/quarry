@@ -16,28 +16,31 @@ This report records the pre-UI empirical benchmark for **Phase 5A-6: Adaptive Wo
 
 | Target Size | Actual Size | Rows | Cold 40×12 Wrap Measurement | Warm `RowWrapCache` Lookup (40 rows) | Effective Wrap State (`enabled = true`) |
 |---|---:|---:|---:|---:|---|
-| `1 MB` | `1.00 MB` | `4,931` | `41.8 µs` *(cold icache/warmup)* | `2.12 µs` | `Active` |
-| `50 MB` | `50.00 MB` | `246,549` | `15.1 µs` | `0.77 µs` | `Active` |
-| `299 MB` | `299.00 MB` | `1,474,359` | `15.4 µs` | `0.76 µs` | `Active` |
-| `301 MB` | `301.00 MB` | `1,484,221` | `15.1 µs` | `0.76 µs` | `AutoDisabled` (`> 300 MB`) |
+| `1 MB` | `1.00 MB` | `4,931` | `37.5 µs` *(cold icache/warmup)* | `2.66 µs` | `Active` |
+| `50 MB` | `50.00 MB` | `246,549` | `15.1 µs` | `0.78 µs` | `Active` |
+| `299 MB` | `299.00 MB` | `1,474,359` | `15.1 µs` | `0.77 µs` | `Active` |
+| `301 MB` | `301.00 MB` | `1,484,221` | `15.6 µs` | `0.79 µs` | `AutoDisabled` (`> 300 MB`) |
+| `1 GB` | `1,000.00 MB` | `4,930,967` | `15.2 µs` | `0.79 µs` | `AutoDisabled` (`> 300 MB`) |
 
 ### Finding 1 (File-Size Independence)
-Because Quarry preserves O(1) row-based scrolling (`DataTable` / `uniform_list`, zero height prefix sums, zero full-file layout scans) and measures strictly fetched viewport rows inside a bounded 512-row `RowWrapCache`, wrap layout cost is **completely independent of total file size** (`15.1–15.4 µs` cold, `0.76–0.77 µs` warm across `50 MB` to `301 MB` / `1.48M` rows).
+Because Quarry preserves O(1) row-based scrolling (`DataTable` / `uniform_list`, zero height prefix sums, zero full-file layout scans) and measures strictly fetched viewport rows inside a bounded 512-row `RowWrapCache`, wrap measurement cost is **independent of total file size** (`15.1–15.6 µs` cold, `0.77–0.79 µs` warm across `50 MB` to `1 GB` / `4.93M` rows).
 
 ---
 
-## 2. Hostile Single-Line Cell Budget Scaling (`40 × 12` Viewport)
+## 2. Hostile Single-Line Cell Budget Scaling (`40 × 12` Microbenchmark)
 
-| Cell Size | Per-Cell Wrap Measure | Full `40 × 12` Frame Wrap Cost | Bytes Inspected per Cell | Cells Degraded by 128 KiB Frame Cap |
+| Cell Size | Per-Cell Wrap Measure | `40 × 12` Measurement Pass | Raw Bytes Decoded per Cell | Cells Degraded by 128 KiB Cap |
 |---|---:|---:|---:|---:|
-| `64 B` | `0.07 µs` | `33.1 µs` | `39 B` | `0` |
-| `4 KiB` | `1.23 µs` | `39.5 µs` | `39 B` | `448` |
-| `64 KiB` | `1.28 µs` | `40.0 µs` | `39 B` | `448` |
-| `1 MiB` | `1.24 µs` | `40.0 µs` | `39 B` | `448` |
-| `10 MiB` | `1.24 µs` | `39.5 µs` | `39 B` | `448` |
+| `64 B` | `0.07 µs` | `34.6 µs` | `39 B` | `0` |
+| `4 KiB` | `1.22 µs` | `39.3 µs` | `39 B` | `448` |
+| `64 KiB` | `1.22 µs` | `50.0 µs` | `39 B` | `448` |
+| `1 MiB` | `1.47 µs` | `39.4 µs` | `39 B` | `448` |
+| `10 MiB` | `1.22 µs` | `39.3 µs` | `39 B` | `448` |
 
-### Finding 2 (Flat O(1) Worst-Case Frame Cost)
-Even when every cell in a `40 × 12` viewport contains a `10 MiB` single-line string, `MAX_WRAP_CELL_BYTES` (`4 KiB`), early exit at `MAX_WRAPPED_LINES` (`2` lines), and `MAX_WRAP_FRAME_BUDGET_BYTES` (`128 KiB`) hold total frame wrap work flat at **`39.5–40.0 µs`** (`0.04 ms`, <0.5% of an `8.33 ms` 120 Hz frame budget).
+### Finding 2 (Flat O(1) Worst-Case Measurement Microbenchmark)
+Even when every cell in a `40 × 12` viewport contains a `10 MiB` single-line string, `MAX_WRAP_CELL_BYTES` (`4 KiB`), zero-allocation `utf8_chunks` early exit at `MAX_WRAPPED_LINES` (`2` lines, decoding `39 B`), and `MAX_WRAP_FRAME_BUDGET_BYTES` (`128 KiB`) hold the measurement pass flat at **`39.3–50.0 µs`**.
+
+> **Measured boundary:** Section 2 times only `WrapFrameBudget::try_consume` and `measure_wrapped_cell` calls in the headless microbenchmark. It does **not** measure GPUI text shaping, whitespace rendering, row-cache overhead, or end-to-end 120 Hz presentation deadlines (which are tracked separately under `C07`/`T18`).
 
 ---
 

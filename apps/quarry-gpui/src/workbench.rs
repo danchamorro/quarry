@@ -884,6 +884,8 @@ impl WorkbenchController {
                 )
             })
             .unwrap_or((None, None));
+        let prev_effective =
+            resolve_word_wrap(&self.word_wrap_prefs, tab_override, active_byte_len);
         let outcome = self
             .word_wrap_prefs
             .toggle_for_tab(tab_override, active_byte_len);
@@ -892,13 +894,15 @@ impl WorkbenchController {
         {
             tab.word_wrap_override = outcome.next_tab_override;
         }
-        self.last_hud_announcement.insert(
-            window,
-            HudAnnouncement {
-                text: outcome.effective.transition_announcement(),
-                is_alert: false,
-            },
-        );
+        if outcome.effective != prev_effective {
+            self.last_hud_announcement.insert(
+                window,
+                HudAnnouncement {
+                    text: outcome.effective.transition_announcement(),
+                    is_alert: false,
+                },
+            );
+        }
         cx.notify();
         outcome
     }

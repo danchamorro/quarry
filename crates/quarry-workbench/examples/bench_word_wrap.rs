@@ -64,6 +64,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ("50 MB", 50_000_000),
         ("299 MB", 299_000_000),
         ("301 MB", 301_000_000),
+        ("1 GB", 1_000_000_000),
     ] {
         let path = tmp
             .path()
@@ -82,6 +83,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let t_cold = Instant::now();
         for _ in 0..iterations {
             let mut cache = RowWrapCache::default();
+            let mut budget = WrapFrameBudget::default_frame();
             for (idx, row) in fetched.iter().enumerate() {
                 let key = RowWrapCacheKey {
                     row: mid_row + idx as u64,
@@ -91,13 +93,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     font_size_tenths: (GRID_FONT_SIZE * 10.0) as u16,
                     width_fingerprint: width_fp,
                 };
-                cache.get_or_measure(
+                let _ = cache.get_or_measure(
                     key,
                     GRID_FONT_SIZE,
                     row.fields
                         .iter()
                         .enumerate()
                         .map(|(c, f)| (f.as_slice(), col_widths.get(c).copied().unwrap_or(124.0))),
+                    &mut budget,
                 );
             }
         }
@@ -105,6 +108,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Warm cache lookup across 40 fetched rows (average of 1,000 runs).
         let mut warm_cache = RowWrapCache::default();
+        let mut warm_budget = WrapFrameBudget::default_frame();
         for (idx, row) in fetched.iter().enumerate() {
             let key = RowWrapCacheKey {
                 row: mid_row + idx as u64,
@@ -114,13 +118,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 font_size_tenths: (GRID_FONT_SIZE * 10.0) as u16,
                 width_fingerprint: width_fp,
             };
-            warm_cache.get_or_measure(
+            let _ = warm_cache.get_or_measure(
                 key,
                 GRID_FONT_SIZE,
                 row.fields
                     .iter()
                     .enumerate()
                     .map(|(c, f)| (f.as_slice(), col_widths.get(c).copied().unwrap_or(124.0))),
+                &mut warm_budget,
             );
         }
         let warm_iters = 1000u32;

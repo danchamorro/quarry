@@ -350,12 +350,33 @@ impl WordWrapPreferences {
             EffectiveWordWrap::Active {
                 manual_override: true,
             } => {
-                let effective = resolve_word_wrap(self, None, active_byte_len);
-                WordWrapToggleOutcome {
-                    effective,
-                    next_tab_override: None,
-                    persist_warning: None,
-                    status_notice: None,
+                let inherited = resolve_word_wrap(self, None, active_byte_len);
+                if !inherited.is_active() {
+                    WordWrapToggleOutcome {
+                        effective: inherited,
+                        next_tab_override: None,
+                        persist_warning: None,
+                        status_notice: None,
+                    }
+                } else {
+                    // Clearing the override would leave the tab Active (e.g. threshold was
+                    // raised or set to 0), so invert the visible state by turning wrap off.
+                    let persist_warning = self
+                        .set_enabled(false)
+                        .err()
+                        .map(|e| format!("Could not save word wrap preference: {e}"));
+                    let next_tab_override = if persist_warning.is_some() {
+                        current_tab_override
+                    } else {
+                        None
+                    };
+                    let effective = resolve_word_wrap(self, next_tab_override, active_byte_len);
+                    WordWrapToggleOutcome {
+                        effective,
+                        next_tab_override,
+                        persist_warning,
+                        status_notice: None,
+                    }
                 }
             }
             EffectiveWordWrap::Active {
@@ -365,9 +386,15 @@ impl WordWrapPreferences {
                     .set_enabled(false)
                     .err()
                     .map(|e| format!("Could not save word wrap preference: {e}"));
+                let next_tab_override = if persist_warning.is_some() {
+                    current_tab_override
+                } else {
+                    None
+                };
+                let effective = resolve_word_wrap(self, next_tab_override, active_byte_len);
                 WordWrapToggleOutcome {
-                    effective: EffectiveWordWrap::Off,
-                    next_tab_override: None,
+                    effective,
+                    next_tab_override,
                     persist_warning,
                     status_notice: None,
                 }
@@ -381,11 +408,11 @@ impl WordWrapPreferences {
                     .err()
                     .map(|e| format!("Could not save word wrap preference: {e}"));
                 if exceeds {
+                    let next_tab_override = Some(true);
+                    let effective = resolve_word_wrap(self, next_tab_override, active_byte_len);
                     WordWrapToggleOutcome {
-                        effective: EffectiveWordWrap::Active {
-                            manual_override: true,
-                        },
-                        next_tab_override: Some(true),
+                        effective,
+                        next_tab_override,
                         persist_warning,
                         status_notice: Some(format!(
                             "Word wrap enabled for this tab (files over {} auto-disable by default; {MAX_WRAPPED_LINES}-line and 4 KiB per-cell budgets remain active).",
@@ -393,11 +420,15 @@ impl WordWrapPreferences {
                         )),
                     }
                 } else {
+                    let next_tab_override = if persist_warning.is_some() {
+                        current_tab_override
+                    } else {
+                        None
+                    };
+                    let effective = resolve_word_wrap(self, next_tab_override, active_byte_len);
                     WordWrapToggleOutcome {
-                        effective: EffectiveWordWrap::Active {
-                            manual_override: false,
-                        },
-                        next_tab_override: None,
+                        effective,
+                        next_tab_override,
                         persist_warning,
                         status_notice: None,
                     }
@@ -517,51 +548,35 @@ pub fn measure_wrapped_cell(
     let mut truncated = byte_clamped;
     let mut inspected = 0usize;
 
-    let text = String::from_utf8_lossy(slice);
-    for ch in text.chars() {
-        inspected = inspected.saturating_add(ch.len_utf8());
-        if ch == '\n' {
-            if lines >= max_lines {
+    // Stream UTF-8 chunks without allocating so we stop scanning at the exact break point
+    // and `inspected_bytes` matches the exact number of raw input bytes decoded.
+    'scan: for chunk in slice.utf8_chunks() {
+        for ch in chunk.valid().chars() {
+            inspected = inspected.saturating_add(ch.len_utf8());
+            if advance_wrap_char(
+                ch,
+                chars_per_line,
+                max_lines,
+                &mut lines,
+                &mut line_chars,
+                &mut word_chars,
+            ) {
                 truncated = true;
-                break;
+                break 'scan;
             }
-            lines += 1;
-            line_chars = 0;
-            word_chars = 0;
-            continue;
         }
-        if ch == '\r' {
-            continue;
-        }
-
-        if ch.is_whitespace() {
-            word_chars = 0;
-            if line_chars < chars_per_line {
-                line_chars += 1;
-            } else if lines >= max_lines {
+        if !chunk.invalid().is_empty() {
+            inspected = inspected.saturating_add(chunk.invalid().len());
+            if advance_wrap_char(
+                '\u{FFFD}',
+                chars_per_line,
+                max_lines,
+                &mut lines,
+                &mut line_chars,
+                &mut word_chars,
+            ) {
                 truncated = true;
-                break;
-            } else {
-                lines += 1;
-                line_chars = 0;
-            }
-            continue;
-        }
-
-        word_chars += 1;
-        line_chars += 1;
-        if line_chars > chars_per_line {
-            if lines >= max_lines {
-                truncated = true;
-                break;
-            }
-            lines += 1;
-            // Word-wrap when the current token fits cleanly on the new line; otherwise hard-break.
-            if word_chars < chars_per_line {
-                line_chars = word_chars;
-            } else {
-                line_chars = 1;
-                word_chars = 1;
+                break 'scan;
             }
         }
     }
@@ -572,6 +587,60 @@ pub fn measure_wrapped_cell(
         inspected_bytes: inspected.min(prefix_len),
         display_char_budget,
     }
+}
+
+/// Advances line/word wrap accounting by one character. Returns `true` when the cell
+/// overflows `max_lines` and measurement should stop immediately.
+fn advance_wrap_char(
+    ch: char,
+    chars_per_line: usize,
+    max_lines: usize,
+    lines: &mut usize,
+    line_chars: &mut usize,
+    word_chars: &mut usize,
+) -> bool {
+    if ch == '\n' {
+        if *lines >= max_lines {
+            return true;
+        }
+        *lines += 1;
+        *line_chars = 0;
+        *word_chars = 0;
+        return false;
+    }
+    if ch == '\r' {
+        return false;
+    }
+
+    if ch.is_whitespace() {
+        *word_chars = 0;
+        if *line_chars < chars_per_line {
+            *line_chars += 1;
+        } else if *lines >= max_lines {
+            return true;
+        } else {
+            *lines += 1;
+            *line_chars = 0;
+        }
+        return false;
+    }
+
+    *word_chars += 1;
+    *line_chars += 1;
+    if *line_chars > chars_per_line {
+        if *lines >= max_lines {
+            return true;
+        }
+        *lines += 1;
+        // Word-wrap when the current token fits cleanly on the new line; otherwise hard-break.
+        if *word_chars < chars_per_line {
+            *line_chars = *word_chars;
+        } else {
+            *line_chars = 1;
+            *word_chars = 1;
+        }
+    }
+    false
 }
 
 /// Per-frame byte budget guarding total wrapped-text work across one viewport render.
@@ -732,20 +801,29 @@ impl RowWrapCache {
         }
     }
 
-    /// Measures and caches a fetched row's cells under `MAX_WRAPPED_LINES` and `MAX_WRAP_CELL_BYTES`.
+    /// Measures and caches a fetched row's cells under `MAX_WRAPPED_LINES`, `MAX_WRAP_CELL_BYTES`,
+    /// and the shared per-frame `WrapFrameBudget`.
+    ///
+    /// Cache hits return immediately without charging `frame_budget`. On a cache miss, each
+    /// cell reserves budget before measuring; if `frame_budget` runs out mid-row, returns `None`
+    /// without caching partial metrics as a complete row.
     pub fn get_or_measure<'a>(
         &mut self,
         key: RowWrapCacheKey,
         font_size_px: f32,
         cells: impl IntoIterator<Item = (&'a [u8], f32)>,
-    ) -> RowWrapMetrics {
+        frame_budget: &mut WrapFrameBudget,
+    ) -> Option<RowWrapMetrics> {
         if let Some(hit) = self.get(&key) {
-            return hit;
+            return Some(hit);
         }
         let mut max_lines: u8 = 1;
         let mut measured_bytes = 0usize;
         let mut clamped_cells = 0usize;
         for (raw, width_px) in cells {
+            if !frame_budget.try_consume(raw.len()) {
+                return None;
+            }
             let m = measure_wrapped_cell(
                 raw,
                 width_px,
@@ -765,7 +843,7 @@ impl RowWrapCache {
             clamped_cells,
         };
         self.insert(key, metrics);
-        metrics
+        Some(metrics)
     }
 
     /// Measures and caches a single horizontally visible viewport cell under the shared
@@ -921,6 +999,42 @@ mod tests {
         assert!(override_off.effective.is_auto_disabled());
         assert_eq!(override_off.next_tab_override, None);
         assert!(prefs.enabled);
+
+        // If a tab had a manual override and the threshold is later raised (or set to 0)
+        // so the inherited state is Active, clicking Wrap: On must turn wrap off in one click.
+        let override_again = prefs.toggle_for_tab(None, Some(301_000_000));
+        assert_eq!(override_again.next_tab_override, Some(true));
+        prefs.set_auto_disable_bytes(0).unwrap();
+        let single_click_off =
+            prefs.toggle_for_tab(override_again.next_tab_override, Some(301_000_000));
+        assert_eq!(single_click_off.effective, EffectiveWordWrap::Off);
+        assert_eq!(single_click_off.next_tab_override, None);
+        assert!(!prefs.enabled);
+    }
+
+    #[test]
+    fn toggle_for_tab_keeps_effective_state_aligned_when_save_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        // Passing a directory as the preference file path forces `persist` to fail on all OSes.
+        let mut prefs = WordWrapPreferences::load(Some(dir.path().to_path_buf()));
+        assert!(!prefs.enabled);
+
+        let failed_on = prefs.toggle_for_tab(None, Some(10_000_000));
+        assert!(failed_on.persist_warning.is_some());
+        assert_eq!(failed_on.effective, EffectiveWordWrap::Off);
+        assert_eq!(failed_on.next_tab_override, None);
+        assert!(!prefs.enabled);
+
+        // Over-threshold tab override still activates for the current tab even if saving fails.
+        let over_limit = prefs.toggle_for_tab(None, Some(301_000_000));
+        assert!(over_limit.persist_warning.is_some());
+        assert_eq!(
+            over_limit.effective,
+            EffectiveWordWrap::Active {
+                manual_override: true
+            }
+        );
+        assert_eq!(over_limit.next_tab_override, Some(true));
     }
 
     #[test]
@@ -1074,6 +1188,7 @@ mod tests {
     #[test]
     fn row_wrap_cache_bounds_capacity_and_invalidates_on_key_change() {
         let mut cache = RowWrapCache::new(4);
+        let mut budget = WrapFrameBudget::default_frame();
         let fp = column_widths_fingerprint([(0, 120.0), (1, 180.0)]);
         for row in 0..10u64 {
             let key = RowWrapCacheKey {
@@ -1084,13 +1199,18 @@ mod tests {
                 font_size_tenths: 130,
                 width_fingerprint: fp,
             };
-            cache.get_or_measure(
-                key,
-                13.0,
-                [
-                    (&b"short"[..], 120.0),
-                    (&b"longer wrapped text here"[..], 180.0),
-                ],
+            assert!(
+                cache
+                    .get_or_measure(
+                        key,
+                        13.0,
+                        [
+                            (&b"short"[..], 120.0),
+                            (&b"longer wrapped text here"[..], 180.0),
+                        ],
+                        &mut budget,
+                    )
+                    .is_some()
             );
         }
         assert_eq!(cache.len(), 4);
@@ -1111,5 +1231,28 @@ mod tests {
             ..latest_key
         };
         assert!(cache.get(&resized_key).is_none());
+
+        // Exhausting budget mid-row returns None and does NOT cache partial row metrics.
+        let mut tight_budget = WrapFrameBudget::new(8 * 1024);
+        let four_kib = vec![b'a'; 4 * 1024];
+        let partial_key = RowWrapCacheKey {
+            row: 99,
+            ..latest_key
+        };
+        assert!(
+            cache
+                .get_or_measure(
+                    partial_key,
+                    13.0,
+                    [
+                        (four_kib.as_slice(), 120.0),
+                        (four_kib.as_slice(), 120.0),
+                        (four_kib.as_slice(), 120.0),
+                    ],
+                    &mut tight_budget,
+                )
+                .is_none()
+        );
+        assert!(cache.get(&partial_key).is_none());
     }
 }
