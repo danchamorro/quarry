@@ -4744,3 +4744,140 @@ fn adaptive_word_wrap_persists_preserves_anchor_and_auto_disables_above_threshol
         "auto-disable transition must emit a quiet accessibility announcement; got {auto_off_announcement:?}"
     );
 }
+
+#[gpui_kit::test]
+fn adaptive_word_wrap_resets_frame_budget_on_single_row_and_bounds_wide_csvs(
+    cx: &mut TestAppContext,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let single_row_csv = dir.path().join("single_row_4k.csv");
+    let wide_csv = dir.path().join("wide_500_cols.csv");
+
+    let payload_4k = "word ".repeat(900); // > 4 KiB
+    std::fs::write(&single_row_csv, format!("id,notes\n1,\"{payload_4k}\"\n")).unwrap();
+
+    let mut wide_header = String::new();
+    let mut wide_row = String::new();
+    for col in 0..500 {
+        if col > 0 {
+            wide_header.push(',');
+            wide_row.push(',');
+        }
+        wide_header.push_str(&format!("c{col}"));
+        wide_row.push_str(&format!("Cell {col} wrapped preview text value"));
+    }
+    let mut wide_body = format!("{wide_header}\n");
+    for _ in 0..3 {
+        wide_body.push_str(&wide_row);
+        wide_body.push('\n');
+    }
+    std::fs::write(&wide_csv, wide_body).unwrap();
+
+    let controller = cx.update(|cx| {
+        gpui_kit::init(cx);
+        crate::apply_light_theme(cx);
+        bind_shortcuts(cx);
+        install_menus(cx);
+        let mut prefs = quarry_workbench::WordWrapPreferences::load(None);
+        prefs.set_enabled(true).unwrap();
+        cx.new(|_| {
+            WorkbenchController::new(WorkbenchSchedulerConfig {
+                index_cache_enabled: false,
+                ..WorkbenchSchedulerConfig::default()
+            })
+            .with_word_wrap_prefs(prefs)
+        })
+    });
+    let (handle, view) = open_test_window(cx, &controller);
+    let win_id = cx.update(|cx| view.read(cx).window_id);
+
+    // 1. Open single-row 4 KiB CSV and redraw 40 consecutive frames: the wrap frame budget
+    // must reset at each frame boundary so the row never degrades after 32 frames.
+    cx.update(|cx| {
+        controller
+            .update(cx, |c, cx| {
+                c.open_paths(
+                    win_id,
+                    vec![single_row_csv.clone()],
+                    OpenOptions::default(),
+                    None,
+                    cx,
+                )
+            })
+            .unwrap();
+    });
+    wait_for_ui(cx, handle, &controller, &view, |q, _, cx| {
+        q.snapshot(cx).is_some_and(|s| s.index_done)
+    });
+
+    for _ in 0..40 {
+        cx.update_window(handle.into(), |_, _, cx| {
+            view.update(cx, |q, cx| {
+                q.table.update(cx, |_, cx| cx.notify());
+                cx.notify();
+            });
+        })
+        .unwrap();
+        cx.update(|cx| cx.refresh_windows());
+        cx.run_until_parked();
+    }
+
+    let (used_bytes, clamped_cells) = cx.update(|cx| {
+        view.read(cx)
+            .table
+            .read(cx)
+            .delegate()
+            .wrap_frame_budget_stats()
+    });
+    assert_eq!(
+        clamped_cells, 0,
+        "1-row 4 KiB document must reset wrap frame budget across 40 consecutive frames"
+    );
+    assert!(
+        used_bytes > 0 && used_bytes <= quarry_workbench::MAX_WRAP_CELL_BYTES + 64,
+        "expected single-frame consumption bounded to visible 1-row cells; got {used_bytes} B"
+    );
+
+    // 2. Open a 500-column CSV and confirm wrap measurement only touches horizontally visible
+    // viewport cells rather than all 500 unhidden columns per row.
+    cx.update(|cx| {
+        controller
+            .update(cx, |c, cx| {
+                c.open_paths(
+                    win_id,
+                    vec![wide_csv.clone()],
+                    OpenOptions::default(),
+                    None,
+                    cx,
+                )
+            })
+            .unwrap();
+    });
+    wait_for_ui(cx, handle, &controller, &view, |q, _, cx| {
+        q.snapshot(cx)
+            .is_some_and(|s| s.path == wide_csv && s.index_done)
+    });
+    cx.update(|cx| cx.refresh_windows());
+    cx.run_until_parked();
+
+    let (cached_rows, cached_cells, wide_used, _) = cx.update(|cx| {
+        let table = view.read(cx).table.read(cx);
+        let d = table.delegate();
+        let (rows, _, _) = d.wrap_cache_stats();
+        let cells = d.wrap_cache_cell_count();
+        let (used, clamped) = d.wrap_frame_budget_stats();
+        (rows, cells, used, clamped)
+    });
+    assert!(
+        cached_rows >= 1,
+        "expected visible rows cached on wide CSV; got {cached_rows}"
+    );
+    assert!(
+        cached_cells > 0 && cached_cells < 150,
+        "wide 500-column CSV must cache only horizontally visible viewport cells, not all 1500 offscreen cells; got {cached_cells}"
+    );
+    assert!(
+        wide_used <= quarry_workbench::MAX_WRAP_FRAME_BUDGET_BYTES,
+        "wide CSV frame budget must remain <= 128 KiB; got {wide_used}"
+    );
+}

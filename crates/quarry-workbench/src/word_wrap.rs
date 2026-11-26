@@ -30,6 +30,9 @@ pub const MAX_WRAP_FRAME_BUDGET_BYTES: usize = 128 * 1024;
 /// Maximum number of fetched rows retained in the bounded wrap-metrics cache.
 pub const MAX_CACHED_WRAP_ROWS: usize = 512;
 
+/// Maximum number of horizontally cached cell entries stored per row in `RowWrapCache`.
+pub const MAX_CACHED_WRAP_COLS_PER_ROW: usize = 128;
+
 /// Uniform row height in logical pixels when word wrap is off (matches `Size::Small`).
 pub const SINGLE_LINE_ROW_HEIGHT_PX: f32 = 30.0;
 
@@ -656,12 +659,20 @@ pub struct RowWrapMetrics {
     pub clamped_cells: usize,
 }
 
+/// Bounded cache entry storing row summary metrics and lazily populated viewport cell metrics.
+#[derive(Clone, Debug)]
+struct RowWrapEntry {
+    metrics: RowWrapMetrics,
+    /// Bounded FIFO of `(source_col, width_tenths, WrapCellMetrics)` for rendered viewport cells.
+    cells: VecDeque<(usize, u32, WrapCellMetrics)>,
+}
+
 /// Bounded cache storing wrapped layout metrics strictly for fetched rows.
 /// Uses FIFO/ring eviction at `max_entries` so RAM stays O(1) independent of file size.
 #[derive(Debug)]
 pub struct RowWrapCache {
     max_entries: usize,
-    entries: HashMap<RowWrapCacheKey, RowWrapMetrics>,
+    entries: HashMap<RowWrapCacheKey, RowWrapEntry>,
     order: VecDeque<RowWrapCacheKey>,
     hits: u64,
     misses: u64,
@@ -686,9 +697,9 @@ impl RowWrapCache {
     }
 
     pub fn get(&mut self, key: &RowWrapCacheKey) -> Option<RowWrapMetrics> {
-        if let Some(&metrics) = self.entries.get(key) {
+        if let Some(entry) = self.entries.get(key) {
             self.hits = self.hits.saturating_add(1);
-            Some(metrics)
+            Some(entry.metrics)
         } else {
             self.misses = self.misses.saturating_add(1);
             None
@@ -697,9 +708,21 @@ impl RowWrapCache {
 
     pub fn insert(&mut self, key: RowWrapCacheKey, metrics: RowWrapMetrics) {
         if let Some(existing) = self.entries.get_mut(&key) {
-            *existing = metrics;
+            existing.metrics = metrics;
             return;
         }
+        self.evict_if_full();
+        self.entries.insert(
+            key,
+            RowWrapEntry {
+                metrics,
+                cells: VecDeque::new(),
+            },
+        );
+        self.order.push_back(key);
+    }
+
+    fn evict_if_full(&mut self) {
         while self.entries.len() >= self.max_entries {
             if let Some(oldest) = self.order.pop_front() {
                 self.entries.remove(&oldest);
@@ -707,8 +730,6 @@ impl RowWrapCache {
                 break;
             }
         }
-        self.entries.insert(key, metrics);
-        self.order.push_back(key);
     }
 
     /// Measures and caches a fetched row's cells under `MAX_WRAPPED_LINES` and `MAX_WRAP_CELL_BYTES`.
@@ -747,6 +768,82 @@ impl RowWrapCache {
         metrics
     }
 
+    /// Measures and caches a single horizontally visible viewport cell under the shared
+    /// per-frame byte budget, never touching offscreen columns on wide CSVs.
+    ///
+    /// Returns `None` without measuring when `frame_budget` is exhausted so the caller
+    /// degrades gracefully to a compact single-line preview for the remainder of the frame.
+    pub fn get_or_measure_cell(
+        &mut self,
+        row_key: RowWrapCacheKey,
+        source_col: usize,
+        col_width_px: f32,
+        font_size_px: f32,
+        raw: &[u8],
+        frame_budget: &mut WrapFrameBudget,
+    ) -> Option<WrapCellMetrics> {
+        if !frame_budget.try_consume(raw.len()) {
+            return None;
+        }
+        let width_tenths = (col_width_px.max(0.0) * 10.0).round() as u32;
+        if let Some(entry) = self.entries.get(&row_key)
+            && let Some((_, _, cached)) = entry
+                .cells
+                .iter()
+                .find(|(col, width, _)| *col == source_col && *width == width_tenths)
+        {
+            self.hits = self.hits.saturating_add(1);
+            return Some(*cached);
+        }
+
+        self.misses = self.misses.saturating_add(1);
+        let measured = measure_wrapped_cell(
+            raw,
+            col_width_px,
+            font_size_px,
+            MAX_WRAPPED_LINES,
+            MAX_WRAP_CELL_BYTES,
+        );
+        if !self.entries.contains_key(&row_key) {
+            self.evict_if_full();
+            self.entries.insert(
+                row_key,
+                RowWrapEntry {
+                    metrics: RowWrapMetrics {
+                        max_lines: measured.lines,
+                        measured_bytes: measured.inspected_bytes,
+                        clamped_cells: usize::from(measured.truncated),
+                    },
+                    cells: VecDeque::new(),
+                },
+            );
+            self.order.push_back(row_key);
+        }
+        if let Some(entry) = self.entries.get_mut(&row_key) {
+            entry.metrics.max_lines = entry.metrics.max_lines.max(measured.lines);
+            entry.metrics.measured_bytes = entry
+                .metrics
+                .measured_bytes
+                .saturating_add(measured.inspected_bytes);
+            if measured.truncated {
+                entry.metrics.clamped_cells = entry.metrics.clamped_cells.saturating_add(1);
+            }
+            if let Some(slot) = entry
+                .cells
+                .iter_mut()
+                .find(|(col, _, _)| *col == source_col)
+            {
+                *slot = (source_col, width_tenths, measured);
+            } else {
+                if entry.cells.len() >= MAX_CACHED_WRAP_COLS_PER_ROW {
+                    entry.cells.pop_front();
+                }
+                entry.cells.push_back((source_col, width_tenths, measured));
+            }
+        }
+        Some(measured)
+    }
+
     pub fn clear(&mut self) {
         self.entries.clear();
         self.order.clear();
@@ -758,6 +855,11 @@ impl RowWrapCache {
 
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    /// Total cached per-cell metrics across all retained rows.
+    pub fn cell_entries_len(&self) -> usize {
+        self.entries.values().map(|e| e.cells.len()).sum()
     }
 
     pub fn hits(&self) -> u64 {
@@ -857,11 +959,16 @@ mod tests {
     }
 
     #[test]
-    fn unix_preferences_path_ignores_relative_env_roots() {
+    fn unix_preferences_path_rejects_relative_env_roots() {
         assert_eq!(
             unix_word_wrap_preferences_path(Some(PathBuf::from("relative")), None),
             None
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn unix_preferences_path_accepts_absolute_unix_env_roots() {
         assert_eq!(
             unix_word_wrap_preferences_path(
                 Some(PathBuf::from("/tmp/xdg")),
@@ -869,6 +976,57 @@ mod tests {
             ),
             Some(PathBuf::from("/tmp/xdg/quarry/word-wrap-preferences"))
         );
+    }
+
+    #[test]
+    fn row_wrap_cache_cell_measurement_honors_frame_budget_and_caps_columns() {
+        let mut cache = RowWrapCache::new(4);
+        let mut budget = WrapFrameBudget::new(8 * 1024);
+        let key = RowWrapCacheKey {
+            row: 1,
+            source_generation: 1,
+            edit_revision: 0,
+            show_all_whitespace: false,
+            font_size_tenths: 130,
+            width_fingerprint: 0,
+        };
+        let four_kib = vec![b'a'; 4 * 1024];
+
+        let m0 = cache
+            .get_or_measure_cell(key, 0, 140.0, 13.0, &four_kib, &mut budget)
+            .expect("first 4 KiB cell fits in 8 KiB budget");
+        assert_eq!(m0.lines, 2);
+        assert_eq!(cache.misses(), 1);
+        assert_eq!(cache.hits(), 0);
+
+        // Cache hit on the same (row, col, width) reuses metrics without re-measuring.
+        let m0_hit = cache
+            .get_or_measure_cell(key, 0, 140.0, 13.0, &four_kib, &mut budget)
+            .expect("second 4 KiB cell hits 8 KiB limit");
+        assert_eq!(m0_hit, m0);
+        assert_eq!(cache.hits(), 1);
+
+        // Third cell exceeds the 8 KiB frame budget and returns None without measuring.
+        let misses_before = cache.misses();
+        assert!(
+            cache
+                .get_or_measure_cell(key, 1, 140.0, 13.0, &four_kib, &mut budget)
+                .is_none()
+        );
+        assert_eq!(cache.misses(), misses_before);
+        assert_eq!(budget.clamped_cells(), 1);
+
+        // After resetting the frame budget, column cache per row remains strictly bounded.
+        budget.reset();
+        let mut wide_budget = WrapFrameBudget::new(usize::MAX);
+        for col in 0..(MAX_CACHED_WRAP_COLS_PER_ROW + 20) {
+            assert!(
+                cache
+                    .get_or_measure_cell(key, col, 140.0, 13.0, b"short", &mut wide_budget)
+                    .is_some()
+            );
+        }
+        assert_eq!(cache.cell_entries_len(), MAX_CACHED_WRAP_COLS_PER_ROW);
     }
 
     #[test]

@@ -16,9 +16,9 @@ use gpui_kit::{
     px, rgb,
 };
 use quarry_workbench::{
-    Document, GRID_FONT_SIZE, MAX_GRID_TEXT_CHARS, MAX_WRAP_CELL_BYTES, MAX_WRAPPED_LINES,
-    RowWrapCache, RowWrapCacheKey, WRAPPED_LINE_HEIGHT_PX, WindowId, WrapFrameBudget,
-    column_widths_fingerprint, field_preview, measure_wrapped_cell, source_looks_numeric,
+    Document, GRID_FONT_SIZE, MAX_GRID_TEXT_CHARS, MAX_WRAPPED_LINES, RowWrapCache,
+    RowWrapCacheKey, WRAPPED_LINE_HEIGHT_PX, WindowId, WrapFrameBudget, field_preview,
+    source_looks_numeric,
 };
 
 use crate::whitespace_ui::render_whitespace;
@@ -67,7 +67,8 @@ pub struct Grid {
     visible_columns: Range<usize>,
     wrap_cache: RowWrapCache,
     frame_budget: WrapFrameBudget,
-    last_frame_row: Option<usize>,
+    frame_ended: Rc<Cell<bool>>,
+    frame_end_scheduled: Rc<Cell<bool>>,
 }
 
 impl Grid {
@@ -86,7 +87,8 @@ impl Grid {
             visible_columns: 0..16,
             wrap_cache: RowWrapCache::default(),
             frame_budget: WrapFrameBudget::default_frame(),
-            last_frame_row: None,
+            frame_ended: Rc::new(Cell::new(false)),
+            frame_end_scheduled: Rc::new(Cell::new(false)),
         }
     }
 
@@ -131,7 +133,8 @@ impl Grid {
     pub fn clear_wrap_cache(&mut self) {
         self.wrap_cache.clear();
         self.frame_budget.reset();
-        self.last_frame_row = None;
+        self.frame_ended.set(false);
+        self.frame_end_scheduled.set(false);
     }
 
     #[cfg(test)]
@@ -140,6 +143,19 @@ impl Grid {
             self.wrap_cache.len(),
             self.wrap_cache.hits(),
             self.wrap_cache.misses(),
+        )
+    }
+
+    #[cfg(test)]
+    pub fn wrap_cache_cell_count(&self) -> usize {
+        self.wrap_cache.cell_entries_len()
+    }
+
+    #[cfg(test)]
+    pub fn wrap_frame_budget_stats(&self) -> (usize, usize) {
+        (
+            self.frame_budget.used_bytes(),
+            self.frame_budget.clamped_cells(),
         )
     }
 
@@ -551,7 +567,7 @@ impl TableDelegate for Grid {
         &mut self,
         row: usize,
         column: usize,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<TableState<Self>>,
     ) -> impl IntoElement {
         let (tokens, show_all, wrap_active) = {
@@ -563,10 +579,17 @@ impl TableDelegate for Grid {
             )
         };
         if wrap_active {
-            if self.last_frame_row.is_none_or(|prev| row < prev) {
+            if self.frame_ended.replace(false) {
                 self.frame_budget.reset();
             }
-            self.last_frame_row = Some(row);
+            if !self.frame_end_scheduled.replace(true) {
+                let frame_ended = self.frame_ended.clone();
+                let frame_end_scheduled = self.frame_end_scheduled.clone();
+                window.defer(cx, move |_, _| {
+                    frame_ended.set(true);
+                    frame_end_scheduled.set(false);
+                });
+            }
         }
         let src_row_opt = self.source_row_at(row, cx);
         let src_col_opt = self.source_column_at(column, cx);
@@ -708,95 +731,68 @@ impl TableDelegate for Grid {
                 controller.inspect_cell_whitespace(win_id, src_row, src_col, raw_len)
             });
 
-            let allow_wrap_cell = wrap_active && self.frame_budget.try_consume(raw_len);
             let col_width_px = self.width_for_source_col(src_col);
-            let mut wrap_cache_key = None;
-            if allow_wrap_cell {
-                let controller = self.controller.read(cx);
-                if let Some(doc) = controller.active_document(win_id) {
-                    let fp = column_widths_fingerprint(
-                        doc.columns
-                            .visible
-                            .iter()
-                            .copied()
-                            .map(|c| (c, self.width_for_source_col(c))),
-                    );
-                    wrap_cache_key = Some(RowWrapCacheKey {
-                        row: src_row,
-                        source_generation: doc.instance_id,
-                        edit_revision: doc.edit_revision,
-                        show_all_whitespace: show_all,
-                        font_size_tenths: (GRID_FONT_SIZE * 10.0) as u16,
-                        width_fingerprint: fp,
-                    });
-                }
-            }
-            if let Some(cache_key) = wrap_cache_key
-                && self.wrap_cache.get(&cache_key).is_none()
-            {
-                let controller = self.controller.read(cx);
-                if let Some(doc) = controller.active_document(win_id)
-                    && let Some((_, fields)) = loaded_row(doc, row)
-                {
-                    let widths = &self.widths;
-                    self.wrap_cache.get_or_measure(
-                        cache_key,
-                        GRID_FONT_SIZE,
-                        doc.columns.visible.iter().copied().map(|col_id| {
-                            let bytes = if let Some(edited) = doc.cell_edits.get(&(src_row, col_id))
-                            {
-                                edited.as_slice()
-                            } else {
-                                fields.get(col_id).map(Vec::as_slice).unwrap_or(&[])
-                            };
-                            let w = widths.get(&col_id).map(|p| f32::from(*p)).unwrap_or(124.0);
-                            (bytes, w)
-                        }),
-                    );
-                }
-            }
-
+            let wrap_cache = &mut self.wrap_cache;
+            let frame_budget = &mut self.frame_budget;
             let rendered_cell = {
                 let controller = self.controller.read(cx);
-                controller
-                    .active_document(win_id)
-                    .and_then(|doc| borrowed_cell_raw(doc, row, column))
-                    .and_then(|(_, _, raw_opt)| raw_opt)
-                    .map(|raw| {
-                        let numeric_cell = source_looks_numeric(raw);
-                        let max_chars = if allow_wrap_cell {
-                            measure_wrapped_cell(
-                                raw,
-                                col_width_px,
-                                GRID_FONT_SIZE,
-                                MAX_WRAPPED_LINES,
-                                MAX_WRAP_CELL_BYTES,
-                            )
-                            .display_char_budget
-                        } else {
-                            MAX_GRID_TEXT_CHARS.min(240)
+                controller.active_document(win_id).and_then(|doc| {
+                    let (_, _, raw_opt) = borrowed_cell_raw(doc, row, column)?;
+                    let raw = raw_opt?;
+                    let numeric_cell = source_looks_numeric(raw);
+                    let wrapped_metrics = if wrap_active {
+                        let cache_key = RowWrapCacheKey {
+                            row: src_row,
+                            source_generation: doc.instance_id,
+                            edit_revision: doc.edit_revision,
+                            show_all_whitespace: show_all,
+                            font_size_tenths: (GRID_FONT_SIZE * 10.0) as u16,
+                            width_fingerprint: 0,
                         };
-                        let rendered = render_whitespace(raw, summary, show_all, max_chars);
-                        let invalid_utf8 =
-                            summary.map_or(rendered.prefix_invalid_utf8, |s| s.invalid_utf8);
-                        let indicated = summary.is_some_and(|s| s.indicated(show_all))
-                            || rendered.visible_marks;
-                        let pending = summary.is_none() && !raw.is_empty();
-                        let ws_tip = (indicated || pending)
-                            .then(|| controller.whitespace_explanation(win_id, summary));
-                        (
-                            numeric_cell,
-                            rendered,
-                            invalid_utf8,
-                            indicated,
-                            pending,
-                            ws_tip,
+                        wrap_cache.get_or_measure_cell(
+                            cache_key,
+                            src_col,
+                            col_width_px,
+                            GRID_FONT_SIZE,
+                            raw,
+                            frame_budget,
                         )
-                    })
+                    } else {
+                        None
+                    };
+                    let allow_wrap_cell = wrapped_metrics.is_some();
+                    let max_chars = wrapped_metrics
+                        .map(|m| m.display_char_budget)
+                        .unwrap_or_else(|| MAX_GRID_TEXT_CHARS.min(240));
+                    let rendered = render_whitespace(raw, summary, show_all, max_chars);
+                    let invalid_utf8 =
+                        summary.map_or(rendered.prefix_invalid_utf8, |s| s.invalid_utf8);
+                    let indicated =
+                        summary.is_some_and(|s| s.indicated(show_all)) || rendered.visible_marks;
+                    let pending = summary.is_none() && !raw.is_empty();
+                    let ws_tip = (indicated || pending)
+                        .then(|| controller.whitespace_explanation(win_id, summary));
+                    Some((
+                        allow_wrap_cell,
+                        numeric_cell,
+                        rendered,
+                        invalid_utf8,
+                        indicated,
+                        pending,
+                        ws_tip,
+                    ))
+                })
             };
 
-            let Some((numeric_cell, rendered, invalid_utf8, indicated, pending, ws_tip)) =
-                rendered_cell
+            let Some((
+                allow_wrap_cell,
+                numeric_cell,
+                rendered,
+                invalid_utf8,
+                indicated,
+                pending,
+                ws_tip,
+            )) = rendered_cell
             else {
                 return cell.child(div().flex_1().min_w_0());
             };
