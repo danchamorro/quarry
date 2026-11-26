@@ -21,6 +21,7 @@ parentheses are GitHub pull requests.
 
 ### Changed
 
+- Moved **Download & Install** to the top of `README.md` with direct links to the published `v0.2.0-beta.2` macOS and Linux/Omarchy release assets and architecture-parameterized verification commands. (#225)
 - Updated `README.md` and `docs/LINUX_AND_OMARCHY.md` with prominent macOS `.dmg` and Linux/Omarchy tarball installation instructions and replaced the outdated `v0.1.0-beta.3` snapshot note. (#224)
 - Bumped the Quarry workspace version from `0.1.0` to `0.2.0` for the GPUI beta series and refreshed third-party license notices accordingly (zero third-party dependency changes). (#223)
 - Scoped GitHub Actions `push` triggers to `main` and enabled `cancel-in-progress` workflow concurrency for pull requests so superseded commits no longer exhaust macOS runner slots. (#222)
