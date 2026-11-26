@@ -2412,9 +2412,9 @@ impl Document {
                 }
             })?;
 
-        let snap = job.snapshot();
-        self.index = Some(job.index_snapshot());
-        if let Some(filter_idx) = job.filter_index_snapshot() {
+        let (snap, live_index, live_filter) = job.state_snapshot();
+        self.index = Some(live_index);
+        if let Some(filter_idx) = live_filter {
             self.filter_index = Some(filter_idx);
             if let Some(progress) = self.filter_progress.as_mut() {
                 progress.matches_found = snap.filter_matches_found.unwrap_or(0);
@@ -2598,9 +2598,24 @@ impl Document {
             .unwrap_or(0);
 
         self.live_watch_last_ui_sync = Instant::now();
+        let (snap, live_index, live_filter) = job.state_snapshot();
+        if !snap.status.is_active() {
+            match self.stop_live_watch() {
+                Ok(_) => return Ok(true),
+                Err(msg) => {
+                    let fallback_alert = match snap.status {
+                        WatchStatus::Alert(alert) => alert,
+                        _ => WatchAlert::IoError(msg.text.clone()),
+                    };
+                    self.invalidate_changed_source();
+                    self.live_watch_alert = Some(fallback_alert);
+                    return Err(msg.text);
+                }
+            }
+        }
         self.live_watch_last_generation = snap.generation;
-        self.index = Some(job.index_snapshot());
-        if let Some(filter_idx) = job.filter_index_snapshot() {
+        self.index = Some(live_index);
+        if let Some(filter_idx) = live_filter {
             let matches = filter_idx.matches_found();
             self.filter_index = Some(filter_idx);
             if let Some(progress) = self.filter_progress.as_mut() {

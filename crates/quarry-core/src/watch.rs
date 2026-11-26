@@ -976,6 +976,29 @@ impl LiveWatchJob {
         self.shared.snapshot.read().unwrap().clone()
     }
 
+    /// Captures a mutually consistent `(WatchSnapshot, StructuralIndex, Option<FilterIndex>)`
+    /// under the canonical `index -> filter -> snapshot` lock order so UI row counts,
+    /// `appended_rows`, and filter match counts can never skew across concurrent commits.
+    pub fn state_snapshot(&self) -> (WatchSnapshot, StructuralIndex, Option<FilterIndex>) {
+        let index = self.shared.index.read().unwrap().clone();
+        let filter = self
+            .shared
+            .filter
+            .read()
+            .unwrap()
+            .as_ref()
+            .map(|f| f.index.clone());
+        let mut snap = self.shared.snapshot.read().unwrap().clone();
+        snap.committed_rows = index.indexed_rows();
+        snap.committed_record_end = index.committed_record_end();
+        snap.appended_rows = index
+            .indexed_rows()
+            .saturating_sub(self.shared.initial_committed_rows);
+        snap.maximum_width = index.maximum_width();
+        snap.filter_matches_found = filter.as_ref().map(FilterIndex::matches_found);
+        (snap, index, filter)
+    }
+
     pub fn index_snapshot(&self) -> StructuralIndex {
         self.shared.index.read().unwrap().clone()
     }
