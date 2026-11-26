@@ -499,17 +499,17 @@ impl TailScanner {
             }
 
             // Advance `maximum_width` only from accepted records (avoiding width leakage from a
-            // later record in the same chunk that fails `max_record_bytes` or encoding validation).
-            if self.scanner.maximum_width() > index.maximum_width()
-                && let Ok(fields) = parse_encoded_record_with_bom(
+            // later record in the same chunk that fails `max_record_bytes` or encoding validation),
+            // counting unquoted delimiters in-place with zero heap allocation so wide comma-only
+            // records cannot amplify memory beyond the raw byte cap.
+            if self.scanner.maximum_width() > index.maximum_width() {
+                let width = count_encoded_record_fields(
                     record_slice,
                     self.delimiter,
-                    row_number,
                     record_start == 0,
                     self.encoding,
-                )
-            {
-                index.set_maximum_width(index.maximum_width().max(fields.len()));
+                );
+                index.set_maximum_width(index.maximum_width().max(width));
             }
             append_to_seam_buf(&mut self.seam_bytes, record_slice);
             index.record_boundary(absolute_end);
@@ -607,7 +607,13 @@ impl TailScanner {
         let seam_copy = self.provisional_bytes.clone();
         self.append_to_seam(&seam_copy);
         index.record_boundary(end);
-        index.set_maximum_width(self.scanner.maximum_width());
+        let width = count_encoded_record_fields(
+            &self.provisional_bytes,
+            self.delimiter,
+            record_start == 0,
+            self.encoding,
+        );
+        index.set_maximum_width(index.maximum_width().max(width));
         self.committed_record_end = end;
         self.provisional_bytes.clear();
         Ok(true)
@@ -657,6 +663,57 @@ enum SeamCheck {
     Ok,
     Truncated { current_len: u64 },
     Rewritten,
+}
+
+/// Counts logical fields in a structurally validated record with zero heap allocation, matching
+/// `StructuralScanner::end_record` (`unquoted_delimiters + 1`).
+fn count_encoded_record_fields(
+    record: &[u8],
+    delimiter: u8,
+    strip_bom: bool,
+    encoding: Encoding,
+) -> usize {
+    let body = if strip_bom {
+        encoding.strip_bom(record).1
+    } else {
+        record
+    };
+    if !encoding.is_utf16() {
+        let mut fields = 1usize;
+        let mut in_quotes = false;
+        for &byte in body {
+            if byte == b'"' {
+                in_quotes = !in_quotes;
+            } else if !in_quotes && byte == delimiter {
+                fields = fields.saturating_add(1);
+            } else if !in_quotes && (byte == b'\r' || byte == b'\n') {
+                break;
+            }
+        }
+        fields
+    } else {
+        let mut fields = 1usize;
+        let mut in_quotes = false;
+        let delim = u16::from(delimiter);
+        let quote = u16::from(b'"');
+        let cr = u16::from(b'\r');
+        let lf = u16::from(b'\n');
+        for &pair in body.as_chunks::<2>().0 {
+            let unit = match encoding {
+                Encoding::Utf16Le => u16::from_le_bytes(pair),
+                Encoding::Utf16Be => u16::from_be_bytes(pair),
+                _ => unreachable!("non-UTF-16 encoding handled above"),
+            };
+            if unit == quote {
+                in_quotes = !in_quotes;
+            } else if !in_quotes && unit == delim {
+                fields = fields.saturating_add(1);
+            } else if !in_quotes && (unit == cr || unit == lf) {
+                break;
+            }
+        }
+        fields
+    }
 }
 
 fn append_to_seam_buf(seam_bytes: &mut Vec<u8>, committed_slice: &[u8]) {
@@ -1945,12 +2002,19 @@ fn drain_open_fd(
 
         let mut index_guard = shared.index.write().unwrap();
         let mut filter_guard = shared.filter.write().unwrap();
-        match tail.feed_bytes(
+        let feed_result = tail.feed_bytes(
             Some(&shared.open_file),
             &read_buf[..read],
             &mut index_guard,
             filter_guard.as_mut(),
-        )? {
+        );
+        // Publish the updated frontier and generation under the same `index -> filter -> snapshot`
+        // lock scope so `state_snapshot()` can never observe a newly committed index paired with
+        // an earlier snapshot or generation.
+        update_snapshot_under_locks(shared, tail, &index_guard, filter_guard.as_ref());
+        drop(filter_guard);
+        drop(index_guard);
+        match feed_result? {
             FeedOutcome::Committed(committed) => {
                 if committed > 0 {
                     changed = true;
@@ -2010,6 +2074,27 @@ fn reconcile_once(
     } else {
         ReconcileOutcome::Unchanged
     })
+}
+
+fn update_snapshot_under_locks(
+    shared: &WatchShared,
+    tail: &TailScanner,
+    index: &StructuralIndex,
+    filter: Option<&WatchFilterState>,
+) {
+    let committed_rows = index.indexed_rows();
+    let maximum_width = index.maximum_width();
+    let filter_matches_found = filter.map(|f| f.index.matches_found());
+    let mut snap = shared.snapshot.write().unwrap();
+    snap.observed_file_len = tail.observed_file_len;
+    snap.scanner_consumed_bytes = tail.scanner_consumed_bytes;
+    snap.committed_record_end = tail.committed_record_end;
+    snap.committed_rows = committed_rows;
+    snap.appended_rows = committed_rows.saturating_sub(shared.initial_committed_rows);
+    snap.maximum_width = maximum_width;
+    snap.provisional_tail = tail.provisional_tail();
+    snap.filter_matches_found = filter_matches_found;
+    snap.generation = snap.generation.saturating_add(1);
 }
 
 fn publish_snapshot(
@@ -3532,5 +3617,42 @@ mod tests {
             WatchStatus::Alert(WatchAlert::IoError(_))
         ));
         assert!(!stopped.index.is_complete());
+    }
+
+    #[test]
+    fn wide_comma_row_updates_maximum_width_without_materializing_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wide_commas.csv");
+        std::fs::write(&path, b"id,v\n1,ok\n").unwrap();
+
+        let (session, index) = open_and_index(&path, Some(Encoding::Utf8), HeaderMode::FirstRow);
+        let watch = session
+            .start_live_watch(
+                &index,
+                None,
+                WatchConfig {
+                    poll_interval: Duration::from_millis(15),
+                    cache_config: IndexCacheConfig::disabled(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        // Append a 1 MiB comma-only row (1_048_577 empty fields); counting width must stay O(1) RAM.
+        let mut wide_row = vec![b','; 1024 * 1024];
+        wide_row.push(b'\n');
+        let mut f = FsOpenOptions::new().append(true).open(&path).unwrap();
+        f.write_all(&wide_row).unwrap();
+        f.flush().unwrap();
+        watch.nudge();
+
+        assert!(wait_until(Duration::from_secs(3), || {
+            watch.snapshot().committed_rows == 3
+        }));
+        assert_eq!(watch.snapshot().maximum_width, 1024 * 1024 + 1);
+
+        let stopped = watch.stop().unwrap();
+        assert_eq!(stopped.final_status, WatchStatus::Stopped);
+        assert_eq!(stopped.index.maximum_width(), 1024 * 1024 + 1);
     }
 }
