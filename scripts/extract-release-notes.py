@@ -14,6 +14,8 @@ DEFAULT_CHANGELOG = ROOT / "CHANGELOG.md"
 DATE_HEADING_RE = re.compile(r"^## \[(\d{4}-\d{2}-\d{2})\]\s*$")
 GROUP_HEADING_RE = re.compile(r"^### (Added|Changed|Removed|Fixed|Security)\s*$")
 GROUP_ORDER = ("Added", "Changed", "Removed", "Fixed", "Security")
+TRAILING_PR_RE = re.compile(r"\((#\d+(?:,\s*#\d+)*)\)\s*$")
+MARKDOWN_LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)\s]+)\)")
 
 
 def ref_exists(repo_root: Path, ref: str) -> bool:
@@ -180,23 +182,13 @@ def extract_sections(
     return included_dates, grouped
 
 
-def extract_diff_since_changelog(
-    current_text: str,
-    previous_text: str,
-) -> tuple[list[str], dict[str, list[str]]]:
-    """Extract bullets added to `current_text` relative to `previous_text`, even on the same date."""
-    _, prev_grouped = extract_sections(previous_text)
-    prev_bullets: dict[str, set[str]] = {
-        group: set(bullets) for group, bullets in prev_grouped.items()
-    }
-
-    included_dates: list[str] = []
-    grouped: dict[str, list[str]] = {group: [] for group in GROUP_ORDER}
+def parse_dated_bullets(changelog_text: str) -> list[tuple[str, str, str]]:
+    """Return `(date_str, group, bullet)` tuples in document order."""
     current_date: str | None = None
     current_group: str | None = None
-    pending_bullets: list[tuple[str, str, str]] = []
+    entries: list[tuple[str, str, str]] = []
 
-    for raw_line in current_text.splitlines():
+    for raw_line in changelog_text.splitlines():
         line = raw_line.rstrip()
         date_match = DATE_HEADING_RE.match(line)
         if date_match:
@@ -210,14 +202,61 @@ def extract_diff_since_changelog(
         if current_date is None or current_group is None:
             continue
         if line.startswith("- "):
-            pending_bullets.append((current_date, current_group, line))
-        elif line.startswith("  ") and pending_bullets:
-            d, g, prev_line = pending_bullets[-1]
-            pending_bullets[-1] = (d, g, prev_line + " " + line.strip())
+            entries.append((current_date, current_group, line))
+        elif line.startswith("  ") and entries:
+            d, g, prev_line = entries[-1]
+            entries[-1] = (d, g, prev_line + " " + line.strip())
 
+    return entries
+
+
+def trailing_pr_refs(bullet: str) -> frozenset[str]:
+    """Extract trailing PR references such as `(#146)` or `(#146, #147)`."""
+    match = TRAILING_PR_RE.search(bullet)
+    if not match:
+        return frozenset()
+    return frozenset(ref.strip() for ref in match.group(1).split(",") if ref.strip())
+
+
+def rebase_relative_links(text: str, *, repo: str, ref: str) -> str:
+    """Rewrite repository-relative Markdown links onto GitHub blob URLs."""
+    def _replace(match: re.Match[str]) -> str:
+        label, target = match.group(1), match.group(2)
+        if target.startswith(("http://", "https://", "mailto:", "#", "/")):
+            return match.group(0)
+        clean_target = target[2:] if target.startswith("./") else target
+        return f"[{label}](https://github.com/{repo}/blob/{ref}/{clean_target})"
+
+    return MARKDOWN_LINK_RE.sub(_replace, text)
+
+
+def extract_diff_since_changelog(
+    current_text: str,
+    previous_text: str,
+) -> tuple[list[str], dict[str, list[str]]]:
+    """Extract bullets added to `current_text` relative to `previous_text`, even on the same date.
+
+    Matches previously released bullets by stable `(date, group, trailing PR refs)` identity
+    when PR references are present (so wording edits to historical entries are not treated as
+    new changes), falling back to exact bullet text when no trailing PR reference exists.
+    """
+    prev_entries = parse_dated_bullets(previous_text)
+    prev_exact: dict[str, set[str]] = {group: set() for group in GROUP_ORDER}
+    prev_pr_refs_by_bucket: dict[tuple[str, str], set[str]] = {}
+    for date_str, group, bullet in prev_entries:
+        prev_exact[group].add(bullet)
+        refs = trailing_pr_refs(bullet)
+        if refs:
+            prev_pr_refs_by_bucket.setdefault((date_str, group), set()).update(refs)
+
+    included_dates: list[str] = []
+    grouped: dict[str, list[str]] = {group: [] for group in GROUP_ORDER}
     seen_dates: set[str] = set()
-    for date_str, group, bullet in pending_bullets:
-        if bullet in prev_bullets[group]:
+    for date_str, group, bullet in parse_dated_bullets(current_text):
+        if bullet in prev_exact[group]:
+            continue
+        refs = trailing_pr_refs(bullet)
+        if refs and refs.issubset(prev_pr_refs_by_bucket.get((date_str, group), set())):
             continue
         grouped[group].append(bullet)
         if date_str not in seen_dates:
@@ -261,6 +300,7 @@ def format_release_notes(
         else:
             lines.append(f"\n_Compiled from `CHANGELOG.md` ({dates[-1]} through {dates[0]})._")
 
+    link_ref = tag or "main"
     any_bullets = False
     for group in GROUP_ORDER:
         bullets = grouped[group]
@@ -268,7 +308,7 @@ def format_release_notes(
             continue
         any_bullets = True
         lines.append(f"\n### {group}\n")
-        lines.extend(bullets)
+        lines.extend(rebase_relative_links(bullet, repo=repo, ref=link_ref) for bullet in bullets)
 
     if not any_bullets:
         lines.append("\nNo new `CHANGELOG.md` entries found in the selected range.")
@@ -281,7 +321,7 @@ def format_release_notes(
     lines.append(
         "- **Linux & Omarchy (`x86_64` / `arm64`):** Build from source via [`docs/LINUX_AND_OMARCHY.md`](https://github.com/"
         + repo
-        + "/blob/main/docs/LINUX_AND_OMARCHY.md) while multi-target Linux packaging completes for v1.0."
+        + f"/blob/{link_ref}/docs/LINUX_AND_OMARCHY.md) while multi-target Linux packaging completes for v1.0."
     )
     lines.append(
         "- **Verify downloads:** Check `SHA256SUMS-macos-arm64.txt` with `shasum -a 256 -c SHA256SUMS-macos-arm64.txt`."

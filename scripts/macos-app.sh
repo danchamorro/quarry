@@ -519,6 +519,10 @@ release_app() {
     fi
     [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] \
         || fail "release tag must match vX.Y.Z or vX.Y.Z-prerelease: $tag"
+    local tag_base_version="${tag#v}"
+    tag_base_version="${tag_base_version%%-*}"
+    [[ "$tag_base_version" == "$version" ]] \
+        || fail "release tag $tag base version ($tag_base_version) does not match packaged app version ($version)."
     local tag_commit
     if tag_commit="$(git -C "$ROOT" rev-parse --verify "refs/tags/$tag^{commit}" 2>/dev/null)"; then
         [[ "$tag_commit" == "$revision" ]] \

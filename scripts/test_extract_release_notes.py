@@ -99,6 +99,59 @@ class ExtractReleaseNotesTests(unittest.TestCase):
         self.assertNotIn("Earlier same-day entry", notes)
         self.assertIn("(2026-11-26)", notes)
 
+    def test_reworded_historical_entry_with_same_pr_ref_is_excluded(self) -> None:
+        previous = """# Changelog
+
+## [2026-11-21]
+
+### Changed
+
+- Simplified Join Files with a long original description. (#146)
+"""
+        current = """# Changelog
+
+## [2026-11-21]
+
+### Changed
+
+- Hardened benchmark runner. (#155)
+- Simplified Join Files into a concise description. (#146)
+"""
+        notes = MOD.format_release_notes(
+            current,
+            tag="v0.2.0-beta.1",
+            previous_tag="v0.1.0-beta.3",
+            previous_changelog_text=previous,
+        )
+        self.assertIn("- Hardened benchmark runner. (#155)", notes)
+        self.assertNotIn("(#146)", notes)
+
+    def test_rebases_repository_relative_links_to_release_tag_blob_urls(self) -> None:
+        changelog = """# Changelog
+
+## [2026-11-26]
+
+### Added
+
+- Documented in [ADR 0015](docs/adr/0015-guarded-section-splice-save.md) and [external](https://example.com/guide). (#213)
+"""
+        notes = MOD.format_release_notes(
+            changelog,
+            tag="v0.2.0-beta.1",
+            previous_tag="v0.1.0-beta.3",
+            previous_changelog_text="",
+            repo="danchamorro/quarry",
+        )
+        self.assertIn(
+            "[ADR 0015](https://github.com/danchamorro/quarry/blob/v0.2.0-beta.1/docs/adr/0015-guarded-section-splice-save.md)",
+            notes,
+        )
+        self.assertIn("[external](https://example.com/guide)", notes)
+        self.assertIn(
+            "https://github.com/danchamorro/quarry/blob/v0.2.0-beta.1/docs/LINUX_AND_OMARCHY.md",
+            notes,
+        )
+
     def test_previous_tag_for_selects_ancestor_not_newer_tag(self) -> None:
         with tempfile.TemporaryDirectory(prefix="quarry-tag-test-") as tmp:
             repo = Path(tmp)
