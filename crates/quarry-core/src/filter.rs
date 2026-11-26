@@ -442,39 +442,41 @@ impl FilterIndex {
             let mut deferred_error = None;
             scanner.scan_chunk(&chunk[..effective_read], absolute_start, |absolute_end| {
                 let local_end = (absolute_end - absolute_start) as usize;
-                record.extend_from_slice(&chunk[segment_start..local_end]);
-                if record.len() > max_record_bytes {
-                    deferred_error = Some(QuarryError::RecordTooLarge {
-                        limit: max_record_bytes,
-                    });
-                } else if deferred_error.is_none() && match_ordinal < plan.target_end {
-                    match matching_fields_with_edits(
-                        &record,
-                        delimiter,
-                        row_number,
-                        record_start == 0,
-                        &plan.query,
-                        &matchers,
-                        &groups,
-                        &plan.edits,
-                        encoding,
-                    ) {
-                        Ok(Some(fields)) => {
-                            if match_ordinal >= plan.start_match {
-                                rows.push(FilterMatch {
-                                    match_ordinal,
-                                    row: row_number,
-                                    record_offset: record_start,
-                                    fields: fields
-                                        .into_iter()
-                                        .map(|field| field.into_owned())
-                                        .collect(),
-                                });
+                if deferred_error.is_none() && match_ordinal < plan.target_end {
+                    record.extend_from_slice(&chunk[segment_start..local_end]);
+                    if record.len() > max_record_bytes {
+                        deferred_error = Some(QuarryError::RecordTooLarge {
+                            limit: max_record_bytes,
+                        });
+                    } else {
+                        match matching_fields_with_edits(
+                            &record,
+                            delimiter,
+                            row_number,
+                            record_start == 0,
+                            &plan.query,
+                            &matchers,
+                            &groups,
+                            &plan.edits,
+                            encoding,
+                        ) {
+                            Ok(Some(fields)) => {
+                                if match_ordinal >= plan.start_match {
+                                    rows.push(FilterMatch {
+                                        match_ordinal,
+                                        row: row_number,
+                                        record_offset: record_start,
+                                        fields: fields
+                                            .into_iter()
+                                            .map(|field| field.into_owned())
+                                            .collect(),
+                                    });
+                                }
+                                match_ordinal += 1;
                             }
-                            match_ordinal += 1;
+                            Ok(None) => {}
+                            Err(error) => deferred_error = Some(error),
                         }
-                        Ok(None) => {}
-                        Err(error) => deferred_error = Some(error),
                     }
                 }
                 record.clear();

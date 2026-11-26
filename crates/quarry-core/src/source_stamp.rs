@@ -359,6 +359,22 @@ impl SourceStamp {
         self.len
     }
 
+    /// Returns `true` when content-bearing metadata (`len`, `modified`, or macOS
+    /// `data_generation`) changed relative to `previous`. Unlike [`Self::matches`], this ignores
+    /// metadata-only `ctime` updates (such as `rename()` or `chmod()`), which Live Watch handles
+    /// separately via path-identity checks.
+    pub(crate) fn content_version_changed(&self, previous: &Self) -> bool {
+        #[cfg(target_os = "macos")]
+        if let (Some(current), Some(prev)) = (self.data_generation, previous.data_generation)
+            && current != 0
+            && prev != 0
+            && current != prev
+        {
+            return true;
+        }
+        self.len != previous.len || self.modified != previous.modified
+    }
+
     pub(crate) fn file_identity(&self) -> Option<FileIdentity> {
         #[cfg(unix)]
         {

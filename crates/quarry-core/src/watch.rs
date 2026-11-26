@@ -203,6 +203,11 @@ impl WatchFilterState {
     }
 }
 
+enum FeedOutcome {
+    Committed(u64),
+    Alert(WatchAlert),
+}
+
 /// Stateful tail scanner tracking the three watch frontiers and carrying all partial record /
 /// encoding state across arbitrary write splits.
 struct TailScanner {
@@ -216,6 +221,7 @@ struct TailScanner {
     scanner_consumed_bytes: u64,
     committed_record_end: u64,
     seam_bytes: Vec<u8>,
+    last_verified_stamp: SourceStamp,
 }
 
 impl TailScanner {
@@ -226,6 +232,7 @@ impl TailScanner {
         delimiter: u8,
         encoding: Encoding,
         max_record_bytes: usize,
+        last_verified_stamp: SourceStamp,
     ) -> Result<Self, QuarryError> {
         let scanner = EncodedScanner::<true>::at_offset_with_bom_handling(
             delimiter,
@@ -245,10 +252,44 @@ impl TailScanner {
             scanner_consumed_bytes: committed_record_end,
             committed_record_end,
             seam_bytes,
+            last_verified_stamp,
         })
     }
 
-    fn verify_seam(&self, open_file: &File) -> Result<SeamCheck, QuarryError> {
+    fn verify_provisional_range(
+        &self,
+        open_file: &File,
+        start_idx: usize,
+    ) -> Result<SeamCheck, QuarryError> {
+        if start_idx >= self.provisional_bytes.len() {
+            return Ok(SeamCheck::Ok);
+        }
+        const VERIFY_CHUNK: usize = 64 * 1024;
+        let remaining_total = self.provisional_bytes.len() - start_idx;
+        let mut buf = vec![0u8; remaining_total.min(VERIFY_CHUNK)];
+        let mut verified = start_idx;
+        while verified < self.provisional_bytes.len() {
+            let want = (self.provisional_bytes.len() - verified).min(buf.len());
+            let offset = self.committed_record_end + verified as u64;
+            let read = read_at_exact_or_eof(open_file, offset, &mut buf[..want])?;
+            if read < want {
+                return Ok(SeamCheck::Truncated {
+                    current_len: offset + read as u64,
+                });
+            }
+            if buf[..read] != self.provisional_bytes[verified..verified + read] {
+                return Ok(SeamCheck::Rewritten);
+            }
+            verified += read;
+        }
+        Ok(SeamCheck::Ok)
+    }
+
+    fn verify_seam(
+        &self,
+        open_file: &File,
+        verify_full_provisional: bool,
+    ) -> Result<SeamCheck, QuarryError> {
         if !self.seam_bytes.is_empty() {
             let start = self
                 .committed_record_end
@@ -264,27 +305,19 @@ impl TailScanner {
                 return Ok(SeamCheck::Rewritten);
             }
         }
-        // Also verify all retained provisional tail bytes against the pinned descriptor so a
-        // same-size in-place rewrite of uncommitted bytes cannot be finalized as stale cached data
-        // or published into a valid-looking sidecar.
+        // Verify retained provisional tail bytes against the pinned descriptor. On ordinary ticks
+        // and non-terminating appends, bound verification to at most the trailing 4 KiB window so
+        // an idle or slowly growing 64 MiB unfinished record cannot drive perpetual or quadratic
+        // `pread` loops. Full provisional verification runs strictly before committing a
+        // terminated record (`feed_bytes`) and before clean-stop finalization (`stop`).
         if !self.provisional_bytes.is_empty() {
-            const VERIFY_CHUNK: usize = 64 * 1024;
-            let mut buf = vec![0u8; self.provisional_bytes.len().min(VERIFY_CHUNK)];
-            let mut verified = 0usize;
-            while verified < self.provisional_bytes.len() {
-                let want = (self.provisional_bytes.len() - verified).min(buf.len());
-                let offset = self.committed_record_end + verified as u64;
-                let read = read_at_exact_or_eof(open_file, offset, &mut buf[..want])?;
-                if read < want {
-                    return Ok(SeamCheck::Truncated {
-                        current_len: offset + read as u64,
-                    });
-                }
-                if buf[..read] != self.provisional_bytes[verified..verified + read] {
-                    return Ok(SeamCheck::Rewritten);
-                }
-                verified += read;
-            }
+            let start_idx =
+                if verify_full_provisional || self.provisional_bytes.len() <= SEAM_WINDOW_BYTES {
+                    0
+                } else {
+                    self.provisional_bytes.len() - SEAM_WINDOW_BYTES
+                };
+            return self.verify_provisional_range(open_file, start_idx);
         }
         Ok(SeamCheck::Ok)
     }
@@ -297,12 +330,13 @@ impl TailScanner {
     /// newline-terminated record into `index` and incrementally evaluating `filter` if present.
     fn feed_bytes(
         &mut self,
+        open_file: Option<&File>,
         new_bytes: &[u8],
         index: &mut StructuralIndex,
         mut filter: Option<&mut WatchFilterState>,
-    ) -> Result<u64, QuarryError> {
+    ) -> Result<FeedOutcome, QuarryError> {
         if new_bytes.is_empty() {
-            return Ok(0);
+            return Ok(FeedOutcome::Committed(0));
         }
 
         // Enforce the 64 MiB uncommitted-tail cap incrementally as bytes arrive.
@@ -329,7 +363,7 @@ impl TailScanner {
                         limit: self.max_record_bytes,
                     });
                 }
-                return Ok(0);
+                return Ok(FeedOutcome::Committed(0));
             }
             let even_len = total_len & !1;
             let abs_start = feed_start_offset - carry_len as u64;
@@ -347,23 +381,48 @@ impl TailScanner {
             (new_bytes, feed_start_offset)
         };
 
-        // Compile filter matchers once per batch when a filter is active.
+        // Scan chunk, capturing any parse error so valid newline-terminated records emitted before
+        // the error are committed consistently with split reads before returning the error.
         let mut field_ranges: Vec<(usize, usize)> = Vec::new();
         let mut record_ends: Vec<u64> = Vec::new();
-        self.scanner
+        let scan_result = self
+            .scanner
             .scan_chunk(scan_slice, scan_abs_start, |absolute_end| {
                 record_ends.push(absolute_end);
-            })?;
+            });
 
         let mut consumed_from_new = 0usize;
         if record_ends.is_empty() {
+            scan_result?;
             self.provisional_bytes.extend_from_slice(new_bytes);
             if self.provisional_bytes.len() > self.max_record_bytes {
                 return Err(QuarryError::RecordTooLarge {
                     limit: self.max_record_bytes,
                 });
             }
-            return Ok(0);
+            return Ok(FeedOutcome::Committed(0));
+        }
+
+        // Before committing a record that incorporates retained provisional bytes, verify the full
+        // provisional prefix against the pinned descriptor once so no rewritten uncommitted bytes
+        // can ever be committed into the index or filter.
+        if !self.provisional_bytes.is_empty()
+            && let Some(file) = open_file
+        {
+            match self.verify_provisional_range(file, 0)? {
+                SeamCheck::Ok => {}
+                SeamCheck::Truncated { current_len } => {
+                    let previous_len = self.observed_file_len.max(self.committed_record_end);
+                    self.observed_file_len = current_len;
+                    return Ok(FeedOutcome::Alert(WatchAlert::Truncated {
+                        previous_len,
+                        current_len,
+                    }));
+                }
+                SeamCheck::Rewritten => {
+                    return Ok(FeedOutcome::Alert(WatchAlert::Rewritten));
+                }
+            }
         }
 
         // Pre-compile filter matchers once for all committed records in this chunk.
@@ -439,14 +498,29 @@ impl TailScanner {
                 }
             }
 
+            // Advance `maximum_width` only from accepted records (avoiding width leakage from a
+            // later record in the same chunk that fails `max_record_bytes` or encoding validation).
+            if self.scanner.maximum_width() > index.maximum_width()
+                && let Ok(fields) = parse_encoded_record_with_bom(
+                    record_slice,
+                    self.delimiter,
+                    row_number,
+                    record_start == 0,
+                    self.encoding,
+                )
+            {
+                index.set_maximum_width(index.maximum_width().max(fields.len()));
+            }
             append_to_seam_buf(&mut self.seam_bytes, record_slice);
             index.record_boundary(absolute_end);
-            index.set_maximum_width(self.scanner.maximum_width());
             self.committed_record_end = absolute_end;
             self.provisional_bytes.clear();
             consumed_from_new = local_end_in_new;
             newly_committed += 1;
         }
+
+        // Propagate any parse error after committing the valid prefix; never save the errored suffix.
+        scan_result?;
 
         // Retain any remaining uncommitted tail bytes past the last newline.
         if consumed_from_new < new_bytes.len() {
@@ -459,7 +533,7 @@ impl TailScanner {
             self.provisional_bytes.extend_from_slice(tail);
         }
 
-        Ok(newly_committed)
+        Ok(FeedOutcome::Committed(newly_committed))
     }
 
     /// Finalizes any non-empty provisional EOF record when the user cleanly stops Live Watch.
@@ -816,7 +890,13 @@ impl LiveWatchJob {
         }
 
         let mut live_index = index.clone();
-        let mut live_filter = active_filter.map(|f| WatchFilterState::new(f.clone(), data_start));
+        let mut live_filter = active_filter.map(|f| {
+            let mut cloned = f.clone();
+            // Live filter snapshots track the growing committed frontier and are not eligible
+            // as whole-file baselines for another `start_live_watch` until clean stop.
+            cloned.set_complete(false);
+            WatchFilterState::new(cloned, data_start)
+        });
 
         // If the baseline file ended without a trailing newline, roll back that final row so it
         // remains provisional until the writer finishes and terminates it with a newline.
@@ -885,9 +965,10 @@ impl LiveWatchJob {
             delimiter,
             encoding,
             config.max_record_bytes,
+            session.source_stamp.clone(),
         )?;
         if let Some(tail_buf) = baseline_tail_bytes {
-            tail.feed_bytes(&tail_buf, &mut live_index, live_filter.as_mut())?;
+            let _ = tail.feed_bytes(None, &tail_buf, &mut live_index, live_filter.as_mut())?;
         }
 
         let network_fs = is_network_filesystem(&open_file);
@@ -1047,17 +1128,18 @@ impl LiveWatchJob {
         start_match: u64,
         count: usize,
     ) -> Result<Vec<FilterMatch>, QuarryError> {
-        let committed_end = self.shared.index.read().unwrap().committed_record_end();
-        let filter_index = self
-            .shared
-            .filter
-            .read()
-            .unwrap()
-            .as_ref()
-            .map(|f| f.index.clone())
-            .ok_or(QuarryError::InvalidOption(
-                "no active filter is attached to this Live Watch session",
-            ))?;
+        // Hold `index` then `filter` together so `committed_end` and `filter_index` always reflect
+        // the exact same committed boundary.
+        let (committed_end, filter_index) = {
+            let index_guard = self.shared.index.read().unwrap();
+            let filter_guard = self.shared.filter.read().unwrap();
+            let committed_end = index_guard.committed_record_end();
+            let filter_index = filter_guard.as_ref().map(|f| f.index.clone());
+            (committed_end, filter_index)
+        };
+        let filter_index = filter_index.ok_or(QuarryError::InvalidOption(
+            "no active filter is attached to this Live Watch session",
+        ))?;
         filter_index.read_matches_from_file(
             &self.shared.open_file,
             self.shared.delimiter,
@@ -1187,6 +1269,20 @@ impl LiveWatchJob {
         }
 
         if matches!(final_status, WatchStatus::Stopped) {
+            match check_path_identity(&self.shared.path, self.shared.open_identity) {
+                PathIdentityCheck::SameFile => {}
+                PathIdentityCheck::Replaced => {
+                    final_status = WatchStatus::Alert(WatchAlert::Rotated);
+                }
+                PathIdentityCheck::Missing => {
+                    final_status = WatchStatus::Alert(WatchAlert::IoError(
+                        "Watched file was moved or unlinked on disk.".into(),
+                    ));
+                }
+            }
+        }
+
+        if matches!(final_status, WatchStatus::Stopped) {
             let stamp_before = SourceStamp::from_file(&self.shared.open_file)?;
             if stamp_before.file_size() < tail.scanner_consumed_bytes {
                 final_status = WatchStatus::Alert(WatchAlert::Truncated {
@@ -1198,11 +1294,13 @@ impl LiveWatchJob {
                     "File continued growing while stopping Live Watch. Reload from disk to view the latest rows."
                         .into(),
                 ));
+            } else if stamp_before.content_version_changed(&tail.last_verified_stamp) {
+                final_status = WatchStatus::Alert(WatchAlert::Rewritten);
             } else {
-                match tail.verify_seam(&self.shared.open_file)? {
+                match tail.verify_seam(&self.shared.open_file, true)? {
                     SeamCheck::Ok => {
                         let stamp_after = SourceStamp::from_file(&self.shared.open_file)?;
-                        if stamp_after != stamp_before {
+                        if stamp_after.content_version_changed(&stamp_before) {
                             final_status = if stamp_after.file_size() < stamp_before.file_size() {
                                 WatchStatus::Alert(WatchAlert::Truncated {
                                     previous_len: stamp_before.file_size(),
@@ -1240,11 +1338,16 @@ impl LiveWatchJob {
         let clean_eof = matches!(final_status, WatchStatus::Stopped)
             && index.committed_record_end() == final_stamp.file_size();
         index.set_complete(clean_eof);
-        index.set_provenance(
-            final_stamp.clone(),
-            self.shared.delimiter,
-            self.shared.encoding,
-        );
+        // Only bind provenance of structural and filter indexes to `final_stamp` on verified clean
+        // EOF so stale indexes from a rewritten/truncated/unlinked source can never validate
+        // against the changed file.
+        if clean_eof {
+            index.set_provenance(
+                final_stamp.clone(),
+                self.shared.delimiter,
+                self.shared.encoding,
+            );
+        }
 
         // On alert/incomplete stop, reuse the baseline `first_rows` captured at watch start so a
         // corrupted or malformed file at row 0 can never block alert delivery.
@@ -1261,14 +1364,18 @@ impl LiveWatchJob {
         )?;
 
         let filter_index = filter_state.map(|mut state| {
-            state.index.update_source_after_watch(
-                self.shared.path.clone(),
-                final_stamp.clone(),
-                self.shared.delimiter,
-                self.shared.data_start,
-                self.shared.encoding,
-                clean_eof,
-            );
+            if clean_eof {
+                state.index.update_source_after_watch(
+                    self.shared.path.clone(),
+                    final_stamp.clone(),
+                    self.shared.delimiter,
+                    self.shared.data_start,
+                    self.shared.encoding,
+                    true,
+                );
+            } else {
+                state.index.set_complete(false);
+            }
             state.index
         });
 
@@ -1537,7 +1644,9 @@ fn attach_filter_query_shared(
         {
             return Ok(None);
         }
-        filter_index.set_complete(true);
+        // Keep `complete = false` while Live Watch is active so live filter snapshots cannot be
+        // reused as whole-file static baselines before clean stop.
+        filter_index.set_complete(false);
         let snapshot_index = filter_index.clone();
         *filter_guard = Some(WatchFilterState::new(filter_index, shared.data_start));
         {
@@ -1590,7 +1699,13 @@ fn run_watch_loop(
                     Ok(ReconcileOutcome::Changed | ReconcileOutcome::Unchanged) => {}
                 }
             }
-            status = WatchStatus::Stopped;
+            if status == WatchStatus::FollowingUnlinked {
+                status = WatchStatus::Alert(WatchAlert::IoError(
+                    "Watched file was moved or unlinked on disk.".into(),
+                ));
+            } else {
+                status = WatchStatus::Stopped;
+            }
             publish_snapshot(&shared, &tail, &status, events_coalesced);
             return WatchWorkerResult {
                 tail,
@@ -1681,8 +1796,8 @@ fn drain_open_fd_locked(
 ) -> Result<DrainOutcome, QuarryError> {
     let mut changed = false;
 
-    let meta = open_file.metadata()?;
-    let current_len = meta.len();
+    let current_stamp = SourceStamp::from_file(open_file)?;
+    let current_len = current_stamp.file_size();
     if current_len < tail.observed_file_len || current_len < tail.committed_record_end {
         let previous_len = tail.observed_file_len.max(tail.committed_record_end);
         tail.observed_file_len = current_len;
@@ -1691,8 +1806,12 @@ fn drain_open_fd_locked(
             current_len,
         }));
     }
+    let stamp_changed = current_stamp.content_version_changed(&tail.last_verified_stamp);
+    if stamp_changed && current_len == tail.observed_file_len {
+        return Ok(DrainOutcome::Alert(WatchAlert::Rewritten));
+    }
 
-    match tail.verify_seam(open_file)? {
+    match tail.verify_seam(open_file, false)? {
         SeamCheck::Ok => {}
         SeamCheck::Truncated { current_len } => {
             let previous_len = tail.observed_file_len.max(tail.committed_record_end);
@@ -1731,11 +1850,22 @@ fn drain_open_fd_locked(
             }));
         }
 
-        let committed = tail.feed_bytes(&read_buf[..read], index, filter.as_deref_mut())?;
-        if committed > 0 {
-            changed = true;
+        match tail.feed_bytes(
+            Some(open_file),
+            &read_buf[..read],
+            index,
+            filter.as_deref_mut(),
+        )? {
+            FeedOutcome::Committed(committed) => {
+                if committed > 0 {
+                    changed = true;
+                }
+            }
+            FeedOutcome::Alert(alert) => return Ok(DrainOutcome::Alert(alert)),
         }
     }
+
+    tail.last_verified_stamp = current_stamp;
 
     Ok(if changed {
         DrainOutcome::Changed
@@ -1751,9 +1881,10 @@ fn drain_open_fd(
 ) -> Result<DrainOutcome, QuarryError> {
     let mut changed = false;
 
-    // 1. Reconcile open FD size and catch truncation before reading.
-    let meta = shared.open_file.metadata()?;
-    let current_len = meta.len();
+    // 1. Reconcile open FD size and source version to catch truncation and same-size in-place
+    //    rewrites (even earlier than the 4 KiB tail seam when content metadata changes without growth).
+    let current_stamp = SourceStamp::from_file(&shared.open_file)?;
+    let current_len = current_stamp.file_size();
     if current_len < tail.observed_file_len || current_len < tail.committed_record_end {
         let previous_len = tail.observed_file_len.max(tail.committed_record_end);
         tail.observed_file_len = current_len;
@@ -1762,9 +1893,16 @@ fn drain_open_fd(
             current_len,
         }));
     }
+    let stamp_changed = current_stamp.content_version_changed(&tail.last_verified_stamp);
+    if stamp_changed && current_len == tail.observed_file_len {
+        return Ok(DrainOutcome::Alert(WatchAlert::Rewritten));
+    }
 
-    // 2. Verify committed tail seam + retained provisional bytes on every reconciliation check.
-    match tail.verify_seam(&shared.open_file)? {
+    // 2. Verify committed tail seam + bounded trailing provisional window (at most 4 KiB each).
+    //    Full provisional verification runs strictly before record commit (`feed_bytes`) and
+    //    clean-stop finalization (`stop`) so an idle or slowly growing 64 MiB unfinished tail
+    //    never drives perpetual or quadratic `pread` loops.
+    match tail.verify_seam(&shared.open_file, false)? {
         SeamCheck::Ok => {}
         SeamCheck::Truncated { current_len } => {
             let previous_len = tail.observed_file_len.max(tail.committed_record_end);
@@ -1807,12 +1945,22 @@ fn drain_open_fd(
 
         let mut index_guard = shared.index.write().unwrap();
         let mut filter_guard = shared.filter.write().unwrap();
-        let committed =
-            tail.feed_bytes(&read_buf[..read], &mut index_guard, filter_guard.as_mut())?;
-        if committed > 0 {
-            changed = true;
+        match tail.feed_bytes(
+            Some(&shared.open_file),
+            &read_buf[..read],
+            &mut index_guard,
+            filter_guard.as_mut(),
+        )? {
+            FeedOutcome::Committed(committed) => {
+                if committed > 0 {
+                    changed = true;
+                }
+            }
+            FeedOutcome::Alert(alert) => return Ok(DrainOutcome::Alert(alert)),
         }
     }
+
+    tail.last_verified_stamp = current_stamp;
 
     Ok(if changed {
         DrainOutcome::Changed
@@ -3251,5 +3399,138 @@ mod tests {
             session_a.start_live_watch(&index_a, Some(&bounded_filter), WatchConfig::default()),
             Err(QuarryError::InvalidOption(_))
         ));
+    }
+
+    #[test]
+    fn detects_same_size_rewrite_outside_tail_seam_and_keeps_stale_index_unbound() {
+        use std::io::{Seek, SeekFrom};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("early_rewrite.csv");
+        let mut initial = String::from("id,v\n1,ok\n");
+        for i in 2..400 {
+            initial.push_str(&format!("{i},padding_payload_beyond_seam_window\n"));
+        }
+        assert!(initial.len() > SEAM_WINDOW_BYTES * 2);
+        std::fs::write(&path, initial.as_bytes()).unwrap();
+
+        let (session, index) = open_and_index(&path, Some(Encoding::Utf8), HeaderMode::FirstRow);
+        let watch = session
+            .start_live_watch(
+                &index,
+                None,
+                WatchConfig {
+                    poll_interval: Duration::from_millis(15),
+                    cache_config: IndexCacheConfig::disabled(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        // Replace an early comma with a newline (byte offset 6, well before the 4 KiB tail seam)
+        // preserving exact byte length while adding a physical row, and bump mtime so coarse-mtime
+        // filesystems also observe the write deterministically.
+        let mut f = FsOpenOptions::new().write(true).open(&path).unwrap();
+        f.seek(SeekFrom::Start(6)).unwrap();
+        f.write_all(b"\n").unwrap();
+        f.flush().unwrap();
+        let bumped = std::time::SystemTime::now() + Duration::from_secs(2);
+        let _ = f.set_modified(bumped);
+        drop(f);
+        watch.nudge();
+
+        assert!(wait_until(Duration::from_secs(2), || {
+            watch.snapshot().status == WatchStatus::Alert(WatchAlert::Rewritten)
+        }));
+        let stopped = watch.stop().unwrap();
+        assert_eq!(
+            stopped.final_status,
+            WatchStatus::Alert(WatchAlert::Rewritten)
+        );
+        assert!(!stopped.index.is_complete());
+        // The stale index must NOT be rebound to the rewritten session's source stamp.
+        assert!(matches!(
+            stopped.session.read_rows(&stopped.index, 0, 5),
+            Err(QuarryError::InvalidOption(_))
+        ));
+    }
+
+    #[test]
+    fn commits_valid_prefix_before_parse_error_in_same_chunk() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("prefix_before_error.csv");
+        std::fs::write(&path, b"id,v\n1,ok\n").unwrap();
+
+        let (session, index) = open_and_index(&path, Some(Encoding::Utf8), HeaderMode::FirstRow);
+        let watch = session
+            .start_live_watch(
+                &index,
+                None,
+                WatchConfig {
+                    poll_interval: Duration::from_millis(15),
+                    cache_config: IndexCacheConfig::disabled(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        // Append one valid newline-terminated row plus a malformed quoted field in the same write.
+        let mut f = FsOpenOptions::new().append(true).open(&path).unwrap();
+        f.write_all(b"2,valid\n3,\"bad\"quote\n").unwrap();
+        f.flush().unwrap();
+        watch.nudge();
+
+        assert!(wait_until(Duration::from_secs(2), || {
+            matches!(
+                watch.snapshot().status,
+                WatchStatus::Alert(WatchAlert::ParseError(_))
+            )
+        }));
+        // Row 2 ("2,valid") must have been committed before the structural parse error fired.
+        assert_eq!(watch.snapshot().committed_rows, 3);
+        let rows = watch.read_rows(0, 3).unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[2].fields[0], b"2");
+        assert_eq!(rows[2].fields[1], b"valid");
+
+        let stopped = watch.stop().unwrap();
+        assert!(matches!(
+            stopped.final_status,
+            WatchStatus::Alert(WatchAlert::ParseError(_))
+        ));
+    }
+
+    #[test]
+    fn rename_without_replacement_reports_missing_source_on_stop() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("moved.csv");
+        let moved = dir.path().join("moved.csv.1");
+        std::fs::write(&path, b"id,v\n1,ok\n").unwrap();
+
+        let (session, index) = open_and_index(&path, Some(Encoding::Utf8), HeaderMode::FirstRow);
+        let watch = session
+            .start_live_watch(
+                &index,
+                None,
+                WatchConfig {
+                    poll_interval: Duration::from_millis(15),
+                    cache_config: IndexCacheConfig::disabled(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        std::fs::rename(&path, &moved).unwrap();
+        watch.nudge();
+        assert!(wait_until(Duration::from_secs(2), || {
+            watch.snapshot().status == WatchStatus::FollowingUnlinked
+        }));
+
+        let stopped = watch.stop().unwrap();
+        assert!(matches!(
+            stopped.final_status,
+            WatchStatus::Alert(WatchAlert::IoError(_))
+        ));
+        assert!(!stopped.index.is_complete());
     }
 }

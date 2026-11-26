@@ -525,3 +525,149 @@ fn stop_live_watch_reconciles_filter_query_when_cancelling_in_flight_replacement
         assert_eq!(idx.matches_found(), 49_999);
     }
 }
+
+#[test]
+fn live_watch_filter_attach_completion_preserves_concurrently_appended_matches() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("attach_race.csv");
+    std::fs::write(&path, b"id,level\n1,WARN\n2,INFO\n").unwrap();
+
+    let (mut scheduler, doc_id) = open_completed_scheduler(&path);
+    scheduler
+        .start_live_watch_with_config(
+            doc_id,
+            WatchConfig {
+                poll_interval: Duration::from_millis(15),
+                cache_config: quarry_core::IndexCacheConfig::disabled(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    let query = FilterQuery::single(1, FilterOperator::Equals, b"WARN".to_vec());
+    scheduler
+        .tab_mut(doc_id)
+        .unwrap()
+        .document
+        .as_mut()
+        .unwrap()
+        .start_filter(query)
+        .unwrap();
+
+    // Wait for the attachment background worker to finish installing the filter into the watcher
+    // WITHOUT calling `poll_filter_scan` yet.
+    assert!(wait_until(Duration::from_secs(2), || {
+        scheduler
+            .tab(doc_id)
+            .unwrap()
+            .document
+            .as_ref()
+            .unwrap()
+            .live_watch_filter_attach
+            .as_ref()
+            .is_some_and(|job| job.is_done())
+    }));
+
+    // Append a second matching row AFTER filter installation and let the watcher ingest it.
+    let mut writer = FsOpenOptions::new().append(true).open(&path).unwrap();
+    writer.write_all(b"3,WARN\n").unwrap();
+    writer.flush().unwrap();
+    scheduler
+        .tab(doc_id)
+        .unwrap()
+        .document
+        .as_ref()
+        .unwrap()
+        .live_watch
+        .as_ref()
+        .unwrap()
+        .nudge();
+    assert!(wait_until(Duration::from_secs(2), || {
+        scheduler
+            .tab(doc_id)
+            .unwrap()
+            .document
+            .as_ref()
+            .unwrap()
+            .live_watch
+            .as_ref()
+            .unwrap()
+            .snapshot()
+            .filter_matches_found
+            == Some(2)
+    }));
+
+    // Now run `poll_all()` (which runs `poll_live_watch` first, syncing 2 matches, and then
+    // collects `live_watch_filter_attach` whose returned worker snapshot only had 1 match).
+    assert!(scheduler.poll_all().is_empty());
+
+    let doc = scheduler.tab(doc_id).unwrap().document.as_ref().unwrap();
+    assert!(doc.live_watch_filter_attach.is_none());
+    assert_eq!(
+        doc.filter_index.as_ref().map(|idx| idx.matches_found()),
+        Some(2),
+        "collecting the completed attach job must not regress matches from 2 back to 1"
+    );
+    let _ = scheduler.stop_live_watch(doc_id).unwrap();
+}
+
+#[test]
+fn live_watch_tab_stays_pinned_when_replacing_active_tab_under_hydration_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let scratch = dir.path().join("scratch");
+    std::fs::create_dir_all(&scratch).unwrap();
+    let path_a = dir.path().join("watched.csv");
+    let path_b = dir.path().join("other.csv");
+    std::fs::write(&path_a, b"id,v\n1,a\n").unwrap();
+    std::fs::write(&path_b, b"id,v\n1,b\n").unwrap();
+
+    let mut scheduler = WorkbenchScheduler::new(WorkbenchSchedulerConfig {
+        working_directory: scratch,
+        index_cache_enabled: false,
+        max_hydrated_tabs: 1,
+        ..WorkbenchSchedulerConfig::default()
+    });
+    scheduler.register_window(WindowId::PRIMARY);
+    let doc_a = match scheduler
+        .open_path(WindowId::PRIMARY, path_a, OpenOptions::default(), None)
+        .unwrap()
+    {
+        WakeOutcome::Ready { document_id, .. }
+        | WakeOutcome::SourceChangedConflict { document_id, .. } => document_id,
+    };
+    assert!(wait_until(Duration::from_secs(3), || {
+        let _ = scheduler.poll_all();
+        scheduler
+            .tab(doc_a)
+            .and_then(|tab| tab.document.as_ref())
+            .is_some_and(|doc| doc.index.as_ref().is_some_and(|idx| idx.is_complete()))
+    }));
+
+    scheduler
+        .start_live_watch_with_config(
+            doc_a,
+            WatchConfig {
+                poll_interval: Duration::from_millis(50),
+                cache_config: quarry_core::IndexCacheConfig::disabled(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    // Opening a second tab under `max_hydrated_tabs = 1` must recognize `LiveWatching` as a
+    // non-active pin and refuse to evict `doc_a` (`AllTabsPinned`), keeping `doc_a` live.
+    assert!(matches!(
+        scheduler.open_path(WindowId::PRIMARY, path_b, OpenOptions::default(), None),
+        Err(quarry_workbench::SchedulerError::AllTabsPinned { .. })
+    ));
+    assert!(
+        scheduler
+            .tab(doc_a)
+            .unwrap()
+            .document
+            .as_ref()
+            .is_some_and(|doc| doc.is_live_watching()),
+        "live-watching tab must remain hydrated and watching when replacing active tab is refused"
+    );
+    let _ = scheduler.stop_live_watch(doc_a).unwrap();
+}

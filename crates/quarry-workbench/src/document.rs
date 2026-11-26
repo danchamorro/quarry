@@ -3233,7 +3233,15 @@ impl Document {
                 .take()
                 .expect("live watch filter attach job is present");
             match attach.wait() {
-                Ok(Some(filter_index)) => {
+                Ok(Some(attached_index)) => {
+                    // Collect the watcher's current synchronized filter index so rows appended
+                    // after filter installation (already synced by `poll_live_watch`) are never
+                    // overwritten by the older snapshot returned by the attachment worker.
+                    let filter_index = self
+                        .live_watch
+                        .as_ref()
+                        .and_then(LiveWatchJob::filter_index_snapshot)
+                        .unwrap_or(attached_index);
                     let matches = filter_index.matches_found();
                     self.filter_index = Some(filter_index);
                     self.filter_progress = Some(FilterProgress {

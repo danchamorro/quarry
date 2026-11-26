@@ -1768,7 +1768,7 @@ pub(crate) fn read_rows_from_open_file(
     let mut row_number = checkpoint.row;
     let mut record_start = checkpoint.offset;
     let mut record = Vec::new();
-    let mut rows = Vec::with_capacity(count);
+    let mut rows = Vec::with_capacity((target_end - start) as usize);
 
     while row_number < target_end {
         let remaining = end.saturating_sub(absolute_start);
@@ -1906,7 +1906,7 @@ fn read_rows_from_index(
     let mut row_number = checkpoint.row;
     let mut record_start = checkpoint.offset;
     let mut record = Vec::new();
-    let mut rows = Vec::with_capacity(count);
+    let mut rows = Vec::with_capacity((target_end - start) as usize);
 
     while row_number < target_end {
         // Bound the read itself, so bytes past `end` (such as half of a UTF-16

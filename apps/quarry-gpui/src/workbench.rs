@@ -1397,6 +1397,10 @@ impl WorkbenchController {
             return Err(AppMessage::warning("Open a file first."));
         };
         self.scheduler.start_live_watch_with_config(id, config)?;
+        {
+            let entry = self.viewport_read_seq.entry(id).or_insert(0);
+            *entry = entry.wrapping_add(1);
+        }
         let backend = self
             .scheduler
             .tab(id)

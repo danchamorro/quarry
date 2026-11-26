@@ -4055,6 +4055,7 @@ impl WorkbenchScheduler {
         };
         if doc.join_reserved()
             || doc.is_indexing_pause_pinned()
+            || doc.is_live_watching()
             || slot.tab.document_writing()
             || doc.pending_materialization.is_some()
             || matches!(
