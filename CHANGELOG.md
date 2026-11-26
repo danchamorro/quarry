@@ -8,6 +8,12 @@ Tagged beta releases are noted on the day they were published, with exact
 checksums and verification details under `docs/releases/`. Numbers in
 parentheses are GitHub pull requests.
 
+## [2026-11-26]
+
+### Changed
+
+- Scoped GitHub Actions `push` triggers to `main` and enabled `cancel-in-progress` workflow concurrency for pull requests so superseded commits no longer exhaust macOS runner slots. (#222)
+
 ## [2026-11-25]
 
 ### Added
