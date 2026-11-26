@@ -482,6 +482,22 @@ PY
     [[ ! -e "$fake_home/.local/bin/quarry-gpui" ]] || fail "self-test: XDG uninstall left binary"
     [[ ! -e "$custom_xdg/applications/dev.quarry.gpui.desktop" ]] || fail "self-test: XDG uninstall left desktop"
 
+    # 8. Failed first install mid-copy rolls back newly created files so retry succeeds.
+    local fail_prefix="$STAGE_DIR/failed-first-install"
+    mkdir -p "$fail_prefix/share/applications"
+    chmod 555 "$fail_prefix/share/applications"
+    if QUARRY_SKIP_ARCH_CHECK=1 QUARRY_SKIP_LDD_CHECK=1 "$fake_bundle/install.sh" --prefix "$fail_prefix" >/dev/null 2>&1; then
+        chmod 755 "$fail_prefix/share/applications"
+        fail "self-test: read-only applications dir should have failed first install"
+    fi
+    chmod 755 "$fail_prefix/share/applications"
+    [[ ! -e "$fail_prefix/bin/quarry-gpui" ]] || fail "self-test: failed first install left untracked quarry-gpui"
+    [[ ! -e "$fail_prefix/bin/quarry" ]] || fail "self-test: failed first install left untracked quarry"
+    [[ ! -e "$fail_prefix/share/doc/quarry/installed-files.txt" ]] || fail "self-test: failed first install left stale manifest"
+    QUARRY_SKIP_ARCH_CHECK=1 QUARRY_SKIP_LDD_CHECK=1 "$fake_bundle/install.sh" --prefix "$fail_prefix" >/dev/null
+    [[ -x "$fail_prefix/bin/quarry-gpui" ]] || fail "self-test: retry after failed first install did not succeed"
+    "$fail_prefix/share/doc/quarry/uninstall.sh" >/dev/null
+
     printf 'Linux packaging self-test passed.\n'
 }
 

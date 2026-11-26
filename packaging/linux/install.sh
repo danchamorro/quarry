@@ -220,30 +220,91 @@ done
 
 mkdir -p "$BIN_DIR" "$APPS_DIR" "$ICON_512_DIR" "$DOC_DIR"
 
-install -m 755 "$BUNDLE_DIR/bin/quarry-gpui" "$BIN_DIR/quarry-gpui"
-install -m 755 "$BUNDLE_DIR/bin/quarry" "$BIN_DIR/quarry"
-install -m 644 "$ICON_512_SRC" "$ICON_512_DIR/dev.quarry.gpui.png"
+# Write pre-commit ownership journal (OLD_FILES union NEW_FILES) before copying
+# any files so even an uncatchable crash (SIGKILL) remains recoverable via retry
+# or uninstall.sh, and register an EXIT rollback trap to clean newly created
+# files on ordinary errors while preserving prior upgrade installations.
+INSTALL_COMMITTED=0
+CREATED_NEW_FILES=()
+DESKTOP_TMP=""
+MANIFEST_TMP=""
+
+write_manifest() {
+    MANIFEST_TMP="$(mktemp "$DOC_DIR/.installed-files.XXXXXX")"
+    printf '%s\n' "$@" > "$MANIFEST_TMP"
+    chmod 644 "$MANIFEST_TMP"
+    mv -f "$MANIFEST_TMP" "$MANIFEST_FILE"
+    MANIFEST_TMP=""
+}
+
+rollback_on_error() {
+    [[ -n "$DESKTOP_TMP" ]] && rm -f -- "$DESKTOP_TMP"
+    [[ -n "$MANIFEST_TMP" ]] && rm -f -- "$MANIFEST_TMP"
+    if [[ "$INSTALL_COMMITTED" -eq 0 ]]; then
+        if [[ ${#CREATED_NEW_FILES[@]} -gt 0 ]]; then
+            local f
+            for f in "${CREATED_NEW_FILES[@]}"; do
+                rm -f -- "$f"
+            done
+        fi
+        if [[ ${#OLD_FILES[@]} -eq 0 ]]; then
+            rm -f -- "$MANIFEST_FILE"
+            rmdir "$DOC_DIR/Rust" 2>/dev/null || true
+            rmdir "$DOC_DIR" 2>/dev/null || true
+            rmdir "$DATA_DIR/doc" 2>/dev/null || true
+        fi
+    fi
+}
+trap rollback_on_error EXIT
+
+JOURNAL_FILES=()
+if [[ ${#OLD_FILES[@]} -gt 0 ]]; then
+    JOURNAL_FILES=("${OLD_FILES[@]}")
+fi
+for dest in "${NEW_FILES[@]}"; do
+    if [[ ${#JOURNAL_FILES[@]} -eq 0 ]] || ! is_in_list "$dest" "${JOURNAL_FILES[@]}"; then
+        JOURNAL_FILES+=("$dest")
+    fi
+done
+write_manifest "${JOURNAL_FILES[@]}"
+
+record_created_if_new() {
+    local dest="$1"
+    if [[ ${#OLD_FILES[@]} -eq 0 ]] || ! is_in_list "$dest" "${OLD_FILES[@]}"; then
+        CREATED_NEW_FILES+=("$dest")
+    fi
+}
+
+install_tracked() {
+    local mode="$1" src="$2" dest="$3"
+    record_created_if_new "$dest"
+    install -m "$mode" "$src" "$dest"
+}
+
+install_tracked 755 "$BUNDLE_DIR/bin/quarry-gpui" "$BIN_DIR/quarry-gpui"
+install_tracked 755 "$BUNDLE_DIR/bin/quarry" "$BIN_DIR/quarry"
+install_tracked 644 "$ICON_512_SRC" "$ICON_512_DIR/dev.quarry.gpui.png"
 
 if [[ -f "$BUNDLE_DIR/share/icons/hicolor/256x256/apps/dev.quarry.gpui.png" ]]; then
     mkdir -p "$ICON_256_DIR"
-    install -m 644 \
+    install_tracked 644 \
         "$BUNDLE_DIR/share/icons/hicolor/256x256/apps/dev.quarry.gpui.png" \
         "$ICON_256_DIR/dev.quarry.gpui.png"
 fi
 
 for doc in LICENSE-MIT LICENSE-APACHE THIRD_PARTY_NOTICES.html RELEASE_METADATA.json; do
     if [[ -f "$BUNDLE_DIR/share/doc/quarry/$doc" ]]; then
-        install -m 644 "$BUNDLE_DIR/share/doc/quarry/$doc" "$DOC_DIR/$doc"
+        install_tracked 644 "$BUNDLE_DIR/share/doc/quarry/$doc" "$DOC_DIR/$doc"
     fi
 done
 if [[ -d "$BUNDLE_DIR/share/doc/quarry/Rust" ]]; then
     mkdir -p "$DOC_DIR/Rust"
     for rust_doc in "$BUNDLE_DIR/share/doc/quarry/Rust/"*; do
         [[ -f "$rust_doc" ]] || continue
-        install -m 644 "$rust_doc" "$DOC_DIR/Rust/$(basename "$rust_doc")"
+        install_tracked 644 "$rust_doc" "$DOC_DIR/Rust/$(basename "$rust_doc")"
     done
 fi
-install -m 755 "$BUNDLE_DIR/uninstall.sh" "$DOC_DIR/uninstall.sh"
+install_tracked 755 "$BUNDLE_DIR/uninstall.sh" "$DOC_DIR/uninstall.sh"
 
 # Write installed .desktop entry with exact spec-encoded binary path so Wayland
 # launchers (Omarchy Walker, Hyprland, GNOME, KDE) find Quarry regardless of PATH.
@@ -251,7 +312,6 @@ EXEC_VALUE="$(encode_desktop_exec_arg "$QUARRY_BIN") %F"
 TRY_EXEC_VALUE="$(encode_desktop_string "$QUARRY_BIN")"
 
 DESKTOP_TMP="$(mktemp "$APPS_DIR/.dev.quarry.gpui.desktop.XXXXXX")"
-trap 'rm -f "$DESKTOP_TMP"' EXIT
 while IFS= read -r line || [[ -n "$line" ]]; do
     case "$line" in
         Exec=*)
@@ -266,8 +326,9 @@ while IFS= read -r line || [[ -n "$line" ]]; do
     esac
 done < "$DESKTOP_SRC" > "$DESKTOP_TMP"
 chmod 644 "$DESKTOP_TMP"
+record_created_if_new "$APPS_DIR/dev.quarry.gpui.desktop"
 mv -f "$DESKTOP_TMP" "$APPS_DIR/dev.quarry.gpui.desktop"
-trap - EXIT
+DESKTOP_TMP=""
 
 # Remove only previously Quarry-owned files that are no longer part of this install.
 if [[ ${#OLD_FILES[@]} -gt 0 ]]; then
@@ -279,12 +340,9 @@ if [[ ${#OLD_FILES[@]} -gt 0 ]]; then
     rmdir "$DOC_DIR/Rust" 2>/dev/null || true
 fi
 
-# Atomically write ownership manifest.
-MANIFEST_TMP="$(mktemp "$DOC_DIR/.installed-files.XXXXXX")"
-trap 'rm -f "$MANIFEST_TMP"' EXIT
-printf '%s\n' "${NEW_FILES[@]}" > "$MANIFEST_TMP"
-chmod 644 "$MANIFEST_TMP"
-mv -f "$MANIFEST_TMP" "$MANIFEST_FILE"
+# Commit exact final ownership manifest.
+write_manifest "${NEW_FILES[@]}"
+INSTALL_COMMITTED=1
 trap - EXIT
 
 if command -v update-desktop-database >/dev/null 2>&1; then

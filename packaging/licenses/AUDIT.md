@@ -362,10 +362,11 @@ refreshed with checksum-verified `cargo-about 0.9.2`.
 
 Extended `packaging/licenses/generate.py` and `scripts/generate-notices.sh` to
 generate and verify audited notice inventories for `x86_64-unknown-linux-gnu`
-(`506` locked packages) and `aarch64-unknown-linux-gnu` (`502` locked packages)
-under `packaging/licenses/targets/<triple>/` alongside the existing
-`aarch64-apple-darwin` inventory (`397` locked packages), using checksum-verified
-`cargo-about 0.9.2` and Rust `1.100.0` runtime notices.
+(`507` locked packages, merging `apps/quarry-gpui` and `apps/quarry-cli`) and
+`aarch64-unknown-linux-gnu` (`503` locked packages, merging `apps/quarry-gpui`
+and `apps/quarry-cli`) under `packaging/licenses/targets/<triple>/` alongside
+the existing `aarch64-apple-darwin` inventory (`397` locked packages), using
+checksum-verified `cargo-about 0.9.2` and Rust `1.100.0` runtime notices.
 
 - **License allowlist parity:** All Linux dependencies satisfy the existing
   OSI-approved `about.toml` allowlist with zero GPL, LGPL, AGPL, or non-OSI
