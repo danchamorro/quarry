@@ -4,8 +4,11 @@
 from __future__ import annotations
 
 import importlib.util
+import sys
 import unittest
 from pathlib import Path
+
+sys.dont_write_bytecode = True
 
 SCRIPT_PATH = Path(__file__).resolve().parent / "extract-release-notes.py"
 SPEC = importlib.util.spec_from_file_location("extract_release_notes", SCRIPT_PATH)

@@ -34,6 +34,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ github.event.inputs.tag || github.ref_name }}
           fetch-depth: 0
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@1.100.0
@@ -45,6 +46,12 @@ jobs:
             echo "error: invalid release tag '$TAG' (expected vX.Y.Z or vX.Y.Z-prerelease)" >&2
             exit 1
           fi
+          TAG_COMMIT="$(git rev-parse --verify "refs/tags/$TAG^{commit}")"
+          HEAD_COMMIT="$(git rev-parse --verify HEAD)"
+          if [[ "$TAG_COMMIT" != "$HEAD_COMMIT" ]]; then
+            echo "error: checked-out HEAD ($HEAD_COMMIT) does not match tag $TAG ($TAG_COMMIT)" >&2
+            exit 1
+          fi
           IS_PRE=false
           if [[ "$TAG" == *-* ]]; then
             IS_PRE=true
@@ -54,7 +61,7 @@ jobs:
       - name: Verify reviewed macOS notice inventory
         run: ./scripts/generate-notices.sh --release-check
       - name: Verify release note extractor tests
-        run: python3 scripts/test_extract_release_notes.py
+        run: python3 -B scripts/test_extract_release_notes.py
       - name: Extract release notes from CHANGELOG.md
         run: |
           TAG="${{ steps.meta.outputs.tag }}"
@@ -63,7 +70,7 @@ jobs:
           if [[ -n "$PREV" ]]; then
             ARGS+=(--since-tag "$PREV")
           fi
-          python3 scripts/extract-release-notes.py "${ARGS[@]}"
+          python3 -B scripts/extract-release-notes.py "${ARGS[@]}"
           cat release-notes.md
       - name: Create or update Draft GitHub Release
         env:
@@ -94,8 +101,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ needs.draft-release.outputs.tag }}
           fetch-depth: 0
           persist-credentials: false
+      - name: Verify checked-out commit matches release tag
+        run: |
+          TAG="${{ needs.draft-release.outputs.tag }}"
+          TAG_COMMIT="$(git rev-parse --verify "refs/tags/$TAG^{commit}")"
+          HEAD_COMMIT="$(git rev-parse --verify HEAD)"
+          if [[ "$TAG_COMMIT" != "$HEAD_COMMIT" ]]; then
+            echo "error: checked-out HEAD ($HEAD_COMMIT) does not match tag $TAG ($TAG_COMMIT)" >&2
+            exit 1
+          fi
       - uses: dtolnay/rust-toolchain@1.100.0
       - name: Check signing secret availability
         id: signing

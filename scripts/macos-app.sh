@@ -524,6 +524,7 @@ release_app() {
     fi
 
     /bin/mkdir -p "$out_dir"
+    out_dir="$(cd "$out_dir" && pwd)"
     RELEASE_STAGE="$(mktemp -d "$ROOT/target/.quarry-release.XXXXXX")"
     app_stage="$RELEASE_STAGE/app"
     app="$app_stage/$APP_NAME.app"
@@ -791,8 +792,8 @@ case "${1:-package}" in
         [[ "$#" -eq 1 ]] || { usage >&2; exit 2; }
         self_test_rollback
         self_test_licenses
-        python3 "$ROOT/packaging/licenses/test_generate.py"
-        python3 "$ROOT/scripts/test_extract_release_notes.py"
+        python3 -B "$ROOT/packaging/licenses/test_generate.py"
+        python3 -B "$ROOT/scripts/test_extract_release_notes.py"
         ;;
     *)
         usage >&2
