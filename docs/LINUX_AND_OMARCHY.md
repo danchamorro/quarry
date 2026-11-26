@@ -24,10 +24,10 @@ Prebuilt Linux tarballs for **`x86_64`** (most desktops and laptops) and **`arm6
 
 ```bash
 ARCHIVE="Quarry-<tag>-linux-x86_64.tar.gz"
-sha256sum -c SHA256SUMS-linux-x86_64.txt
-tar -xzf "$ARCHIVE"
-cd "${ARCHIVE%.tar.gz}"
-./install.sh
+sha256sum -c SHA256SUMS-linux-x86_64.txt &&
+  tar -xzf "$ARCHIVE" &&
+  cd "${ARCHIVE%.tar.gz}" &&
+  ./install.sh
 ```
 
 By default `./install.sh` installs cleanly into `~/.local/bin` and `${XDG_DATA_HOME:-~/.local/share}` (no `sudo` needed; pass `--prefix /usr/local` for a system-wide install, ensuring `<prefix>/share` is in `XDG_DATA_DIRS` for custom prefixes):
@@ -41,7 +41,11 @@ By default `./install.sh` installs cleanly into `~/.local/bin` and `${XDG_DATA_H
 Before writing any files, `install.sh` verifies bundle architecture parity, runs `ldd` on both binaries (reporting the exact `pacman`/`apt` command if runtime shared libraries are missing), and refuses to overwrite unrelated pre-existing files. To uninstall cleanly (removing only Quarry-owned files and preserving `~/.config/quarry`), run:
 
 ```bash
+# Default user install:
 "${XDG_DATA_HOME:-$HOME/.local/share}/doc/quarry/uninstall.sh"
+
+# System-wide install (e.g. --prefix /usr/local):
+sudo /usr/local/share/doc/quarry/uninstall.sh
 ```
 
 ---

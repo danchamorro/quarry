@@ -128,9 +128,9 @@ Prebuilt Linux tarballs (`Quarry-<tag>-linux-x86_64.tar.gz` and `Quarry-<tag>-li
 
 ```bash
 ARCHIVE="Quarry-<tag>-linux-x86_64.tar.gz"
-tar -xzf "$ARCHIVE"
-cd "${ARCHIVE%.tar.gz}"
-./install.sh
+tar -xzf "$ARCHIVE" &&
+  cd "${ARCHIVE%.tar.gz}" &&
+  ./install.sh
 ```
 
 This installs the GPU-rendered desktop app (`~/.local/bin/quarry-gpui`), the headless CLI (`~/.local/bin/quarry`), an XDG launcher entry (`Quarry` in Omarchy's app launcher / Walker and *"Open With"* for `.csv`/`.tsv`), the app icon, and third-party notices into `~/.local/bin` and `${XDG_DATA_HOME:-~/.local/share}`. On Omarchy, choose **View → Theme → Omarchy** to follow your active theme live. To uninstall cleanly (keeping `~/.config/quarry`), run `${XDG_DATA_HOME:-~/.local/share}/doc/quarry/uninstall.sh`.

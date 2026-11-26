@@ -335,6 +335,7 @@ PY
 
 self_test() {
     STAGE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/quarry-linux-selftest.XXXXXX")"
+    STAGE_DIR="$(cd "$STAGE_DIR" && pwd)"
     local fake_bundle="$STAGE_DIR/Quarry-v0.2.0-linux-x86_64"
     # Test spaces, apostrophe, and literal '%' in prefix path!
     local prefix="$STAGE_DIR/o'brien 100% prefix"
