@@ -70,14 +70,14 @@ host_arch_label() {
 
 rust_release_version() {
     local version
-    version="$("${RUSTC:-rustc}" -vV | awk '/^release: / {print $2; exit}')"
+    version="$(cd "$ROOT" && "${RUSTC:-rustc}" -vV | awk '/^release: / {print $2; exit}')"
     [[ -n "$version" ]] || fail "could not determine rustc release version"
     printf '%s\n' "$version"
 }
 
 app_version() {
     local pkgid version
-    pkgid="$(cargo pkgid --offline -p quarry-gpui --manifest-path "$ROOT/Cargo.toml")"
+    pkgid="$(cd "$ROOT" && cargo pkgid --offline -p quarry-gpui --manifest-path "$ROOT/Cargo.toml")"
     version="${pkgid##*[@#]}"
     [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "unexpected quarry-gpui version: $version"
     printf '%s\n' "$version"
@@ -112,13 +112,14 @@ verify_ldd_binary() {
 
 build_release_binaries() {
     local target="$1"
-    # Pass explicit --target and --target-dir so ambient CARGO_TARGET_DIR or
+    # Run from $ROOT so rustup selects $ROOT/rust-toolchain.toml, and pass
+    # explicit --target and --target-dir so ambient CARGO_TARGET_DIR or
     # build.target settings can never cause staging to pick up stale binaries.
-    cargo build --release --locked \
+    (cd "$ROOT" && cargo build --release --locked \
         --target "$target" \
         --target-dir "$BUILD_TARGET_DIR" \
         --manifest-path "$ROOT/Cargo.toml" \
-        -p quarry-gpui -p quarry-cli
+        -p quarry-gpui -p quarry-cli)
 }
 
 stage_bundle() {
@@ -241,17 +242,12 @@ release_app() {
         fail "release packaging requires a clean Git working tree."
     fi
 
-    local target arch rust_release version revision tag_base_version tag_commit bin_src_dir
+    local target arch rust_release version revision post_revision tag_base_version tag_commit bin_src_dir
     target="$(host_target)"
     arch="$(host_arch_label)"
     rust_release="$(rust_release_version)"
-
-    "$ROOT/scripts/generate-notices.sh" --release-check --target "$target" --rust-release "$rust_release"
-    build_release_binaries "$target"
-    bin_src_dir="$BUILD_TARGET_DIR/$target/release"
-
-    version="$(app_version)"
     revision="$(git -C "$ROOT" rev-parse HEAD)"
+    version="$(app_version)"
     if [[ -z "$tag" ]]; then
         tag="v$version"
     fi
@@ -267,6 +263,17 @@ release_app() {
             || fail "tag $tag points to $tag_commit, not packaged HEAD $revision (check out $tag first)."
     else
         fail "git tag $tag does not exist locally; create tag $tag on $revision before cutting a release."
+    fi
+
+    "$ROOT/scripts/generate-notices.sh" --release-check --target "$target" --rust-release "$rust_release"
+    build_release_binaries "$target"
+    bin_src_dir="$BUILD_TARGET_DIR/$target/release"
+
+    post_revision="$(git -C "$ROOT" rev-parse HEAD)"
+    [[ "$post_revision" == "$revision" ]] \
+        || fail "HEAD changed during release build ($revision -> $post_revision); aborting."
+    if [[ -n "$(git -C "$ROOT" status --porcelain --untracked-files=normal)" ]]; then
+        fail "working tree became dirty during release build; aborting."
     fi
 
     if [[ -z "$out_dir" ]]; then
@@ -497,7 +504,20 @@ PY
     [[ ! -e "$fail_prefix/share/doc/quarry/installed-files.txt" ]] || fail "self-test: failed first install left stale manifest"
     QUARRY_SKIP_ARCH_CHECK=1 QUARRY_SKIP_LDD_CHECK=1 "$fake_bundle/install.sh" --prefix "$fail_prefix" >/dev/null
     [[ -x "$fail_prefix/bin/quarry-gpui" ]] || fail "self-test: retry after failed first install did not succeed"
+
+    # 9. Active installation lock blocks concurrent install and uninstall cleanly.
+    mkdir "$fail_prefix/share/.quarry-install.lock"
+    if QUARRY_SKIP_ARCH_CHECK=1 QUARRY_SKIP_LDD_CHECK=1 "$fake_bundle/install.sh" --prefix "$fail_prefix" >/dev/null 2>&1; then
+        rmdir "$fail_prefix/share/.quarry-install.lock" 2>/dev/null || true
+        fail "self-test: locked prefix should have blocked concurrent install"
+    fi
+    if "$fail_prefix/share/doc/quarry/uninstall.sh" >/dev/null 2>&1; then
+        rmdir "$fail_prefix/share/.quarry-install.lock" 2>/dev/null || true
+        fail "self-test: locked prefix should have blocked concurrent uninstall"
+    fi
+    rmdir "$fail_prefix/share/.quarry-install.lock"
     "$fail_prefix/share/doc/quarry/uninstall.sh" >/dev/null
+    [[ ! -e "$fail_prefix/bin/quarry-gpui" ]] || fail "self-test: uninstall after unlocking failed"
 
     printf 'Linux packaging self-test passed.\n'
 }

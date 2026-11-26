@@ -148,6 +148,39 @@ ICON_512_DIR="$DATA_DIR/icons/hicolor/512x512/apps"
 ICON_256_DIR="$DATA_DIR/icons/hicolor/256x256/apps"
 DOC_DIR="$DATA_DIR/doc/quarry"
 MANIFEST_FILE="$DOC_DIR/installed-files.txt"
+LOCK_DIR="$DATA_DIR/.quarry-install.lock"
+LOCK_HELD=0
+INSTALL_COMMITTED=0
+JOURNAL_WRITTEN=0
+OLD_FILES=()
+CREATED_NEW_FILES=()
+DESKTOP_TMP=""
+MANIFEST_TMP=""
+
+release_and_rollback_on_exit() {
+    [[ -n "$DESKTOP_TMP" ]] && rm -f -- "$DESKTOP_TMP"
+    [[ -n "$MANIFEST_TMP" ]] && rm -f -- "$MANIFEST_TMP"
+    if [[ "$INSTALL_COMMITTED" -eq 0 && "$LOCK_HELD" -eq 1 ]]; then
+        if [[ ${#CREATED_NEW_FILES[@]} -gt 0 ]]; then
+            local f
+            for f in "${CREATED_NEW_FILES[@]}"; do
+                rm -f -- "$f"
+            done
+        fi
+        if [[ "$JOURNAL_WRITTEN" -eq 1 && ${#OLD_FILES[@]} -eq 0 ]]; then
+            rm -f -- "$MANIFEST_FILE"
+            rmdir "$DOC_DIR/Rust" 2>/dev/null || true
+            rmdir "$DOC_DIR" 2>/dev/null || true
+            rmdir "$DATA_DIR/doc" 2>/dev/null || true
+        fi
+    fi
+    if [[ "$LOCK_HELD" -eq 1 ]]; then
+        rmdir "$LOCK_DIR" 2>/dev/null || true
+        LOCK_HELD=0
+    fi
+}
+trap release_and_rollback_on_exit EXIT
+
 DESKTOP_SRC="$BUNDLE_DIR/share/applications/dev.quarry.gpui.desktop"
 ICON_512_SRC="$BUNDLE_DIR/share/icons/hicolor/512x512/apps/dev.quarry.gpui.png"
 
@@ -165,6 +198,13 @@ done
 
 validate_bundle_arch
 validate_linux_binaries
+
+# Acquire exclusive installation lock before reading the ownership manifest.
+mkdir -p "$DATA_DIR"
+if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+    fail "another Quarry install or uninstall is currently in progress (lock: $LOCK_DIR)"
+fi
+LOCK_HELD=1
 
 # Build exact list of target files before writing anything.
 NEW_FILES=(
@@ -222,40 +262,16 @@ mkdir -p "$BIN_DIR" "$APPS_DIR" "$ICON_512_DIR" "$DOC_DIR"
 
 # Write pre-commit ownership journal (OLD_FILES union NEW_FILES) before copying
 # any files so even an uncatchable crash (SIGKILL) remains recoverable via retry
-# or uninstall.sh, and register an EXIT rollback trap to clean newly created
-# files on ordinary errors while preserving prior upgrade installations.
-INSTALL_COMMITTED=0
-CREATED_NEW_FILES=()
-DESKTOP_TMP=""
-MANIFEST_TMP=""
-
+# or uninstall.sh; release_and_rollback_on_exit cleans newly created files on
+# ordinary errors while preserving prior upgrade installations.
 write_manifest() {
     MANIFEST_TMP="$(mktemp "$DOC_DIR/.installed-files.XXXXXX")"
     printf '%s\n' "$@" > "$MANIFEST_TMP"
     chmod 644 "$MANIFEST_TMP"
     mv -f "$MANIFEST_TMP" "$MANIFEST_FILE"
     MANIFEST_TMP=""
+    JOURNAL_WRITTEN=1
 }
-
-rollback_on_error() {
-    [[ -n "$DESKTOP_TMP" ]] && rm -f -- "$DESKTOP_TMP"
-    [[ -n "$MANIFEST_TMP" ]] && rm -f -- "$MANIFEST_TMP"
-    if [[ "$INSTALL_COMMITTED" -eq 0 ]]; then
-        if [[ ${#CREATED_NEW_FILES[@]} -gt 0 ]]; then
-            local f
-            for f in "${CREATED_NEW_FILES[@]}"; do
-                rm -f -- "$f"
-            done
-        fi
-        if [[ ${#OLD_FILES[@]} -eq 0 ]]; then
-            rm -f -- "$MANIFEST_FILE"
-            rmdir "$DOC_DIR/Rust" 2>/dev/null || true
-            rmdir "$DOC_DIR" 2>/dev/null || true
-            rmdir "$DATA_DIR/doc" 2>/dev/null || true
-        fi
-    fi
-}
-trap rollback_on_error EXIT
 
 JOURNAL_FILES=()
 if [[ ${#OLD_FILES[@]} -gt 0 ]]; then
@@ -343,7 +359,6 @@ fi
 # Commit exact final ownership manifest.
 write_manifest "${NEW_FILES[@]}"
 INSTALL_COMMITTED=1
-trap - EXIT
 
 if command -v update-desktop-database >/dev/null 2>&1; then
     update-desktop-database -q "$APPS_DIR" 2>/dev/null || true

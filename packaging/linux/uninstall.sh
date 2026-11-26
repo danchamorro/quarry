@@ -62,6 +62,26 @@ else
     DOC_DIR="$DATA_DIR/doc/quarry"
 fi
 
+if [[ ! -d "$DATA_DIR" ]]; then
+    printf 'No Quarry installation found under %s; nothing removed.\n' "$DATA_DIR"
+    exit 0
+fi
+
+LOCK_DIR="$DATA_DIR/.quarry-install.lock"
+LOCK_HELD=0
+release_lock() {
+    if [[ "$LOCK_HELD" -eq 1 ]]; then
+        rmdir "$LOCK_DIR" 2>/dev/null || true
+        LOCK_HELD=0
+    fi
+}
+trap release_lock EXIT
+
+if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+    fail "another Quarry install or uninstall is currently in progress (lock: $LOCK_DIR)"
+fi
+LOCK_HELD=1
+
 MANIFEST_FILE="$DOC_DIR/installed-files.txt"
 if [[ ! -f "$MANIFEST_FILE" ]]; then
     printf 'No Quarry installation manifest found at %s; nothing removed.\n' "$MANIFEST_FILE"
