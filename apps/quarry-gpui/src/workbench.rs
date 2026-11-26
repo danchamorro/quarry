@@ -2614,8 +2614,11 @@ impl WorkbenchController {
                 })?;
             doc.selection = Some(quarry_workbench::GridSelection::Row { row: local_row });
             doc.cursor.select_row(local_row);
-            doc.selected_rows
-                .select(local_row, SelectionModifiers::NONE);
+            doc.selected_rows.clear();
+            doc.selected_filtered_rows
+                .select(table_row as u64, SelectionModifiers::NONE);
+            doc.selected_columns.clear();
+            doc.column_selection_anchor = None;
             table_row
         } else {
             if local_row < doc.data_start || local_row >= doc.available_rows() {
@@ -2630,8 +2633,11 @@ impl WorkbenchController {
             let _ = doc.load_buffer(local_row);
             doc.selection = Some(quarry_workbench::GridSelection::Row { row: local_row });
             doc.cursor.select_row(local_row);
+            doc.selected_filtered_rows.clear();
             doc.selected_rows
                 .select(local_row, SelectionModifiers::NONE);
+            doc.selected_columns.clear();
+            doc.column_selection_anchor = None;
             table_row
         };
         let message = format!("Jumped to {label}.");

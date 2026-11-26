@@ -4136,6 +4136,110 @@ fn row_copy_works_after_cell_selection_and_under_active_filter(cx: &mut TestAppC
 }
 
 #[gpui_kit::test]
+fn filtered_bookmark_jump_updates_filtered_row_selection_anchor(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("filtered_bookmark_anchor.csv");
+    std::fs::write(
+        &path,
+        "id,name,tag\n1,row1,a\n2,row2,b\n3,row3,a\n4,row4,b\n5,row5,a\n",
+    )
+    .unwrap();
+
+    let controller = cx.update(|cx| {
+        gpui_kit::init(cx);
+        crate::apply_light_theme(cx);
+        bind_shortcuts(cx);
+        install_menus(cx);
+        WorkbenchController::reset_for_test(
+            cx,
+            WorkbenchSchedulerConfig {
+                index_cache_enabled: false,
+                ..WorkbenchSchedulerConfig::default()
+            },
+        )
+    });
+    let (handle, view) = open_test_window(cx, &controller);
+    let win_id = cx.update(|cx| view.read(cx).window_id);
+
+    cx.update_window(handle.into(), |_, window, cx| {
+        view.update(cx, |q, cx| {
+            q.open_paths_direct(
+                vec![path.clone()],
+                OpenOptions {
+                    header_mode: HeaderMode::FirstRow,
+                    ..OpenOptions::default()
+                },
+                None,
+                window,
+                cx,
+            );
+        });
+    })
+    .unwrap();
+    wait_for_ui(cx, handle, &controller, &view, |q, _, cx| {
+        q.snapshot(cx).is_some_and(|s| s.index_done)
+    });
+
+    // Bookmark source row 3 before filtering to tag == "a" (matches source rows 1, 3, 5).
+    cx.update(|cx| {
+        controller.update(cx, |c, cx| {
+            c.select_row_active(win_id, 3, false, false, cx);
+            c.toggle_bookmark_active(win_id, cx).unwrap();
+            c.filter_by_cell_value_active(
+                win_id,
+                2,
+                b"a".to_vec(),
+                true,
+                quarry_core::CaseSensitivity::Sensitive,
+                cx,
+            )
+            .unwrap();
+        });
+    });
+    wait_for_ui(cx, handle, &controller, &view, |q, _, cx| {
+        q.snapshot(cx)
+            .is_some_and(|s| s.filter_active && s.filter_done && s.available_rows == 3)
+    });
+
+    // Select source row 1 (filtered ordinal 0), jump to bookmarked source row 3 (filtered ordinal 1),
+    // then Shift-click source row 5 (filtered ordinal 2). Only rows 3 and 5 must be selected.
+    cx.update(|cx| {
+        controller.update(cx, |c, cx| {
+            c.select_row_active(win_id, 1, false, false, cx);
+            let (table_row, _) = c.jump_to_bookmark_active(win_id, 3, cx).unwrap();
+            assert_eq!(table_row, 1);
+            c.select_row_active(win_id, 5, true, false, cx);
+        });
+    });
+
+    cx.update(|cx| {
+        let controller_ref = controller.read(cx);
+        let snap = controller_ref
+            .active_snapshot(win_id)
+            .expect("active snapshot");
+        assert_eq!(
+            snap.selected_rows_count, 2,
+            "Shift-clicking row 5 after filtered bookmark jump to row 3 must select only 2 rows"
+        );
+        let doc = controller_ref
+            .active_document(win_id)
+            .expect("active document");
+        assert!(
+            !doc.is_table_row_selected(0, 1),
+            "source row 1 (ordinal 0) must not remain selected"
+        );
+        assert!(
+            doc.is_table_row_selected(1, 3),
+            "bookmarked source row 3 (ordinal 1) must be selected"
+        );
+        assert!(
+            doc.is_table_row_selected(2, 5),
+            "Shift-clicked source row 5 (ordinal 2) must be selected"
+        );
+    });
+}
+
+#[gpui_kit::test]
 fn rename_header_targets_selected_column_and_context_menus_work(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("context_menu_parity.csv");
