@@ -24,3 +24,11 @@ objc2-foundation = { version = "0.3.2", default-features = false, features = ["s
 [profile.release]
 codegen-units = 1
 lto = "thin"
+
+# Temporary patch for `gpui-pre-macos 0.3.12`: fall back to CVDisplayLink on
+# Apple Silicon paravirtualized Metal devices (`Apple Paravirtual device`),
+# where `CAMetalDisplayLink` stalls while the pointer is stationary
+# (https://github.com/zed-industries/zed/issues/67295). Remove once an upstream
+# `gpui-pre-macos` / `gpui-kit` release includes this fix.
+[patch.crates-io]
+gpui-pre-macos = { git = "https://github.com/danchamorro/gpui-pre-macos.git", rev = "7e0297f71d5d6ee878b55cdd4616deb9a529df41" }

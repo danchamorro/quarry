@@ -25,6 +25,7 @@ parentheses are GitHub pull requests.
 
 ### Fixed
 
+- Fixed multi-second click-to-paint stalls on Apple Silicon macOS virtual machines by temporarily patching the macOS GPUI backend to fall back to `CVDisplayLink` on Apple Paravirtual GPUs while keeping bare-metal Macs unchanged, and refreshed the third-party license manifest for the pinned patch. (#219)
 - Fixed `Cmd+C` / `Ctrl+C` row copying after selecting a row in the `#` gutter (including while filtered) and fixed **Edit → Rename Selected Column Header…** to target the selected column header rather than the previously focused cell. (#218)
 - Fixed grid whitespace visualization to inspect raw unescaped cell bytes, highlight leading, trailing, repeated, tab, newline, and special whitespace with corner indicators and tooltips, distinguish missing ragged fields, and persist **Show All Whitespace** across restarts. (#218)
 - Fixed error banners for damaged or unsupported `.gz` files so they no longer offer an unusable **Inspect…** action. (#218)
