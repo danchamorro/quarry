@@ -16,7 +16,9 @@ use gpui_kit::{
     px, rgb,
 };
 use quarry_workbench::{
-    Document, MAX_GRID_TEXT_CHARS, WindowId, field_preview, source_looks_numeric,
+    Document, GRID_FONT_SIZE, MAX_GRID_TEXT_CHARS, MAX_WRAP_CELL_BYTES, MAX_WRAPPED_LINES,
+    RowWrapCache, RowWrapCacheKey, WRAPPED_LINE_HEIGHT_PX, WindowId, WrapFrameBudget,
+    column_widths_fingerprint, field_preview, measure_wrapped_cell, source_looks_numeric,
 };
 
 use crate::whitespace_ui::render_whitespace;
@@ -63,6 +65,9 @@ pub struct Grid {
     widths: HashMap<usize, Pixels>,
     visible_rows: Range<usize>,
     visible_columns: Range<usize>,
+    wrap_cache: RowWrapCache,
+    frame_budget: WrapFrameBudget,
+    last_frame_row: Option<usize>,
 }
 
 impl Grid {
@@ -79,6 +84,9 @@ impl Grid {
             widths: HashMap::new(),
             visible_rows: 0..40,
             visible_columns: 0..16,
+            wrap_cache: RowWrapCache::default(),
+            frame_budget: WrapFrameBudget::default_frame(),
+            last_frame_row: None,
         }
     }
 
@@ -112,10 +120,34 @@ impl Grid {
         for (source, width) in shown.iter().zip(widths.iter().skip(1)) {
             self.widths.insert(*source, *width);
         }
+        self.wrap_cache.clear();
     }
 
     pub fn reset_widths(&mut self) {
         self.widths.clear();
+        self.wrap_cache.clear();
+    }
+
+    pub fn clear_wrap_cache(&mut self) {
+        self.wrap_cache.clear();
+        self.frame_budget.reset();
+        self.last_frame_row = None;
+    }
+
+    #[cfg(test)]
+    pub fn wrap_cache_stats(&self) -> (usize, u64, u64) {
+        (
+            self.wrap_cache.len(),
+            self.wrap_cache.hits(),
+            self.wrap_cache.misses(),
+        )
+    }
+
+    fn width_for_source_col(&self, source_col: usize) -> f32 {
+        self.widths
+            .get(&source_col)
+            .map(|p| f32::from(*p))
+            .unwrap_or(124.0)
     }
 
     pub fn visible_rows(&self) -> Range<usize> {
@@ -146,6 +178,7 @@ impl Grid {
                 px((chars.min(48) as f32 * 8.2 + 24.).clamp(76., 420.)),
             );
         }
+        self.wrap_cache.clear();
     }
 
     /// Maps a rendered `(row, table_column)` to `(source_row, source_column)` if loaded.
@@ -521,13 +554,20 @@ impl TableDelegate for Grid {
         _: &mut Window,
         cx: &mut Context<TableState<Self>>,
     ) -> impl IntoElement {
-        let (tokens, show_all) = {
+        let (tokens, show_all, wrap_active) = {
             let controller = self.controller.read(cx);
             (
                 controller.active_palette(),
                 controller.show_all_whitespace(),
+                controller.effective_word_wrap(self.window_id).is_active(),
             )
         };
+        if wrap_active {
+            if self.last_frame_row.is_none_or(|prev| row < prev) {
+                self.frame_budget.reset();
+            }
+            self.last_frame_row = Some(row);
+        }
         let src_row_opt = self.source_row_at(row, cx);
         let src_col_opt = self.source_column_at(column, cx);
         let (row_selected, row_bookmarked, col_selected) = {
@@ -547,11 +587,8 @@ impl TableDelegate for Grid {
             .relative()
             .size_full()
             .flex()
-            .items_center()
             .gap_1()
             .overflow_hidden()
-            .whitespace_nowrap()
-            .text_ellipsis()
             .text_size(px(quarry_workbench::GRID_FONT_SIZE))
             .font_features(tabular_font_features())
             .text_color(if column == 0 {
@@ -563,6 +600,11 @@ impl TableDelegate for Grid {
             } else {
                 cx.theme().foreground
             });
+        cell = if wrap_active {
+            cell.items_start()
+        } else {
+            cell.items_center().whitespace_nowrap().text_ellipsis()
+        };
 
         if column == 0 {
             if row_selected {
@@ -597,13 +639,20 @@ impl TableDelegate for Grid {
                     });
             }
             if row_bookmarked {
-                cell = cell.child(div().w(px(6.)).h(px(6.)).flex_shrink_0().rounded_full().bg(
-                    rgb(if row_selected {
+                let mut dot = div()
+                    .w(px(6.))
+                    .h(px(6.))
+                    .flex_shrink_0()
+                    .rounded_full()
+                    .bg(rgb(if row_selected {
                         tokens.on_accent.to_rgb_hex()
                     } else {
                         tokens.accent_text.to_rgb_hex()
-                    }),
-                ));
+                    }));
+                if wrap_active {
+                    dot = dot.mt(px(6.));
+                }
+                cell = cell.child(dot);
             }
             let text = self.gutter_label(row, cx).unwrap_or_default();
             return cell.child(
@@ -659,6 +708,54 @@ impl TableDelegate for Grid {
                 controller.inspect_cell_whitespace(win_id, src_row, src_col, raw_len)
             });
 
+            let allow_wrap_cell = wrap_active && self.frame_budget.try_consume(raw_len);
+            let col_width_px = self.width_for_source_col(src_col);
+            let mut wrap_cache_key = None;
+            if allow_wrap_cell {
+                let controller = self.controller.read(cx);
+                if let Some(doc) = controller.active_document(win_id) {
+                    let fp = column_widths_fingerprint(
+                        doc.columns
+                            .visible
+                            .iter()
+                            .copied()
+                            .map(|c| (c, self.width_for_source_col(c))),
+                    );
+                    wrap_cache_key = Some(RowWrapCacheKey {
+                        row: src_row,
+                        source_generation: doc.instance_id,
+                        edit_revision: doc.edit_revision,
+                        show_all_whitespace: show_all,
+                        font_size_tenths: (GRID_FONT_SIZE * 10.0) as u16,
+                        width_fingerprint: fp,
+                    });
+                }
+            }
+            if let Some(cache_key) = wrap_cache_key
+                && self.wrap_cache.get(&cache_key).is_none()
+            {
+                let controller = self.controller.read(cx);
+                if let Some(doc) = controller.active_document(win_id)
+                    && let Some((_, fields)) = loaded_row(doc, row)
+                {
+                    let widths = &self.widths;
+                    self.wrap_cache.get_or_measure(
+                        cache_key,
+                        GRID_FONT_SIZE,
+                        doc.columns.visible.iter().copied().map(|col_id| {
+                            let bytes = if let Some(edited) = doc.cell_edits.get(&(src_row, col_id))
+                            {
+                                edited.as_slice()
+                            } else {
+                                fields.get(col_id).map(Vec::as_slice).unwrap_or(&[])
+                            };
+                            let w = widths.get(&col_id).map(|p| f32::from(*p)).unwrap_or(124.0);
+                            (bytes, w)
+                        }),
+                    );
+                }
+            }
+
             let rendered_cell = {
                 let controller = self.controller.read(cx);
                 controller
@@ -667,8 +764,19 @@ impl TableDelegate for Grid {
                     .and_then(|(_, _, raw_opt)| raw_opt)
                     .map(|raw| {
                         let numeric_cell = source_looks_numeric(raw);
-                        let rendered =
-                            render_whitespace(raw, summary, show_all, MAX_GRID_TEXT_CHARS.min(240));
+                        let max_chars = if allow_wrap_cell {
+                            measure_wrapped_cell(
+                                raw,
+                                col_width_px,
+                                GRID_FONT_SIZE,
+                                MAX_WRAPPED_LINES,
+                                MAX_WRAP_CELL_BYTES,
+                            )
+                            .display_char_budget
+                        } else {
+                            MAX_GRID_TEXT_CHARS.min(240)
+                        };
+                        let rendered = render_whitespace(raw, summary, show_all, max_chars);
                         let invalid_utf8 =
                             summary.map_or(rendered.prefix_invalid_utf8, |s| s.invalid_utf8);
                         let indicated = summary.is_some_and(|s| s.indicated(show_all))
@@ -694,6 +802,14 @@ impl TableDelegate for Grid {
             };
 
             let mut text_div = div().flex_1().min_w_0().overflow_hidden().text_ellipsis();
+            if allow_wrap_cell {
+                text_div = text_div
+                    .whitespace_normal()
+                    .line_clamp(MAX_WRAPPED_LINES)
+                    .line_height(px(WRAPPED_LINE_HEIGHT_PX));
+            } else {
+                text_div = text_div.whitespace_nowrap();
+            }
             if numeric_cell {
                 text_div = text_div.text_right();
             }

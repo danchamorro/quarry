@@ -4532,3 +4532,215 @@ fn whitespace_persists_damaged_gzip_uninspectable_and_drag_drop_opens_files(
         "damaged .gz open failure must not offer Inspect… button"
     );
 }
+
+#[gpui_kit::test]
+fn adaptive_word_wrap_persists_preserves_anchor_and_auto_disables_above_threshold(
+    cx: &mut TestAppContext,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let pref_path = dir.path().join("word-wrap-preferences");
+    let small_csv = dir.path().join("small_wrap.csv");
+    let large_csv = dir.path().join("large_wrap.csv");
+
+    let mut small_content = String::from("id,notes\n");
+    for i in 1..=120 {
+        small_content.push_str(&format!(
+            "{i},\"Row {i} has a deliberately long note value designed to wrap cleanly onto two visual lines inside a narrow grid column\"\n"
+        ));
+    }
+    std::fs::write(&small_csv, &small_content).unwrap();
+
+    let mut large_content = String::from("id,notes\n");
+    for i in 1..=600 {
+        large_content.push_str(&format!(
+            "{i},\"Large file row {i} payload exceeding a low custom auto-disable threshold for deterministic adaptive word-wrap verification\"\n"
+        ));
+    }
+    std::fs::write(&large_csv, &large_content).unwrap();
+    let small_len = std::fs::metadata(&small_csv).unwrap().len();
+    let large_len = std::fs::metadata(&large_csv).unwrap().len();
+    assert!(small_len < large_len);
+
+    let controller = cx.update(|cx| {
+        gpui_kit::init(cx);
+        crate::apply_light_theme(cx);
+        bind_shortcuts(cx);
+        install_menus(cx);
+        let prefs = quarry_workbench::WordWrapPreferences::load(Some(pref_path.clone()));
+        cx.new(|_| {
+            WorkbenchController::new(WorkbenchSchedulerConfig {
+                index_cache_enabled: false,
+                ..WorkbenchSchedulerConfig::default()
+            })
+            .with_word_wrap_prefs(prefs)
+        })
+    });
+    let (handle, view) = open_test_window(cx, &controller);
+    let win_id = cx.update(|cx| view.read(cx).window_id);
+
+    // Open small CSV and wait for indexing.
+    cx.update(|cx| {
+        controller
+            .update(cx, |c, cx| {
+                c.open_paths(
+                    win_id,
+                    vec![small_csv.clone()],
+                    OpenOptions::default(),
+                    None,
+                    cx,
+                )
+            })
+            .unwrap();
+    });
+    wait_for_ui(cx, handle, &controller, &view, |q, _, cx| {
+        q.snapshot(cx).is_some_and(|s| s.index_done)
+    });
+
+    assert_eq!(
+        cx.update(|cx| controller.read(cx).effective_word_wrap(win_id)),
+        quarry_workbench::EffectiveWordWrap::Off
+    );
+
+    // Scroll to row 50, then toggle word wrap ON and confirm anchor + persistence + clean state.
+    cx.update_window(handle.into(), |_, window, cx| {
+        view.update(cx, |q, cx| {
+            q.row_input
+                .update(cx, |input, cx| input.set_value("51", window, cx));
+            q.go_to_row(cx);
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+    let anchor_before =
+        cx.update(|cx| view.read(cx).table.read(cx).delegate().visible_rows().start);
+
+    cx.update_window(handle.into(), |_, window, cx| {
+        view.update(cx, |q, cx| {
+            q.toggle_word_wrap_action(&crate::menus::ToggleWordWrap, window, cx);
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    let snap_on = cx.update(|cx| view.read(cx).snapshot(cx).unwrap());
+    assert_eq!(
+        snap_on.word_wrap,
+        quarry_workbench::EffectiveWordWrap::Active {
+            manual_override: false
+        }
+    );
+    assert!(
+        !snap_on.dirty,
+        "word wrap must remain view-only and never dirty a document"
+    );
+    assert!(
+        quarry_workbench::WordWrapPreferences::load(Some(pref_path.clone())).enabled,
+        "word wrap preference must persist across restarts"
+    );
+    let anchor_after = cx.update(|cx| view.read(cx).table.read(cx).delegate().visible_rows().start);
+    assert_eq!(
+        anchor_after, anchor_before,
+        "toggling word wrap on must preserve the top visible row anchor"
+    );
+    let (cache_len, _, _) =
+        cx.update(|cx| view.read(cx).table.read(cx).delegate().wrap_cache_stats());
+    assert!(
+        cache_len > 0 && cache_len <= quarry_workbench::MAX_CACHED_WRAP_ROWS,
+        "expected fetched-row wrap cache to populate bounded entries; got {cache_len}"
+    );
+
+    // Lower threshold strictly between small_len and large_len to verify deterministic auto-disable.
+    let threshold = small_len + 1;
+    assert!(large_len > threshold);
+    cx.update(|cx| {
+        controller
+            .update(cx, |c, cx| {
+                c.set_word_wrap_auto_disable_bytes(threshold, cx)
+            })
+            .unwrap();
+    });
+    assert_eq!(
+        quarry_workbench::WordWrapPreferences::load(Some(pref_path)).auto_disable_bytes,
+        threshold
+    );
+
+    // Opening large_csv while word wrap is globally enabled must auto-disable for that tab.
+    cx.update(|cx| {
+        controller
+            .update(cx, |c, cx| {
+                c.open_paths(
+                    win_id,
+                    vec![large_csv.clone()],
+                    OpenOptions::default(),
+                    None,
+                    cx,
+                )
+            })
+            .unwrap();
+    });
+    wait_for_ui(cx, handle, &controller, &view, |q, _, cx| {
+        q.snapshot(cx)
+            .is_some_and(|s| s.path == large_csv && s.index_done)
+    });
+
+    let snap_large = cx.update(|cx| view.read(cx).snapshot(cx).unwrap());
+    assert_eq!(
+        snap_large.word_wrap,
+        quarry_workbench::EffectiveWordWrap::AutoDisabled {
+            file_bytes: large_len,
+            threshold_bytes: threshold,
+        }
+    );
+
+    // Toggling on an auto-disabled tab overrides it ON for that tab only; toggling again returns to AutoDisabled
+    // and emits quiet transition announcements for assistive technology.
+    cx.update_window(handle.into(), |_, window, cx| {
+        view.update(cx, |q, cx| {
+            q.toggle_word_wrap_action(&crate::menus::ToggleWordWrap, window, cx);
+        });
+    })
+    .unwrap();
+    assert_eq!(
+        cx.update(|cx| controller.read(cx).effective_word_wrap(win_id)),
+        quarry_workbench::EffectiveWordWrap::Active {
+            manual_override: true
+        }
+    );
+    let override_announcement = cx.update(|cx| {
+        controller
+            .read(cx)
+            .hud_announcement(win_id)
+            .map(|a| a.text.clone())
+    });
+    assert!(
+        override_announcement
+            .as_deref()
+            .is_some_and(|t| t.contains("Word wrap enabled for this tab")),
+        "override toggle must emit a quiet accessibility announcement; got {override_announcement:?}"
+    );
+
+    cx.update_window(handle.into(), |_, window, cx| {
+        view.update(cx, |q, cx| {
+            q.toggle_word_wrap_action(&crate::menus::ToggleWordWrap, window, cx);
+        });
+    })
+    .unwrap();
+    assert!(cx.update(|cx| {
+        controller
+            .read(cx)
+            .effective_word_wrap(win_id)
+            .is_auto_disabled()
+    }));
+    let auto_off_announcement = cx.update(|cx| {
+        controller
+            .read(cx)
+            .hud_announcement(win_id)
+            .map(|a| a.text.clone())
+    });
+    assert!(
+        auto_off_announcement
+            .as_deref()
+            .is_some_and(|t| t.contains("auto-disabled")),
+        "auto-disable transition must emit a quiet accessibility announcement; got {auto_off_announcement:?}"
+    );
+}

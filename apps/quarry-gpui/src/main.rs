@@ -23,7 +23,7 @@ const APP_ID: &str = "io.github.danchamorro.quarry";
 use gpui_kit::component::menu::AppMenuBar;
 use gpui_kit::{
     component::{
-        ActiveTheme, Disableable, Root, Sizable, Theme, ThemeMode, WindowExt,
+        ActiveTheme, Disableable, Root, Sizable, Size, Theme, ThemeMode, WindowExt,
         button::{Button, ButtonVariants},
         input::{Input, InputEvent, InputState, Textarea, TextareaState},
         menu::{PopupMenu, PopupMenuItem},
@@ -34,8 +34,9 @@ use gpui_kit::{
 };
 use quarry_core::{BoundaryTrust, CaseSensitivity, Encoding, OpenOptions, ProcessMemorySample};
 use quarry_workbench::{
-    AppMessage, CommandId, DocumentId, FailedOpen, GridSelection, MessageSeverity, ResidencyState,
-    ResolvedTheme, ThemeAppearance, ThemePreference, VolumeSpaceSample, WindowId,
+    AppMessage, CommandId, DocumentId, EffectiveWordWrap, FailedOpen, GridSelection,
+    MessageSeverity, ResidencyState, ResolvedTheme, SINGLE_LINE_ROW_HEIGHT_PX, ThemeAppearance,
+    ThemePreference, VolumeSpaceSample, WRAPPED_ROW_HEIGHT_PX, WindowId,
     compressed::uncompressed_name, format_bytes,
 };
 
@@ -51,7 +52,8 @@ use menus::{
     QUARRY_KEY_CONTEXT, QuitApp, RedoEdit, ReloadFromDisk, RenameHeader, ReplaceText, SaveAsFile,
     SaveAsUtf8, SaveFile, ShowAllWhitespace, SortRows, SplitColumn, TemporaryStorage, ThemeDark,
     ThemeLight, ThemeOmarchy, ThemeSystem, ToggleBookmark, ToggleBookmarks, ToggleColumns,
-    ToggleFilters, UndoEdit, VerifySectionBoundary, bind_shortcuts, encoding_label, install_menus,
+    ToggleFilters, ToggleWordWrap, UndoEdit, VerifySectionBoundary, bind_shortcuts, encoding_label,
+    install_menus,
 };
 use panels::{PanelEvent, Panels, Tool};
 use workbench::{
@@ -72,6 +74,8 @@ pub struct QuarryWindow {
     last_headers: Vec<String>,
     last_shown_columns: Vec<usize>,
     last_row_gutter_anchor: Option<u64>,
+    last_word_wrap_active: bool,
+    last_word_wrap_auto_disabled_doc: Option<(DocumentId, u64)>,
     confirming: bool,
     editing: bool,
     editor_status: Option<Entity<CellEditStatus>>,
@@ -364,6 +368,8 @@ impl QuarryWindow {
             last_headers: Vec::new(),
             last_shown_columns: Vec::new(),
             last_row_gutter_anchor: None,
+            last_word_wrap_active: false,
+            last_word_wrap_auto_disabled_doc: None,
             confirming: false,
             editing: false,
             editor_status: None,
@@ -451,6 +457,7 @@ impl QuarryWindow {
                 self.last_headers = info.headers.clone();
                 self.last_shown_columns = info.shown_columns.clone();
                 self.last_row_gutter_anchor = row_gutter_anchor;
+                self.last_word_wrap_active = info.word_wrap.is_active();
                 if doc_changed {
                     self.close_grid_context_menu_and_restore_focus(window, cx);
                 }
@@ -472,7 +479,30 @@ impl QuarryWindow {
                         .update(cx, |state, cx| state.set_value("1", window, cx));
                 }
             } else {
-                self.table.update(cx, |_, cx| cx.notify());
+                let wrap_active = info.word_wrap.is_active();
+                if self.last_word_wrap_active != wrap_active {
+                    self.last_word_wrap_active = wrap_active;
+                    let top_row = self.table.read(cx).delegate().visible_rows().start;
+                    self.table.update(cx, |table, cx| {
+                        table.delegate_mut().clear_wrap_cache();
+                        table.scroll_to_row(top_row, cx);
+                        cx.notify();
+                    });
+                } else {
+                    self.table.update(cx, |_, cx| cx.notify());
+                }
+            }
+            if info.word_wrap.is_auto_disabled() {
+                if self.last_word_wrap_auto_disabled_doc != Some(doc_key) {
+                    self.last_word_wrap_auto_disabled_doc = Some(doc_key);
+                    let announcement = info.word_wrap.transition_announcement();
+                    let win_id = self.window_id;
+                    self.controller.update(cx, |controller, cx| {
+                        controller.push_hud_announcement(win_id, announcement, false, cx);
+                    });
+                }
+            } else if self.last_word_wrap_auto_disabled_doc == Some(doc_key) {
+                self.last_word_wrap_auto_disabled_doc = None;
             }
         } else {
             self.close_grid_context_menu_and_restore_focus(window, cx);
@@ -1583,7 +1613,33 @@ impl QuarryWindow {
         if let Some(warning) = warning {
             self.set_message(AppMessage::warning(warning), cx);
         }
-        self.table.update(cx, |_, cx| cx.notify());
+        self.table.update(cx, |table, cx| {
+            table.delegate_mut().clear_wrap_cache();
+            cx.notify();
+        });
+    }
+
+    fn toggle_word_wrap_action(
+        &mut self,
+        _: &ToggleWordWrap,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let top_row = self.table.read(cx).delegate().visible_rows().start;
+        let outcome = self.controller.update(cx, |controller, cx| {
+            controller.toggle_word_wrap(self.window_id, cx)
+        });
+        self.last_word_wrap_active = outcome.effective.is_active();
+        if let Some(warning) = outcome.persist_warning {
+            self.set_message(AppMessage::warning(warning), cx);
+        } else if let Some(notice) = outcome.status_notice {
+            self.set_message(AppMessage::status(notice), cx);
+        }
+        self.table.update(cx, |table, cx| {
+            table.delegate_mut().clear_wrap_cache();
+            table.scroll_to_row(top_row, cx);
+            cx.notify();
+        });
     }
 
     fn restore_grid_focus(&self, window: &mut Window, cx: &mut Context<Self>) {
@@ -3862,6 +3918,7 @@ impl QuarryWindow {
         loaded: bool,
         busy: bool,
         show_whitespace: bool,
+        word_wrap: EffectiveWordWrap,
         can_undo: bool,
         can_redo: bool,
         can_save: bool,
@@ -3998,6 +4055,17 @@ impl QuarryWindow {
                     .small()
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.toggle_whitespace_action(&ShowAllWhitespace, window, cx);
+                    })),
+            )
+            .child(
+                Button::new("toggle-word-wrap")
+                    .label(word_wrap.toolbar_label())
+                    .accessibility_label(word_wrap.accessible_label())
+                    .tooltip(word_wrap.tooltip())
+                    .ghost()
+                    .small()
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.toggle_word_wrap_action(&ToggleWordWrap, window, cx);
                     })),
             )
             .child(div().flex_1())
@@ -4505,6 +4573,7 @@ impl Render for QuarryWindow {
         let tabs = self.controller.read(cx).tabs_for_window(self.window_id);
         let total_open_tabs = self.controller.read(cx).scheduler().total_tabs();
         let show_whitespace = self.controller.read(cx).show_all_whitespace();
+        let word_wrap = self.controller.read(cx).effective_word_wrap(self.window_id);
         let filename = info
             .as_ref()
             .map(|i| i.filename.clone())
@@ -4583,6 +4652,7 @@ impl Render for QuarryWindow {
             .on_action(cx.listener(Self::pause_resume_indexing_action))
             .on_action(cx.listener(Self::verify_section_boundary_action))
             .on_action(cx.listener(Self::toggle_whitespace_action))
+            .on_action(cx.listener(Self::toggle_word_wrap_action))
             .on_action(cx.listener(Self::theme_system_action))
             .on_action(cx.listener(Self::theme_light_action))
             .on_action(cx.listener(Self::theme_dark_action))
@@ -4622,6 +4692,7 @@ impl Render for QuarryWindow {
             loaded,
             busy,
             show_whitespace,
+            word_wrap,
             can_undo,
             can_redo,
             can_save,
@@ -4676,6 +4747,20 @@ impl Render for QuarryWindow {
             )
             .absolute()
             .size_full();
+            let data_table = if word_wrap.is_active() {
+                DataTable::new(&self.table)
+                    .accessibility_label(format!("{filename} data grid"))
+                    .stripe(true)
+                    .bordered(false)
+                    .with_size(Size::Size(px(WRAPPED_ROW_HEIGHT_PX)))
+                    .header_row_height(px(SINGLE_LINE_ROW_HEIGHT_PX))
+            } else {
+                DataTable::new(&self.table)
+                    .accessibility_label(format!("{filename} data grid"))
+                    .stripe(true)
+                    .bordered(false)
+                    .small()
+            };
             body = body.child(
                 div()
                     .relative()
@@ -4683,13 +4768,7 @@ impl Render for QuarryWindow {
                     .min_h_0()
                     .overflow_hidden()
                     .child(shift_horizontal_scroll)
-                    .child(
-                        DataTable::new(&self.table)
-                            .accessibility_label(format!("{filename} data grid"))
-                            .stripe(true)
-                            .bordered(false)
-                            .small(),
-                    ),
+                    .child(data_table),
             );
         } else {
             body = body.child(self.render_welcome(cx));

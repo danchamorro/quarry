@@ -12,6 +12,7 @@ pub mod storage_prefs;
 pub mod tab;
 pub mod theme;
 pub mod whitespace;
+pub mod word_wrap;
 pub mod workflows;
 
 pub use bookmarks::{
@@ -68,6 +69,15 @@ pub use theme::{
     contrast_ratio, load_omarchy_theme_from_home, looks_numeric, omarchy_allowed_roots,
     omarchy_theme_fingerprint, palette_meets_wcag_aa, relative_luminance, resolve_theme,
     resolve_theme_for_current_user, source_looks_numeric,
+};
+pub use word_wrap::{
+    DEFAULT_WORD_WRAP_AUTO_DISABLE_BYTES, EffectiveWordWrap, MAX_CACHED_WRAP_ROWS,
+    MAX_CONFIGURABLE_AUTO_DISABLE_MB, MAX_WRAP_CELL_BYTES, MAX_WRAP_FRAME_BUDGET_BYTES,
+    MAX_WRAPPED_LINES, MIN_CONFIGURABLE_AUTO_DISABLE_MB, RowWrapCache, RowWrapCacheKey,
+    RowWrapMetrics, SINGLE_LINE_ROW_HEIGHT_PX, WRAPPED_LINE_HEIGHT_PX, WRAPPED_ROW_HEIGHT_PX,
+    WordWrapPreferences, WordWrapToggleOutcome, WrapCellMetrics, WrapFrameBudget,
+    column_widths_fingerprint, format_decimal_mb, measure_wrapped_cell, resolve_word_wrap,
+    unix_word_wrap_preferences_path, utf8_bounded_prefix_len,
 };
 
 #[cfg(any(test, feature = "test-hooks"))]

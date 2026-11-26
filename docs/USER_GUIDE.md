@@ -8,6 +8,7 @@ delimited files in the Quarry desktop app on **macOS** and **Linux / Omarchy**.
 - [Getting started](#getting-started)
 - [How to](#how-to)
   - [Choose a theme](#choose-a-theme)
+  - [Wrap long cells (Adaptive Word Wrap)](#wrap-long-cells-adaptive-word-wrap)
   - [Work with tabs and multiple windows](#work-with-tabs-and-multiple-windows)
   - [Pause indexing and read the Live Resource HUD](#pause-indexing-and-read-the-live-resource-hud)
   - [Open a section of a huge file](#open-a-section-of-a-huge-file)
@@ -157,6 +158,25 @@ Open **View → Theme** and choose:
   present).
 
 Your choice is saved locally and restored on next launch.
+
+### Wrap long cells (Adaptive Word Wrap)
+
+Toggle view-only 2-line cell wrapping with **View → Word Wrap**, the toolbar
+**Wrap** button, or **Option+Z** (macOS) / **Alt+Z** (Linux) while the grid has
+focus:
+
+- Wrapped rows expand uniformly to show up to **2 lines** per cell with a
+  trailing ellipsis when text overflows, while preserving Quarry's row-based
+  scrolling and keeping your top visible row anchored on toggle. Full cell
+  values remain intact in Copy and inline cell editing.
+- Wrapping is strictly view-only and never marks a document dirty. Per-cell
+  (`4 KiB`) and per-frame (`128 KiB`) layout budgets keep navigation responsive
+  even on multi-megabyte single-line fields.
+- **Adaptive 300 MB auto-disable:** When Word Wrap is enabled globally, files
+  (or sections) larger than **300 MB** automatically scale back to single-line
+  rows (**Wrap: Auto-off**). Click **Wrap: Auto-off** to override word wrap on
+  for that tab, or adjust the threshold (in MB, or `0` to disable auto-scale-back)
+  under **File → Temporary Storage…**.
 
 ### Work with tabs and multiple windows
 
@@ -1143,6 +1163,7 @@ setting.
 | Replace… | `Command+Option+F` | `Ctrl+H` |
 | Toggle row bookmark | `Command+B` or right-click `#` gutter | `Ctrl+B` or right-click `#` gutter |
 | Next / Previous row bookmark | `Command+]` / `Command+[` | `Ctrl+]` / `Ctrl+[` |
+| Toggle adaptive word wrap | `Option+Z` (grid focused) | `Alt+Z` (grid focused) |
 | Move by one page | `Page Up` / `Page Down` | `Page Up` / `Page Down` |
 | Select a row or column range | `Shift+Click` row/column numbers | `Shift+Click` row/column numbers |
 | Add or remove selected rows/columns | `Command+Click` row/column numbers | `Ctrl+Click` row/column numbers |
