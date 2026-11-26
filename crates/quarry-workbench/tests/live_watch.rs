@@ -907,3 +907,71 @@ fn live_watch_filtered_page_reads_run_in_background_worker() {
     assert_eq!(doc.filtered_rows[0].fields[0], b"10");
     let _ = scheduler.stop_live_watch(doc_id).unwrap();
 }
+
+#[test]
+fn live_watch_filter_replacement_discards_in_flight_page_read_from_previous_filter() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("replace_filter_read.csv");
+    std::fs::write(&path, b"id,level\n1,WARN\n2,INFO\n").unwrap();
+
+    let (mut scheduler, doc_id) = open_completed_scheduler(&path);
+    scheduler
+        .start_live_watch_with_config(
+            doc_id,
+            WatchConfig {
+                poll_interval: Duration::from_millis(15),
+                cache_config: quarry_core::IndexCacheConfig::disabled(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    let warn_query = FilterQuery::single(1, FilterOperator::Equals, b"WARN".to_vec());
+    let info_query = FilterQuery::single(1, FilterOperator::Equals, b"INFO".to_vec());
+
+    // Attach Filter A (WARN, 1 match).
+    scheduler
+        .tab_mut(doc_id)
+        .unwrap()
+        .document
+        .as_mut()
+        .unwrap()
+        .start_filter(warn_query)
+        .unwrap();
+    assert!(wait_until(Duration::from_secs(3), || {
+        let _ = scheduler.poll_all();
+        let doc = scheduler.tab(doc_id).unwrap().document.as_ref().unwrap();
+        doc.live_watch_filter_attach.is_none() && doc.filtered_rows.len() == 1
+    }));
+
+    // Schedule a background FilterReadJob for Filter A (window 0..1), then replace with Filter B
+    // (INFO, also window 0..1) BEFORE collecting A's completed FilterReadJob!
+    {
+        let doc = scheduler
+            .tab_mut(doc_id)
+            .unwrap()
+            .document
+            .as_mut()
+            .unwrap();
+        doc.filtered_rows.clear();
+        doc.navigate_filter(0).unwrap();
+        assert!(doc.filter_read.is_some());
+        doc.start_filter(info_query).unwrap();
+    }
+
+    // Wait for Filter B attachment + its own FilterReadJob to finish.
+    assert!(wait_until(Duration::from_secs(3), || {
+        let _ = scheduler.poll_all();
+        let doc = scheduler.tab(doc_id).unwrap().document.as_ref().unwrap();
+        doc.live_watch_filter_attach.is_none()
+            && doc.filter_read.is_none()
+            && doc.filtered_rows.len() == 1
+    }));
+
+    let doc = scheduler.tab(doc_id).unwrap().document.as_ref().unwrap();
+    assert_eq!(
+        doc.filtered_rows[0].fields[1], b"INFO",
+        "in-flight FilterReadJob from WARN must be discarded so INFO row is shown"
+    );
+    let _ = scheduler.stop_live_watch(doc_id).unwrap();
+}

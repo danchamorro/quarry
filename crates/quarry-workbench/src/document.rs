@@ -2665,9 +2665,27 @@ impl Document {
                 }
             }
         }
+        let committed_header_row = if self.session.dialect.has_header
+            && self.live_watch_header_row.is_none()
+            && snap.committed_rows > 0
+        {
+            job.read_rows(0, 1).ok().and_then(|mut rows| rows.pop())
+        } else {
+            None
+        };
         self.live_watch_last_generation = snap.generation;
         self.index = Some(live_index);
+        let mut live_filter_query_changed = false;
         if let Some(filter_idx) = live_filter {
+            live_filter_query_changed = self
+                .filter_index
+                .as_ref()
+                .is_some_and(|prev| prev.query() != filter_idx.query());
+            if live_filter_query_changed {
+                self.stop_filter_read();
+                self.filtered_rows.clear();
+                self.whitespace.invalidate_rows();
+            }
             let matches = filter_idx.matches_found();
             self.filter_index = Some(filter_idx);
             if let Some(progress) = self.filter_progress.as_mut() {
@@ -2684,13 +2702,8 @@ impl Document {
         self.progress.bytes_read = snap.observed_file_len;
         self.progress.file_size = snap.observed_file_len;
         self.progress.columns_found = snap.maximum_width;
-        if self.session.dialect.has_header
-            && self.live_watch_header_row.is_none()
-            && snap.committed_rows > 0
-        {
-            if let Ok(mut rows) = job.read_rows(0, 1) {
-                self.live_watch_header_row = rows.pop();
-            }
+        if let Some(header_row) = committed_header_row {
+            self.live_watch_header_row = Some(header_row);
             self.apply_indexed_width(snap.maximum_width);
             self.refresh_column_headers();
         } else {
@@ -2702,11 +2715,13 @@ impl Document {
         self.live_watch_snapshot = Some(snap);
 
         if self.live_watch_tail_follow {
-            if rows_grew || matches_grew {
+            if rows_grew || matches_grew || live_filter_query_changed {
                 self.scroll_to_live_tail(true)?;
             }
         } else if self.filter_active() {
-            if matches_grew && self.filtered_rows.len() < self.visible_rows {
+            if live_filter_query_changed
+                || (matches_grew && self.filtered_rows.len() < self.visible_rows)
+            {
                 self.filtered_rows.clear();
                 self.whitespace.invalidate_rows();
                 self.schedule_filter_buffer(self.filter_viewport_start)?;
@@ -3300,12 +3315,14 @@ impl Document {
                     } else {
                         0
                     };
+                    self.stop_filter_read();
                     self.filter_buffer_start = 0;
                     self.whitespace.invalidate_rows();
                     self.filtered_rows.clear();
                     self.schedule_filter_buffer(self.filter_viewport_start)?;
                 }
                 Ok(None) => {
+                    self.stop_filter_read();
                     if let Some(existing) = self
                         .live_watch
                         .as_ref()
@@ -3344,6 +3361,7 @@ impl Document {
                     }
                 }
                 Err(error) => {
+                    self.stop_filter_read();
                     if matches!(error, QuarryError::SourceChanged) {
                         self.invalidate_changed_source();
                     }
