@@ -17,14 +17,15 @@ Quarry runs natively on Linux (`x86_64` and `arm64`) and [Omarchy](https://omarc
 
 ## Installing a Prebuilt Release (Recommended)
 
-Prebuilt Linux tarballs for **`x86_64`** (most desktops and laptops) and **`arm64`** (`aarch64`) are built in CI for [GitHub Releases](https://github.com/danchamorro/quarry/releases) starting with the `v0.2.0-beta.2` pre-release—no Rust toolchain or compiler required. (Until a Linux archive is attached to the latest release, use `./scripts/linux-app.sh install` under [Building from Source](#building-from-source).)
+Prebuilt Linux tarballs for **`x86_64`** (most desktops and laptops) and **`arm64`** (`aarch64`) are published on [GitHub Releases](https://github.com/danchamorro/quarry/releases) (starting with **[v0.2.0-beta.2](https://github.com/danchamorro/quarry/releases/tag/v0.2.0-beta.2)**)—no Rust toolchain or compiler required.
 
-1. Download `Quarry-<tag>-linux-x86_64.tar.gz` (or `arm64`) and `SHA256SUMS-linux-<arch>.txt`.
-2. Verify the checksum and run the included user installer:
+1. Download `Quarry-v0.2.0-beta.2-linux-x86_64.tar.gz` (or `arm64`) and its `SHA256SUMS-linux-*.txt`.
+2. From the directory containing the downloaded files, verify the checksum and run the included user installer:
 
 ```bash
-ARCHIVE="Quarry-<tag>-linux-x86_64.tar.gz"
-sha256sum -c SHA256SUMS-linux-x86_64.txt &&
+ARCH="x86_64" # or "arm64"
+ARCHIVE="Quarry-v0.2.0-beta.2-linux-${ARCH}.tar.gz"
+awk -v archive="$ARCHIVE" 'substr($0, 67) == archive' "SHA256SUMS-linux-${ARCH}.txt" | sha256sum -c - &&
   tar -xzf "$ARCHIVE" &&
   cd "${ARCHIVE%.tar.gz}" &&
   ./install.sh
