@@ -1374,6 +1374,8 @@ impl LiveWatchJob {
                 }
                 match drain_open_fd_locked(
                     &self.shared.open_file,
+                    &self.shared.path,
+                    self.shared.open_identity,
                     &mut tail,
                     &mut read_buf,
                     &mut index,
@@ -1422,13 +1424,13 @@ impl LiveWatchJob {
                     "File continued growing while stopping Live Watch. Reload from disk to view the latest rows."
                         .into(),
                 ));
-            } else if stamp_before.content_version_changed(&tail.last_verified_stamp) {
+            } else if !tail.last_verified_stamp.matches(&stamp_before) {
                 final_status = WatchStatus::Alert(WatchAlert::Rewritten);
             } else {
                 match tail.verify_seam(&self.shared.open_file, true)? {
                     SeamCheck::Ok => {
                         let stamp_after = SourceStamp::from_file(&self.shared.open_file)?;
-                        if stamp_after.content_version_changed(&stamp_before) {
+                        if !stamp_before.matches(&stamp_after) {
                             final_status = if stamp_after.file_size() < stamp_before.file_size() {
                                 WatchStatus::Alert(WatchAlert::Truncated {
                                     previous_len: stamp_before.file_size(),
@@ -1960,8 +1962,11 @@ fn confirm_same_size_stamp_change(
     Ok(SameSizeStampCheck::ConfirmedRewrite)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn drain_open_fd_locked(
     open_file: &File,
+    path: &Path,
+    open_identity: Option<FileIdentity>,
     tail: &mut TailScanner,
     read_buf: &mut [u8],
     index: &mut StructuralIndex,
@@ -1979,7 +1984,12 @@ fn drain_open_fd_locked(
             current_len,
         }));
     }
-    let stamp_changed = current_stamp.content_version_changed(&tail.last_verified_stamp);
+    let stamp_changed = !tail.last_verified_stamp.matches(&current_stamp)
+        && (current_stamp.content_version_changed(&tail.last_verified_stamp)
+            || matches!(
+                check_path_identity(path, open_identity),
+                PathIdentityCheck::SameFile
+            ));
     if stamp_changed && current_len == tail.observed_file_len {
         match confirm_same_size_stamp_change(open_file, tail)? {
             SameSizeStampCheck::ConfirmedRewrite => {
@@ -2084,7 +2094,12 @@ fn drain_open_fd(
             current_len,
         }));
     }
-    let stamp_changed = current_stamp.content_version_changed(&tail.last_verified_stamp);
+    let stamp_changed = !tail.last_verified_stamp.matches(&current_stamp)
+        && (current_stamp.content_version_changed(&tail.last_verified_stamp)
+            || matches!(
+                check_path_identity(&shared.path, shared.open_identity),
+                PathIdentityCheck::SameFile
+            ));
     if stamp_changed && current_len == tail.observed_file_len {
         match confirm_same_size_stamp_change(&shared.open_file, tail)? {
             SameSizeStampCheck::ConfirmedRewrite => {
@@ -3884,5 +3899,61 @@ mod tests {
         let stopped = watch.stop().unwrap();
         assert_eq!(stopped.final_status, WatchStatus::Stopped);
         assert_eq!(stopped.index.maximum_width(), 3);
+    }
+
+    #[test]
+    fn same_size_rewrite_with_restored_mtime_triggers_rewritten_and_never_rebinds_on_stop() {
+        use std::io::{Seek, SeekFrom};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("restored_mtime_rewrite.csv");
+        let mut initial = String::from("id,v\n1,ok\n");
+        for i in 2..400 {
+            initial.push_str(&format!("{i},padding_payload_beyond_seam_window\n"));
+        }
+        assert!(initial.len() > SEAM_WINDOW_BYTES * 2);
+        std::fs::write(&path, initial.as_bytes()).unwrap();
+        let original_mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+
+        let (session, index) = open_and_index(&path, Some(Encoding::Utf8), HeaderMode::FirstRow);
+        let watch = session
+            .start_live_watch(
+                &index,
+                None,
+                WatchConfig {
+                    poll_interval: Duration::from_millis(15),
+                    cache_config: IndexCacheConfig::disabled(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        // Overwrite an early comma with a newline (same byte length, well before the 4 KiB seam)
+        // and explicitly restore the original `mtime` to simulate `pwrite` + `utimensat` tampering.
+        let mut f = FsOpenOptions::new().write(true).open(&path).unwrap();
+        f.seek(SeekFrom::Start(6)).unwrap();
+        f.write_all(b"\n").unwrap();
+        f.flush().unwrap();
+        f.set_modified(original_mtime).unwrap();
+        drop(f);
+        watch.nudge();
+
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                watch.snapshot().status == WatchStatus::Alert(WatchAlert::Rewritten)
+            }),
+            "same-size rewrite with restored mtime must fire Rewritten via ctime/data_generation, got {:?}",
+            watch.snapshot()
+        );
+        let stopped = watch.stop().unwrap();
+        assert_eq!(
+            stopped.final_status,
+            WatchStatus::Alert(WatchAlert::Rewritten)
+        );
+        assert!(!stopped.index.is_complete());
+        assert!(matches!(
+            stopped.session.read_rows(&stopped.index, 0, 5),
+            Err(QuarryError::InvalidOption(_))
+        ));
     }
 }
