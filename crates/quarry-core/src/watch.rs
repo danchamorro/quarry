@@ -978,17 +978,17 @@ impl LiveWatchJob {
 
     /// Captures a mutually consistent `(WatchSnapshot, StructuralIndex, Option<FilterIndex>)`
     /// under the canonical `index -> filter -> snapshot` lock order so UI row counts,
-    /// `appended_rows`, and filter match counts can never skew across concurrent commits.
+    /// `appended_rows`, filter match counts, and `generation` can never skew across concurrent commits.
     pub fn state_snapshot(&self) -> (WatchSnapshot, StructuralIndex, Option<FilterIndex>) {
-        let index = self.shared.index.read().unwrap().clone();
-        let filter = self
-            .shared
-            .filter
-            .read()
-            .unwrap()
-            .as_ref()
-            .map(|f| f.index.clone());
-        let mut snap = self.shared.snapshot.read().unwrap().clone();
+        let index_guard = self.shared.index.read().unwrap();
+        let filter_guard = self.shared.filter.read().unwrap();
+        let snap_guard = self.shared.snapshot.read().unwrap();
+        let index = index_guard.clone();
+        let filter = filter_guard.as_ref().map(|f| f.index.clone());
+        let mut snap = snap_guard.clone();
+        drop(snap_guard);
+        drop(filter_guard);
+        drop(index_guard);
         snap.committed_rows = index.indexed_rows();
         snap.committed_record_end = index.committed_record_end();
         snap.appended_rows = index
@@ -1117,8 +1117,10 @@ impl LiveWatchJob {
     }
 
     pub fn clear_filter(&self) {
-        *self.shared.filter.write().unwrap() = None;
+        let _index_guard = self.shared.index.read().unwrap();
+        let mut filter_guard = self.shared.filter.write().unwrap();
         let mut snap = self.shared.snapshot.write().unwrap();
+        *filter_guard = None;
         snap.filter_matches_found = None;
         snap.generation = snap.generation.saturating_add(1);
     }
@@ -1538,13 +1540,13 @@ fn attach_filter_query_shared(
         filter_index.set_complete(true);
         let snapshot_index = filter_index.clone();
         *filter_guard = Some(WatchFilterState::new(filter_index, shared.data_start));
-        drop(filter_guard);
-        drop(index_guard);
         {
             let mut snap = shared.snapshot.write().unwrap();
             snap.filter_matches_found = Some(snapshot_index.matches_found());
             snap.generation = snap.generation.saturating_add(1);
         }
+        drop(filter_guard);
+        drop(index_guard);
         return Ok(Some(snapshot_index));
     }
 }
@@ -1868,16 +1870,11 @@ fn publish_snapshot(
     status: &WatchStatus,
     events_coalesced: u64,
 ) {
-    let (committed_rows, maximum_width) = {
-        let index = shared.index.read().unwrap();
-        (index.indexed_rows(), index.maximum_width())
-    };
-    let filter_matches_found = shared
-        .filter
-        .read()
-        .unwrap()
-        .as_ref()
-        .map(|f| f.index.matches_found());
+    let index = shared.index.read().unwrap();
+    let filter = shared.filter.read().unwrap();
+    let committed_rows = index.indexed_rows();
+    let maximum_width = index.maximum_width();
+    let filter_matches_found = filter.as_ref().map(|f| f.index.matches_found());
     let mut snap = shared.snapshot.write().unwrap();
     snap.status = status.clone();
     snap.observed_file_len = tail.observed_file_len;

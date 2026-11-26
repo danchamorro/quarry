@@ -456,3 +456,72 @@ fn live_watch_unterminated_baseline_rollback_reports_zero_then_one_and_blocks_re
     assert!(!doc.is_live_watching());
     assert!(doc.source_changed);
 }
+
+#[test]
+fn stop_live_watch_reconciles_filter_query_when_cancelling_in_flight_replacement_filter() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("filter_reconcile.csv");
+    let mut content = String::from("id,level,payload\n1,WARN,seed\n");
+    for i in 2..=50_000 {
+        content.push_str(&format!("{i},INFO,payload-{i:06}\n"));
+    }
+    std::fs::write(&path, &content).unwrap();
+
+    let (mut scheduler, doc_id) = open_completed_scheduler(&path);
+    let warn_query = FilterQuery::single(1, FilterOperator::Equals, b"WARN".to_vec());
+    let info_query = FilterQuery::single(1, FilterOperator::Equals, b"INFO".to_vec());
+
+    // Start and complete Filter A (WARN).
+    scheduler
+        .tab_mut(doc_id)
+        .unwrap()
+        .document
+        .as_mut()
+        .unwrap()
+        .start_filter(warn_query.clone())
+        .unwrap();
+    assert!(wait_until(Duration::from_secs(5), || {
+        let _ = scheduler.poll_all();
+        scheduler
+            .tab(doc_id)
+            .unwrap()
+            .document
+            .as_ref()
+            .unwrap()
+            .filter_job
+            .is_none()
+    }));
+
+    scheduler
+        .start_live_watch_with_config(
+            doc_id,
+            WatchConfig {
+                poll_interval: Duration::from_millis(50),
+                cache_config: quarry_core::IndexCacheConfig::disabled(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    // Start Filter B (INFO) while watching and immediately Stop Watch (cancelling or completing B).
+    scheduler
+        .tab_mut(doc_id)
+        .unwrap()
+        .document
+        .as_mut()
+        .unwrap()
+        .start_filter(info_query)
+        .unwrap();
+    let _ = scheduler.stop_live_watch(doc_id).unwrap();
+
+    // Regardless of whether B finished before cancellation or was cancelled mid-attach,
+    // `doc.filter_query` MUST match `doc.filter_index.query()`!
+    let doc = scheduler.tab(doc_id).unwrap().document.as_ref().unwrap();
+    let idx = doc.filter_index.as_ref().expect("filter index retained");
+    assert_eq!(doc.filter_query.as_ref(), Some(idx.query()));
+    if idx.query() == &warn_query {
+        assert_eq!(idx.matches_found(), 1);
+    } else {
+        assert_eq!(idx.matches_found(), 49_999);
+    }
+}

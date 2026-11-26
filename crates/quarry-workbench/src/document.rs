@@ -2441,10 +2441,13 @@ impl Document {
     }
 
     pub fn stop_live_watch(&mut self) -> Result<Option<WatchAlert>, AppMessage> {
-        if let Some(attach) = self.live_watch_filter_attach.take() {
+        let cancelled_attach = if let Some(attach) = self.live_watch_filter_attach.take() {
             attach.cancel();
             drop(attach);
-        }
+            true
+        } else {
+            false
+        };
         let Some(job) = self.live_watch.take() else {
             return Ok(None);
         };
@@ -2452,6 +2455,26 @@ impl Document {
         self.session = Arc::new(outcome.session);
         self.index = Some(outcome.index.clone());
         self.filter_index = outcome.filter_index;
+        // Reconcile `filter_query` with the actual `FilterIndex` returned by `stop()` so
+        // cancelling an in-flight replacement filter on Stop Watch never leaves a mismatched
+        // query/index pair (e.g., grid showing filter A while export evaluates filter B).
+        match self.filter_index.as_ref() {
+            Some(idx) => {
+                if self.filter_query.as_ref() != Some(idx.query()) {
+                    self.filter_query = Some(idx.query().clone());
+                    self.filter_status = Some(format!(
+                        "Filter complete. {} matches.",
+                        group_digits(idx.matches_found())
+                    ));
+                }
+            }
+            None if cancelled_attach => {
+                self.filter_query = None;
+                self.filter_progress = None;
+                self.filter_status = Some("Filter cancelled.".into());
+            }
+            None => {}
+        }
         self.progress.rows_scanned = outcome.index.indexed_rows();
         self.progress.bytes_scanned = outcome.index.committed_record_end();
         self.progress.bytes_read = outcome.snapshot.observed_file_len;
@@ -3235,16 +3258,42 @@ impl Document {
                     self.schedule_filter_buffer(self.filter_viewport_start)?;
                 }
                 Ok(None) => {
-                    self.filter_progress = Some(FilterProgress {
-                        bytes_scanned: self.progress.bytes_scanned,
-                        rows_scanned: self.progress.rows_scanned,
-                        matches_found: 0,
-                        file_size: self.progress.file_size,
-                        elapsed: Duration::ZERO,
-                        done: true,
-                        cancelled: true,
-                    });
-                    self.filter_status = Some("Filter cancelled.".into());
+                    if let Some(existing) = self
+                        .live_watch
+                        .as_ref()
+                        .and_then(LiveWatchJob::filter_index_snapshot)
+                    {
+                        let matches = existing.matches_found();
+                        self.filter_query = Some(existing.query().clone());
+                        self.filter_index = Some(existing);
+                        self.filter_progress = Some(FilterProgress {
+                            bytes_scanned: self.progress.bytes_scanned,
+                            rows_scanned: self.progress.rows_scanned,
+                            matches_found: matches,
+                            file_size: self.progress.file_size,
+                            elapsed: Duration::ZERO,
+                            done: true,
+                            cancelled: false,
+                        });
+                        self.filter_status = Some(format!(
+                            "Filter change cancelled; keeping previous live filter ({} matches).",
+                            group_digits(matches)
+                        ));
+                        self.filter_viewport_start = if self.live_watch_tail_follow {
+                            max_viewport_start(matches, self.visible_rows)
+                        } else {
+                            0
+                        };
+                        self.filter_buffer_start = 0;
+                        self.whitespace.invalidate_rows();
+                        self.filtered_rows.clear();
+                        self.schedule_filter_buffer(self.filter_viewport_start)?;
+                    } else {
+                        self.filter_query = None;
+                        self.filter_index = None;
+                        self.filter_progress = None;
+                        self.filter_status = Some("Filter cancelled.".into());
+                    }
                 }
                 Err(error) => {
                     if matches!(error, QuarryError::SourceChanged) {
