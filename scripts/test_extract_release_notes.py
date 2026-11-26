@@ -164,6 +164,29 @@ class ExtractReleaseNotesTests(unittest.TestCase):
             )
             self.assertIn("- Same-day feature added after v0.1.0. (#225)", notes)
 
+    def test_read_changelog_at_ref_fails_closed_on_missing_ref_or_git_error(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="quarry-git-err-") as tmp:
+            non_repo = Path(tmp) / "not-a-repo"
+            non_repo.mkdir()
+            with self.assertRaises(RuntimeError):
+                MOD.read_changelog_at_ref(non_repo, "v0.1.0")
+
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            env = {
+                "GIT_AUTHOR_NAME": "Test",
+                "GIT_AUTHOR_EMAIL": "test@example.com",
+                "GIT_COMMITTER_NAME": "Test",
+                "GIT_COMMITTER_EMAIL": "test@example.com",
+            }
+            subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+            (repo / "README.md").write_text("init\n", encoding="utf-8")
+            subprocess.run(["git", "add", "README.md"], cwd=repo, check=True)
+            subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=repo, env=env, check=True)
+
+            with self.assertRaises(RuntimeError):
+                MOD.read_changelog_at_ref(repo, "v9.9.9-missing")
+
     def test_format_release_notes_includes_compare_link_and_groups(self) -> None:
         notes = MOD.format_release_notes(
             SAMPLE_CHANGELOG,

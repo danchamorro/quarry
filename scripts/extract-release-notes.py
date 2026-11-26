@@ -17,13 +17,29 @@ GROUP_ORDER = ("Added", "Changed", "Removed", "Fixed", "Security")
 
 
 def ref_exists(repo_root: Path, ref: str) -> bool:
+    check_repo = subprocess.run(
+        ["git", "-C", str(repo_root), "rev-parse", "--git-dir"],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if check_repo.returncode != 0:
+        raise RuntimeError(
+            f"git repository check failed for {repo_root}: {check_repo.stderr.strip()}"
+        )
+
     result = subprocess.run(
         ["git", "-C", str(repo_root), "rev-parse", "--verify", f"{ref}^{{commit}}"],
         text=True,
         capture_output=True,
         check=False,
     )
-    return result.returncode == 0
+    if result.returncode == 0:
+        return True
+    stderr = result.stderr.strip()
+    if "Needed a single revision" in stderr or "not a valid object name" in stderr:
+        return False
+    raise RuntimeError(f"git rev-parse failed for {ref!r}: {stderr}")
 
 
 def previous_tag_for(repo_root: Path, current_tag: str | None) -> str | None:
@@ -80,15 +96,15 @@ def tag_commit_date(repo_root: Path, tag: str) -> str | None:
     return date_str if re.fullmatch(r"\d{4}-\d{2}-\d{2}", date_str) else None
 
 
-def read_changelog_at_ref(repo_root: Path, ref: str, rel_path: str = "CHANGELOG.md") -> str | None:
-    """Read `CHANGELOG.md` from a Git ref.
+def read_changelog_at_ref(repo_root: Path, ref: str, rel_path: str = "CHANGELOG.md") -> str:
+    """Read `CHANGELOG.md` from a Git ref, failing closed on lookup or Git errors.
 
-    Returns file contents if present at `ref`, `""` if `ref` exists and `rel_path`
-    is confirmed absent at `ref`, or `None` if `ref` itself does not exist.
-    Raises `RuntimeError` if Git fails while inspecting an existing ref.
+    Returns file contents if present at `ref`, or `""` if `ref` exists and
+    `rel_path` is confirmed absent at `ref`. Raises `RuntimeError` if `ref`
+    cannot be resolved or any Git command fails.
     """
     if not ref_exists(repo_root, ref):
-        return None
+        raise RuntimeError(f"git ref does not resolve to a commit: {ref!r}")
 
     ls_tree = subprocess.run(
         ["git", "-C", str(repo_root), "ls-tree", "--name-only", ref, "--", rel_path],
@@ -304,8 +320,6 @@ def main(argv: list[str] | None = None) -> int:
     previous_changelog_text = None
     if since_date is None and previous_tag:
         previous_changelog_text = read_changelog_at_ref(ROOT, previous_tag)
-        if previous_changelog_text is None:
-            since_date = tag_commit_date(ROOT, previous_tag)
 
     text = args.changelog.read_text(encoding="utf-8")
     notes = format_release_notes(
