@@ -24,13 +24,13 @@ use quarry_core::{
     FilterExportJob, FilterExportOutcome, FilterExportProgress, FilterIndex, FilterJob,
     FilterMatch, FilterOperator, FilterProgress, FilterQuery, FilterReadJob, FilterReadOutcome,
     HeaderMode, IndexCacheConfig, IndexConfig, IndexJob, IndexProgress, JoinConfig,
-    JoinWorkingSource, LiteralReplacement, LiveWatchJob, MAX_TRANSFORMATION_COLUMNS, OpenOptions,
-    QuarryError, ReplaceAllJob, ReplaceAllOutcome, Row, RowInsertion, SaveAsJob, SaveAsOutcome,
-    SaveAsProgress, SearchJob, SearchMatch, SearchOutcome, SearchPosition, SectionBounds,
-    SectionOpenOptions, Session, SortDirection, SortJob, SortMode, SortOutcome, SortPlan,
-    SplitAnalysisJob, SplitAnalysisOutcome, StructuralIndex, VerifyBoundaryJob,
-    VerifyBoundaryOutcome, VerifyBoundaryProgress, WatchAlert, WatchConfig, WatchSnapshot,
-    WatchStatus,
+    JoinWorkingSource, LiteralReplacement, LiveWatchFilterJob, LiveWatchJob,
+    MAX_TRANSFORMATION_COLUMNS, OpenOptions, QuarryError, ReplaceAllJob, ReplaceAllOutcome, Row,
+    RowInsertion, SaveAsJob, SaveAsOutcome, SaveAsProgress, SearchJob, SearchMatch, SearchOutcome,
+    SearchPosition, SectionBounds, SectionOpenOptions, Session, SortDirection, SortJob, SortMode,
+    SortOutcome, SortPlan, SplitAnalysisJob, SplitAnalysisOutcome, StructuralIndex,
+    VerifyBoundaryJob, VerifyBoundaryOutcome, VerifyBoundaryProgress, WatchAlert, WatchConfig,
+    WatchSnapshot, WatchStatus,
 };
 
 /// Actionable reason surfaced when editing or modifying a document while Live Watch is active.
@@ -304,6 +304,7 @@ pub struct Document {
     pub pending_verified_reopen: Option<SectionBounds>,
     pub section_quote_free_confirmed: bool,
     pub live_watch: Option<LiveWatchJob>,
+    pub live_watch_filter_attach: Option<LiveWatchFilterJob>,
     pub live_watch_snapshot: Option<WatchSnapshot>,
     pub live_watch_alert: Option<WatchAlert>,
     pub live_watch_tail_follow: bool,
@@ -607,6 +608,7 @@ impl Document {
             pending_verified_reopen: None,
             section_quote_free_confirmed: false,
             live_watch: None,
+            live_watch_filter_attach: None,
             live_watch_snapshot: None,
             live_watch_alert: None,
             live_watch_tail_follow: false,
@@ -2310,6 +2312,10 @@ impl Document {
         self.live_watch.is_some()
     }
 
+    pub fn is_filter_scanning(&self) -> bool {
+        self.filter_job.is_some() || self.live_watch_filter_attach.is_some()
+    }
+
     pub fn live_watch_fd_count(&self) -> usize {
         self.live_watch
             .as_ref()
@@ -2338,12 +2344,25 @@ impl Document {
             || self.export_job.is_some()
             || self.structural_job.is_some()
             || self.search_job.is_some()
-            || self.filter_job.is_some()
+            || self.is_filter_scanning()
             || self.pending_materialization.is_some()
         {
             return Some(
                 "Wait for active file operations to finish before starting Live Watch Mode.",
             );
+        }
+        if self.filter_active()
+            && (self.filter_refresh_pending
+                || self.filter_paused_row_limit.is_some()
+                || self
+                    .filter_progress
+                    .is_some_and(|progress| !progress.done || progress.cancelled)
+                || self
+                    .filter_index
+                    .as_ref()
+                    .is_none_or(|idx| !idx.is_complete()))
+        {
+            return Some("Finish or clear the incomplete filter before starting Live Watch Mode.");
         }
         if self.job.is_some() || self.index.as_ref().is_none_or(|idx| !idx.is_complete()) {
             return Some("Wait for initial indexing to finish before starting Live Watch Mode.");
@@ -2376,6 +2395,7 @@ impl Document {
         }
         self.commit_edits();
         self.stop_filter_read();
+        self.stop_bookmark_offset_job();
         let index = self
             .index
             .as_ref()
@@ -2412,12 +2432,19 @@ impl Document {
         self.live_watch_alert = None;
         self.live_watch_tail_follow = true;
         self.live_watch = Some(job);
-        // Jump to the live tail immediately on opt-in start.
-        let _ = self.scroll_to_live_tail(true);
+        // Jump to the live tail immediately on opt-in start; propagate any read failure cleanly.
+        if let Err(err) = self.scroll_to_live_tail(true) {
+            let _ = self.stop_live_watch();
+            return Err(AppMessage::error(err));
+        }
         Ok(())
     }
 
     pub fn stop_live_watch(&mut self) -> Result<Option<WatchAlert>, AppMessage> {
+        if let Some(attach) = self.live_watch_filter_attach.take() {
+            attach.cancel();
+            drop(attach);
+        }
         let Some(job) = self.live_watch.take() else {
             return Ok(None);
         };
@@ -2440,7 +2467,8 @@ impl Document {
                 if matches!(
                     alert,
                     WatchAlert::Truncated { .. } | WatchAlert::Rewritten | WatchAlert::Rotated
-                ) {
+                ) || !outcome.index.is_complete()
+                {
                     self.invalidate_changed_source();
                 }
                 self.live_watch_alert = Some(alert.clone());
@@ -2448,6 +2476,13 @@ impl Document {
             }
             _ => {
                 self.live_watch_alert = None;
+                if !self
+                    .bookmarks
+                    .pending_offset_rows(self.source_generation)
+                    .is_empty()
+                {
+                    self.bookmark_offset_refresh_pending = true;
+                }
                 // Reload buffer cleanly from reconciled static session at current scroll anchor.
                 self.buffered_rows.clear();
                 self.filtered_rows.clear();
@@ -2528,8 +2563,18 @@ impl Document {
         let snap = job.snapshot();
         // Alerts / terminal watch transitions bypass the ~10 Hz repaint throttle immediately.
         if !snap.status.is_active() {
-            let _ = self.stop_live_watch();
-            return Ok(true);
+            match self.stop_live_watch() {
+                Ok(_) => return Ok(true),
+                Err(msg) => {
+                    let fallback_alert = match snap.status {
+                        WatchStatus::Alert(alert) => alert,
+                        _ => WatchAlert::IoError(msg.text.clone()),
+                    };
+                    self.invalidate_changed_source();
+                    self.live_watch_alert = Some(fallback_alert);
+                    return Err(msg.text);
+                }
+            }
         }
         let status_changed = self
             .live_watch_snapshot
@@ -2981,7 +3026,7 @@ impl Document {
         if self.export_job.is_some() {
             return Err("Cancel the active export before changing filters.".into());
         }
-        if self.filter_job.is_some() {
+        if self.is_filter_scanning() {
             return Err("A filter is already running.".into());
         }
         if self.search_job.is_some() {
@@ -3012,34 +3057,30 @@ impl Document {
 
         self.commit_edits();
         if let Some(watch) = &self.live_watch {
-            let filter_index = watch
-                .attach_filter_query(query.clone())
+            let attach_job = watch
+                .start_attach_filter_query(query.clone())
                 .map_err(|error| self.diagnostic_error(error))?;
-            let matches = filter_index.matches_found();
             self.stop_filter_read();
             self.filter_job = None;
-            self.filter_index = Some(filter_index);
+            self.live_watch_filter_attach = Some(attach_job);
+            self.filter_index = None;
             self.filter_query = Some(query);
             self.filter_refresh_pending = false;
             self.filter_paused_row_limit = None;
             self.filter_progress = Some(FilterProgress {
-                bytes_scanned: self.progress.bytes_scanned,
-                rows_scanned: self.progress.rows_scanned,
-                matches_found: matches,
+                bytes_scanned: 0,
+                rows_scanned: 0,
+                matches_found: 0,
                 file_size: self.progress.file_size,
                 elapsed: Duration::ZERO,
-                done: true,
+                done: false,
                 cancelled: false,
             });
-            self.filter_status = Some(format!("Live filter: {} matches.", group_digits(matches)));
+            self.filter_status = Some("Filtering live file…".into());
             self.export_progress = None;
             self.export_status = None;
             self.export_cancel_requested = false;
-            self.filter_viewport_start = if self.live_watch_tail_follow {
-                max_viewport_start(matches, self.visible_rows)
-            } else {
-                0
-            };
+            self.filter_viewport_start = 0;
             self.filter_buffer_start = 0;
             self.whitespace.invalidate_rows();
             self.filtered_rows.clear();
@@ -3047,7 +3088,6 @@ impl Document {
             self.clear_row_selection();
             self.reveal_cell = None;
             self.scroll_points = 0.0;
-            self.schedule_filter_buffer(self.filter_viewport_start)?;
             return Ok(());
         }
         let (max_bytes, paused_row_limit) = if self.is_indexing_paused() {
@@ -3146,6 +3186,62 @@ impl Document {
     }
 
     pub fn poll_filter_scan(&mut self) -> Result<(), String> {
+        if let Some(attach) = self.live_watch_filter_attach.as_ref() {
+            if !attach.is_done() {
+                return Ok(());
+            }
+            let attach = self
+                .live_watch_filter_attach
+                .take()
+                .expect("live watch filter attach job is present");
+            match attach.wait() {
+                Ok(Some(filter_index)) => {
+                    let matches = filter_index.matches_found();
+                    self.filter_index = Some(filter_index);
+                    self.filter_progress = Some(FilterProgress {
+                        bytes_scanned: self.progress.bytes_scanned,
+                        rows_scanned: self.progress.rows_scanned,
+                        matches_found: matches,
+                        file_size: self.progress.file_size,
+                        elapsed: Duration::ZERO,
+                        done: true,
+                        cancelled: false,
+                    });
+                    self.filter_status =
+                        Some(format!("Live filter: {} matches.", group_digits(matches)));
+                    self.filter_viewport_start = if self.live_watch_tail_follow {
+                        max_viewport_start(matches, self.visible_rows)
+                    } else {
+                        0
+                    };
+                    self.filter_buffer_start = 0;
+                    self.whitespace.invalidate_rows();
+                    self.filtered_rows.clear();
+                    self.schedule_filter_buffer(self.filter_viewport_start)?;
+                }
+                Ok(None) => {
+                    self.filter_progress = Some(FilterProgress {
+                        bytes_scanned: self.progress.bytes_scanned,
+                        rows_scanned: self.progress.rows_scanned,
+                        matches_found: 0,
+                        file_size: self.progress.file_size,
+                        elapsed: Duration::ZERO,
+                        done: true,
+                        cancelled: true,
+                    });
+                    self.filter_status = Some("Filter cancelled.".into());
+                }
+                Err(error) => {
+                    if matches!(error, QuarryError::SourceChanged) {
+                        self.invalidate_changed_source();
+                    }
+                    self.filter_progress = None;
+                    self.filter_status = Some("Filter failed.".into());
+                    return Err(self.diagnostic_error(error));
+                }
+            }
+            return Ok(());
+        }
         let Some(job) = self.filter_job.as_ref() else {
             return Ok(());
         };
@@ -3631,6 +3727,9 @@ impl Document {
     ///
     /// Returns `true` when a background worker was spawned.
     pub fn start_bookmark_offset_refresh(&mut self) -> bool {
+        if self.is_live_watching() {
+            return false;
+        }
         self.refresh_bookmark_offsets_from_buffers();
         let generation = self.source_generation;
         let pending = self.bookmarks.pending_offset_rows(generation);
@@ -3764,6 +3863,9 @@ impl Document {
     /// Returns a clear explanation when Split-at-Bookmarks is unavailable (including Speculative
     /// sections per Phase 5A-5 / Phase 7A-1), or `None` when ready to snapshot split targets.
     pub fn split_at_bookmarks_disabled_reason(&self) -> Option<String> {
+        if self.is_live_watching() {
+            return Some("Stop Live Watch before splitting at bookmarks.".into());
+        }
         if self.source_changed {
             return Some(SOURCE_CHANGED_NOTICE.into());
         }
@@ -4308,6 +4410,9 @@ impl Document {
         if let Some(job) = &self.filter_job {
             job.cancel();
         }
+        if let Some(attach) = &self.live_watch_filter_attach {
+            attach.cancel();
+        }
     }
 
     pub fn clear_filter(&mut self) -> Result<(), String> {
@@ -4324,6 +4429,10 @@ impl Document {
 
     /// Drop filter state without starting a read while a save is being handed off.
     pub fn reset_filter_state(&mut self) {
+        if let Some(attach) = self.live_watch_filter_attach.take() {
+            attach.cancel();
+            drop(attach);
+        }
         if let Some(watch) = &self.live_watch {
             watch.clear_filter();
         }
@@ -4966,6 +5075,10 @@ impl Document {
     }
 
     pub fn shutdown(&mut self) {
+        if let Some(attach) = self.live_watch_filter_attach.take() {
+            attach.cancel();
+            drop(attach);
+        }
         if let Some(watch) = self.live_watch.take() {
             drop(watch);
         }
@@ -5033,6 +5146,12 @@ impl Document {
     }
 
     pub fn available_rows(&self) -> u64 {
+        if self.is_live_watching() {
+            return self
+                .index
+                .as_ref()
+                .map_or(self.progress.rows_scanned, StructuralIndex::indexed_rows);
+        }
         self.index
             .as_ref()
             .map(StructuralIndex::indexed_rows)
@@ -6153,7 +6272,7 @@ pub fn footer_range_text(document: &Document) -> String {
     if document.filter_active() {
         let total = document.available_filter_rows();
         let visible = document.visible_row_count() as u64;
-        if document.filter_job.is_some() && total == 0 {
+        if document.is_filter_scanning() && total == 0 {
             return "Finding matching rows…".into();
         }
         if document.filter_rows_loading() && visible == 0 {

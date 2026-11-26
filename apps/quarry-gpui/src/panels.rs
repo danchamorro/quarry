@@ -111,6 +111,7 @@ pub struct Panels {
     detected: String,
     busy: bool,
     dirty: bool,
+    live_watching: bool,
     source_changed: bool,
     filter_active: bool,
     filter_running: bool,
@@ -218,6 +219,7 @@ impl Panels {
             detected: String::new(),
             busy: false,
             dirty: false,
+            live_watching: false,
             source_changed: false,
             filter_active: false,
             filter_running: false,
@@ -258,6 +260,7 @@ impl Panels {
             self.rules.clear();
             self.dirty = false;
             self.busy = false;
+            self.live_watching = false;
             self.source_changed = false;
             self.bookmark_count = 0;
             self.bookmarks.clear();
@@ -275,6 +278,7 @@ impl Panels {
     ) {
         self.dirty = info.dirty;
         self.busy = info.busy;
+        self.live_watching = info.live_watch.active;
         self.source_changed = info.source_changed;
         self.filter_active = info.filter_active;
         self.filter_running = info.filter_running;
@@ -1300,6 +1304,14 @@ impl Panels {
                         .child("Save or discard your changes before changing the format."),
                 )
             })
+            .when(self.live_watching, |this| {
+                this.child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(cx.theme().muted_foreground)
+                        .child("Stop Live Watch before changing format or encoding."),
+                )
+            })
             .child(
                 div()
                     .flex()
@@ -1322,7 +1334,12 @@ impl Panels {
                             .label("Reopen")
                             .primary()
                             .small()
-                            .disabled(self.busy || self.dirty || selected == self.applied_format)
+                            .disabled(
+                                self.busy
+                                    || self.dirty
+                                    || self.live_watching
+                                    || selected == self.applied_format,
+                            )
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 cx.emit(PanelEvent::Reopen(
                                     format_options((selected.0, selected.1)),

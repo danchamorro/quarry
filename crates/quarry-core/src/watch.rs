@@ -249,21 +249,42 @@ impl TailScanner {
     }
 
     fn verify_seam(&self, open_file: &File) -> Result<SeamCheck, QuarryError> {
-        if self.seam_bytes.is_empty() {
-            return Ok(SeamCheck::Ok);
+        if !self.seam_bytes.is_empty() {
+            let start = self
+                .committed_record_end
+                .saturating_sub(self.seam_bytes.len() as u64);
+            let mut observed = vec![0u8; self.seam_bytes.len()];
+            let read = read_at_exact_or_eof(open_file, start, &mut observed)?;
+            if read < self.seam_bytes.len() {
+                return Ok(SeamCheck::Truncated {
+                    current_len: start + read as u64,
+                });
+            }
+            if observed != self.seam_bytes {
+                return Ok(SeamCheck::Rewritten);
+            }
         }
-        let start = self
-            .committed_record_end
-            .saturating_sub(self.seam_bytes.len() as u64);
-        let mut observed = vec![0u8; self.seam_bytes.len()];
-        let read = read_at_exact_or_eof(open_file, start, &mut observed)?;
-        if read < self.seam_bytes.len() {
-            return Ok(SeamCheck::Truncated {
-                current_len: start + read as u64,
-            });
-        }
-        if observed != self.seam_bytes {
-            return Ok(SeamCheck::Rewritten);
+        // Also verify all retained provisional tail bytes against the pinned descriptor so a
+        // same-size in-place rewrite of uncommitted bytes cannot be finalized as stale cached data
+        // or published into a valid-looking sidecar.
+        if !self.provisional_bytes.is_empty() {
+            const VERIFY_CHUNK: usize = 64 * 1024;
+            let mut buf = vec![0u8; self.provisional_bytes.len().min(VERIFY_CHUNK)];
+            let mut verified = 0usize;
+            while verified < self.provisional_bytes.len() {
+                let want = (self.provisional_bytes.len() - verified).min(buf.len());
+                let offset = self.committed_record_end + verified as u64;
+                let read = read_at_exact_or_eof(open_file, offset, &mut buf[..want])?;
+                if read < want {
+                    return Ok(SeamCheck::Truncated {
+                        current_len: offset + read as u64,
+                    });
+                }
+                if buf[..read] != self.provisional_bytes[verified..verified + read] {
+                    return Ok(SeamCheck::Rewritten);
+                }
+                verified += read;
+            }
         }
         Ok(SeamCheck::Ok)
     }
@@ -346,10 +367,11 @@ impl TailScanner {
         }
 
         // Pre-compile filter matchers once for all committed records in this chunk.
-        let compiled_filter = if let Some(filter_state) = filter.as_deref() {
-            let query = filter_state.index.query().clone();
-            let groups = predicate_groups(&query);
-            Some((query, groups))
+        let filter_query = filter.as_deref().map(|state| state.index.query().clone());
+        let compiled_filter = if let Some(query) = filter_query.as_ref() {
+            let matchers = compile_matchers(query)?;
+            let groups = predicate_groups(query);
+            Some((query, matchers, groups))
         } else {
             None
         };
@@ -395,18 +417,17 @@ impl TailScanner {
                     .map_err(|err| crate::record_encoding_error(row_number + 1, err))?;
             }
 
-            if let (Some(filter_state), Some((query, groups))) =
+            if let (Some(filter_state), Some((query, matchers, groups))) =
                 (filter.as_deref_mut(), compiled_filter.as_ref())
                 && row_number >= filter_state.data_start
             {
-                let matchers = compile_matchers(query)?;
                 let matched = record_matches_fast(
                     record_slice,
                     self.delimiter,
                     row_number,
                     record_start == 0,
                     query,
-                    &matchers,
+                    matchers,
                     groups,
                     filter_state.max_column,
                     &filter_state.edits,
@@ -657,7 +678,13 @@ struct WatchShared {
     stop_requested: AtomicBool,
     /// Used by the polling backend and for waking tests / shutdown cleanly.
     wake_cond: (Mutex<bool>, Condvar),
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(any(
+        target_os = "macos",
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
+    ))]
     wake_write_fd: Mutex<Option<OwnedRawFd>>,
 }
 
@@ -668,11 +695,15 @@ impl WatchShared {
             *lock.lock().unwrap() = true;
             cvar.notify_all();
         }
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        #[cfg(any(
+            target_os = "macos",
+            all(
+                target_os = "linux",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            )
+        ))]
         if let Some(fd) = self.wake_write_fd.lock().unwrap().as_ref() {
-            let byte = [1u8];
-            // SAFETY: writing one byte to our non-blocking self-pipe only wakes poll/kevent.
-            let _ = unsafe { libc::write(fd.raw(), byte.as_ptr().cast(), 1) };
+            write_wakeup_byte(fd);
         }
     }
 }
@@ -681,9 +712,45 @@ impl WatchShared {
 pub struct LiveWatchJob {
     dialect: Dialect,
     metrics: OpenMetrics,
+    base_first_rows: Vec<Row>,
     cache_config: IndexCacheConfig,
     shared: Arc<WatchShared>,
     handle: Option<JoinHandle<WatchWorkerResult>>,
+}
+
+/// Background job that scans already-committed watched bytes for a new [`FilterQuery`] off the UI
+/// thread and atomically hands off to incremental live evaluation with zero missed rows.
+pub struct LiveWatchFilterJob {
+    cancel: Arc<AtomicBool>,
+    done: Arc<AtomicBool>,
+    handle: Option<JoinHandle<Result<Option<FilterIndex>, QuarryError>>>,
+}
+
+impl LiveWatchFilterJob {
+    pub fn cancel(&self) {
+        self.cancel.store(true, Ordering::Release);
+    }
+
+    pub fn is_done(&self) -> bool {
+        self.done.load(Ordering::Acquire)
+    }
+
+    pub fn wait(mut self) -> Result<Option<FilterIndex>, QuarryError> {
+        self.handle
+            .take()
+            .expect("live watch filter handle present")
+            .join()
+            .map_err(|_| QuarryError::WorkerPanicked)?
+    }
+}
+
+impl Drop for LiveWatchFilterJob {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            self.cancel();
+            let _ = handle.join();
+        }
+    }
 }
 
 struct WatchWorkerResult {
@@ -733,6 +800,20 @@ impl LiveWatchJob {
         let delimiter = session.dialect.delimiter;
         let encoding = session.encoding;
         let data_start = u64::from(session.dialect.has_header);
+
+        if let Some(filter) = active_filter
+            && !filter.is_complete_for_watch(
+                &session.path,
+                &session.source_stamp,
+                delimiter,
+                data_start,
+                encoding,
+            )
+        {
+            return Err(QuarryError::InvalidOption(
+                "Active filter must be complete and match the current file before starting Live Watch Mode.",
+            ));
+        }
 
         let mut live_index = index.clone();
         let mut live_filter = active_filter.map(|f| WatchFilterState::new(f.clone(), data_start));
@@ -858,10 +939,22 @@ impl LiveWatchJob {
             snapshot: RwLock::new(initial_snapshot),
             stop_requested: AtomicBool::new(false),
             wake_cond: (Mutex::new(false), Condvar::new()),
-            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            #[cfg(any(
+                target_os = "macos",
+                all(
+                    target_os = "linux",
+                    any(target_arch = "x86_64", target_arch = "aarch64")
+                )
+            ))]
             wake_write_fd: Mutex::new(wake_write_fd),
         });
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        #[cfg(not(any(
+            target_os = "macos",
+            all(
+                target_os = "linux",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            )
+        )))]
         let _ = wake_write_fd;
 
         let worker_shared = Arc::clone(&shared);
@@ -872,6 +965,7 @@ impl LiveWatchJob {
         Ok(Self {
             dialect: session.dialect,
             metrics: session.metrics,
+            base_first_rows: session.first_rows.clone(),
             cache_config: config.cache_config,
             shared,
             handle: Some(handle),
@@ -952,121 +1046,51 @@ impl LiveWatchJob {
         )
     }
 
-    /// Attaches a freshly evaluated filter index to the running watch so all subsequent appended
-    /// rows are evaluated incrementally without rescanning the file.
-    pub fn attach_filter_query(&self, query: FilterQuery) -> Result<FilterIndex, QuarryError> {
-        let committed_end = self.shared.index.read().unwrap().committed_record_end();
-        let stamp = SourceStamp::from_file(&self.shared.open_file)?;
-        let mut filter_index = FilterIndex::new_for_watch(
-            query.clone(),
-            self.shared.path.clone(),
-            stamp,
-            self.shared.delimiter,
-            self.shared.data_start,
-            self.shared.encoding,
-        )?;
-        // Evaluate already-committed rows `[0..committed_end)` once via positional reads.
-        let matchers = compile_matchers(&query)?;
-        let groups = predicate_groups(&query);
-        let max_column = query
-            .predicates
-            .iter()
-            .map(|predicate| predicate.column)
-            .max()
-            .unwrap_or(0);
-        let edits: FilterEdits = Arc::default();
-        let mut scanner = crate::encoding::RecordScanner::at_offset_with_bom_handling(
-            self.shared.delimiter,
-            0,
-            self.shared.encoding,
-            true,
-        )?;
-        let mut chunk = vec![0u8; self.shared.encoding.chunk_size(DEFAULT_READ_CHUNK)];
-        let mut absolute_start = 0u64;
-        let mut row_number = 0u64;
-        let mut record_start = 0u64;
-        let mut record = Vec::new();
-        let mut field_ranges = Vec::new();
-
-        while absolute_start < committed_end {
-            let remaining = committed_end - absolute_start;
-            let mut cap = usize::try_from(remaining)
-                .unwrap_or(chunk.len())
-                .min(chunk.len());
-            if self.shared.encoding.is_utf16() {
-                cap &= !1;
-            }
-            if cap == 0 {
-                break;
-            }
-            let read =
-                read_at_exact_or_eof(&self.shared.open_file, absolute_start, &mut chunk[..cap])?;
-            if read == 0 {
-                break;
-            }
-            let effective_read = if self.shared.encoding.is_utf16() {
-                read & !1
-            } else {
-                read
-            };
-            let mut seg_start = 0usize;
-            let mut deferred_error = None;
-            scanner.scan_chunk(&chunk[..effective_read], absolute_start, |absolute_end| {
-                let local_end = (absolute_end - absolute_start) as usize;
-                if row_number >= self.shared.data_start && deferred_error.is_none() {
-                    let rec_slice = if record.is_empty() {
-                        &chunk[seg_start..local_end]
-                    } else {
-                        record.extend_from_slice(&chunk[seg_start..local_end]);
-                        &record
-                    };
-                    if rec_slice.len() > self.shared.max_record_bytes {
-                        deferred_error = Some(QuarryError::RecordTooLarge {
-                            limit: self.shared.max_record_bytes,
-                        });
-                    } else {
-                        match record_matches_fast(
-                            rec_slice,
-                            self.shared.delimiter,
-                            row_number,
-                            record_start == 0,
-                            &query,
-                            &matchers,
-                            &groups,
-                            max_column,
-                            &edits,
-                            self.shared.encoding,
-                            &mut field_ranges,
-                        ) {
-                            Ok(true) => filter_index.record_match(row_number, record_start),
-                            Ok(false) => {}
-                            Err(err) => deferred_error = Some(err),
-                        }
-                    }
-                }
-                record.clear();
-                row_number += 1;
-                record_start = absolute_end;
-                seg_start = local_end;
+    /// Starts attaching a freshly evaluated filter index to the running watch off the UI thread,
+    /// catching up to the latest committed frontier and atomically handing off to incremental
+    /// evaluation with zero missed rows.
+    pub fn start_attach_filter_query(
+        &self,
+        query: FilterQuery,
+    ) -> Result<LiveWatchFilterJob, QuarryError> {
+        query.validate()?;
+        let shared = Arc::clone(&self.shared);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let done = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
+        let worker_done = Arc::clone(&done);
+        let handle = thread::Builder::new()
+            .name("quarry-watch-filter".into())
+            .spawn(move || {
+                let result = attach_filter_query_shared(&shared, query, Some(&worker_cancel), None);
+                worker_done.store(true, Ordering::Release);
+                result
             })?;
-            if let Some(err) = deferred_error {
-                return Err(err);
-            }
-            if row_number >= self.shared.data_start {
-                record.extend_from_slice(&chunk[seg_start..effective_read]);
-            }
-            absolute_start += effective_read as u64;
-        }
+        Ok(LiveWatchFilterJob {
+            cancel,
+            done,
+            handle: Some(handle),
+        })
+    }
 
-        let snapshot_index = filter_index.clone();
-        *self.shared.filter.write().unwrap() =
-            Some(WatchFilterState::new(filter_index, self.shared.data_start));
-        {
-            let mut snap = self.shared.snapshot.write().unwrap();
-            snap.filter_matches_found = Some(snapshot_index.matches_found());
-            snap.generation = snap.generation.saturating_add(1);
-        }
-        Ok(snapshot_index)
+    /// Synchronously evaluates and atomically attaches a filter index to the running watch so all
+    /// already-committed and concurrently appended rows are covered with zero missed matches.
+    pub fn attach_filter_query(&self, query: FilterQuery) -> Result<FilterIndex, QuarryError> {
+        attach_filter_query_shared(&self.shared, query, None, None)?.ok_or(
+            QuarryError::InvalidOption("filter attachment was cancelled"),
+        )
+    }
+
+    #[cfg(test)]
+    fn attach_filter_query_with_hook(
+        &self,
+        query: FilterQuery,
+        before_install: impl FnOnce() + Send + 'static,
+    ) -> Result<FilterIndex, QuarryError> {
+        attach_filter_query_shared(&self.shared, query, None, Some(Box::new(before_install)))?
+            .ok_or(QuarryError::InvalidOption(
+                "filter attachment was cancelled",
+            ))
     }
 
     pub fn clear_filter(&self) {
@@ -1081,9 +1105,10 @@ impl LiveWatchJob {
         self.shared.signal_wakeup();
     }
 
-    /// Stops Live Watch Mode, joins the watcher thread promptly, finalizes any valid trailing EOF
-    /// record on clean stop, refreshes the persistent sidecar cache once via ordinary cache
-    /// validation, and returns the reconciled [`Session`] and [`StructuralIndex`].
+    /// Stops Live Watch Mode, joins the watcher thread promptly, re-verifies seam + provisional
+    /// bytes against the pinned descriptor, finalizes any valid trailing EOF record on clean stop,
+    /// refreshes the persistent sidecar cache once via ordinary cache validation, and returns the
+    /// reconciled [`Session`] and [`StructuralIndex`].
     pub fn stop(mut self) -> Result<WatchStopOutcome, QuarryError> {
         self.shared.stop_requested.store(true, Ordering::Release);
         self.shared.signal_wakeup();
@@ -1099,15 +1124,94 @@ impl LiveWatchJob {
         let mut index = self.shared.index.read().unwrap().clone();
         let mut filter_state = self.shared.filter.write().unwrap().take();
 
-        // On clean stop (no prior alert), finalize any valid provisional EOF record so the
-        // reconciled index matches a normal full-file static scan byte-for-byte.
-        if matches!(final_status, WatchStatus::Stopped)
-            && let Err(err) = tail.finish_on_clean_stop(&mut index, filter_state.as_mut())
-        {
-            final_status = WatchStatus::Alert(WatchAlert::ParseError(err.to_string()));
+        // Bind final verification, provisional tail finalization, index provenance, and sidecar
+        // publication to the exact same validated `SourceStamp`.
+        let mut validated_stamp: Option<SourceStamp> = None;
+        if matches!(final_status, WatchStatus::Stopped) {
+            let mut read_buf = vec![0u8; WATCH_READ_CHUNK_BYTES];
+            // Perform at most two quick bounded catch-up passes if bytes arrived right after the
+            // worker exited so benign shutdown races still stop cleanly, while actively mutating
+            // writers fail closed rather than returning a bogus `Stopped` with incomplete EOF.
+            for _ in 0..2 {
+                let meta_len = self.shared.open_file.metadata()?.len();
+                if meta_len == tail.scanner_consumed_bytes {
+                    break;
+                }
+                match drain_open_fd_locked(
+                    &self.shared.open_file,
+                    &mut tail,
+                    &mut read_buf,
+                    &mut index,
+                    filter_state.as_mut(),
+                ) {
+                    Ok(DrainOutcome::Alert(alert)) => {
+                        final_status = WatchStatus::Alert(alert);
+                        break;
+                    }
+                    Ok(DrainOutcome::Changed | DrainOutcome::Unchanged) => {}
+                    Err(err) => {
+                        let alert = match err {
+                            QuarryError::Io(io_err) => WatchAlert::IoError(io_err.to_string()),
+                            other => WatchAlert::ParseError(other.to_string()),
+                        };
+                        final_status = WatchStatus::Alert(alert);
+                        break;
+                    }
+                }
+            }
         }
 
-        let final_stamp = SourceStamp::from_file(&self.shared.open_file)?;
+        if matches!(final_status, WatchStatus::Stopped) {
+            let stamp_before = SourceStamp::from_file(&self.shared.open_file)?;
+            if stamp_before.file_size() < tail.scanner_consumed_bytes {
+                final_status = WatchStatus::Alert(WatchAlert::Truncated {
+                    previous_len: tail.observed_file_len.max(tail.scanner_consumed_bytes),
+                    current_len: stamp_before.file_size(),
+                });
+            } else if stamp_before.file_size() > tail.scanner_consumed_bytes {
+                final_status = WatchStatus::Alert(WatchAlert::IoError(
+                    "File continued growing while stopping Live Watch. Reload from disk to view the latest rows."
+                        .into(),
+                ));
+            } else {
+                match tail.verify_seam(&self.shared.open_file)? {
+                    SeamCheck::Ok => {
+                        let stamp_after = SourceStamp::from_file(&self.shared.open_file)?;
+                        if stamp_after != stamp_before {
+                            final_status = if stamp_after.file_size() < stamp_before.file_size() {
+                                WatchStatus::Alert(WatchAlert::Truncated {
+                                    previous_len: stamp_before.file_size(),
+                                    current_len: stamp_after.file_size(),
+                                })
+                            } else {
+                                WatchStatus::Alert(WatchAlert::Rewritten)
+                            };
+                        } else if let Err(err) =
+                            tail.finish_on_clean_stop(&mut index, filter_state.as_mut())
+                        {
+                            final_status =
+                                WatchStatus::Alert(WatchAlert::ParseError(err.to_string()));
+                        } else {
+                            validated_stamp = Some(stamp_after);
+                        }
+                    }
+                    SeamCheck::Truncated { current_len } => {
+                        final_status = WatchStatus::Alert(WatchAlert::Truncated {
+                            previous_len: tail.observed_file_len.max(tail.committed_record_end),
+                            current_len,
+                        });
+                    }
+                    SeamCheck::Rewritten => {
+                        final_status = WatchStatus::Alert(WatchAlert::Rewritten);
+                    }
+                }
+            }
+        }
+
+        let final_stamp = match validated_stamp {
+            Some(stamp) => stamp,
+            None => SourceStamp::from_file(&self.shared.open_file)?,
+        };
         let clean_eof = matches!(final_status, WatchStatus::Stopped)
             && index.committed_record_end() == final_stamp.file_size();
         index.set_complete(clean_eof);
@@ -1117,6 +1221,9 @@ impl LiveWatchJob {
             self.shared.encoding,
         );
 
+        // On alert/incomplete stop, reuse the baseline `first_rows` captured at watch start so a
+        // corrupted or malformed file at row 0 can never block alert delivery.
+        let reuse_first_rows = (!clean_eof).then_some(self.base_first_rows.clone());
         let session = Session::from_watch_stop_parts(
             self.shared.path.clone(),
             self.shared.encoding,
@@ -1125,6 +1232,7 @@ impl LiveWatchJob {
             &self.shared.open_file,
             final_stamp.clone(),
             &index,
+            reuse_first_rows,
         )?;
 
         let filter_index = filter_state.map(|mut state| {
@@ -1134,13 +1242,15 @@ impl LiveWatchJob {
                 self.shared.delimiter,
                 self.shared.data_start,
                 self.shared.encoding,
+                clean_eof,
             );
             state.index
         });
 
         // Never persist raw uncommitted tail bytes to sidecars; update sidecar at most once on
-        // clean stop when the final index reaches validated EOF matching `final_stamp`.
+        // clean stop when the pinned descriptor still matches the exact validated `final_stamp`.
         if clean_eof
+            && SourceStamp::from_file(&self.shared.open_file).ok().as_ref() == Some(&final_stamp)
             && source_matches_stamp(&self.shared.open_file, &self.shared.path, &final_stamp)
                 .unwrap_or(false)
         {
@@ -1198,6 +1308,224 @@ impl Drop for LiveWatchJob {
     }
 }
 
+fn attach_filter_query_shared(
+    shared: &WatchShared,
+    query: FilterQuery,
+    cancel: Option<&AtomicBool>,
+    mut before_install_hook: Option<Box<dyn FnOnce() + Send>>,
+) -> Result<Option<FilterIndex>, QuarryError> {
+    const INLINE_CATCHUP_MAX_BYTES: u64 = 256 * 1024;
+
+    let stamp = SourceStamp::from_file(&shared.open_file)?;
+    let mut filter_index = FilterIndex::new_for_watch(
+        query.clone(),
+        shared.path.clone(),
+        stamp,
+        shared.delimiter,
+        shared.data_start,
+        shared.encoding,
+    )?;
+    let matchers = compile_matchers(&query)?;
+    let groups = predicate_groups(&query);
+    let max_column = query
+        .predicates
+        .iter()
+        .map(|predicate| predicate.column)
+        .max()
+        .unwrap_or(0);
+    let edits: FilterEdits = Arc::default();
+    let mut scanner = crate::encoding::RecordScanner::at_offset_with_bom_handling(
+        shared.delimiter,
+        0,
+        shared.encoding,
+        true,
+    )?;
+    let mut chunk = vec![0u8; shared.encoding.chunk_size(DEFAULT_READ_CHUNK)];
+    let mut absolute_start = 0u64;
+    let mut row_number = 0u64;
+    let mut record_start = 0u64;
+    let mut record = Vec::new();
+    let mut field_ranges = Vec::new();
+
+    #[allow(clippy::too_many_arguments)]
+    fn scan_filter_range(
+        shared: &WatchShared,
+        query: &FilterQuery,
+        matchers: &[crate::filter::PredicateMatcher<'_>],
+        groups: &[Vec<usize>],
+        max_column: usize,
+        edits: &FilterEdits,
+        scanner: &mut crate::encoding::RecordScanner,
+        chunk: &mut [u8],
+        absolute_start: &mut u64,
+        target_end: u64,
+        row_number: &mut u64,
+        record_start: &mut u64,
+        record: &mut Vec<u8>,
+        field_ranges: &mut Vec<(usize, usize)>,
+        filter_index: &mut FilterIndex,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<bool, QuarryError> {
+        while *absolute_start < target_end {
+            if cancel.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+                return Ok(false);
+            }
+            let remaining = target_end - *absolute_start;
+            if shared.encoding.is_utf16() && remaining == 1 {
+                return Err(QuarryError::SourceChanged);
+            }
+            let mut cap = usize::try_from(remaining)
+                .unwrap_or(chunk.len())
+                .min(chunk.len());
+            if shared.encoding.is_utf16() {
+                cap &= !1;
+            }
+            if cap == 0 {
+                return Err(QuarryError::SourceChanged);
+            }
+            let read = read_at_exact_or_eof(&shared.open_file, *absolute_start, &mut chunk[..cap])?;
+            if read < cap {
+                // Short read below the known committed frontier indicates concurrent truncation.
+                return Err(QuarryError::SourceChanged);
+            }
+            let mut seg_start = 0usize;
+            let mut deferred_error = None;
+            let start_offset = *absolute_start;
+            scanner.scan_chunk(&chunk[..read], start_offset, |absolute_end| {
+                let local_end = (absolute_end - start_offset) as usize;
+                if *row_number >= shared.data_start && deferred_error.is_none() {
+                    let rec_slice = if record.is_empty() {
+                        &chunk[seg_start..local_end]
+                    } else {
+                        record.extend_from_slice(&chunk[seg_start..local_end]);
+                        record.as_slice()
+                    };
+                    if rec_slice.len() > shared.max_record_bytes {
+                        deferred_error = Some(QuarryError::RecordTooLarge {
+                            limit: shared.max_record_bytes,
+                        });
+                    } else {
+                        match record_matches_fast(
+                            rec_slice,
+                            shared.delimiter,
+                            *row_number,
+                            *record_start == 0,
+                            query,
+                            matchers,
+                            groups,
+                            max_column,
+                            edits,
+                            shared.encoding,
+                            field_ranges,
+                        ) {
+                            Ok(true) => filter_index.record_match(*row_number, *record_start),
+                            Ok(false) => {}
+                            Err(err) => deferred_error = Some(err),
+                        }
+                    }
+                }
+                record.clear();
+                *row_number += 1;
+                *record_start = absolute_end;
+                seg_start = local_end;
+            })?;
+            if let Some(err) = deferred_error {
+                return Err(err);
+            }
+            if *row_number >= shared.data_start {
+                record.extend_from_slice(&chunk[seg_start..read]);
+                if record.len() > shared.max_record_bytes {
+                    return Err(QuarryError::RecordTooLarge {
+                        limit: shared.max_record_bytes,
+                    });
+                }
+            }
+            *absolute_start += read as u64;
+        }
+        Ok(true)
+    }
+
+    loop {
+        if cancel.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+            return Ok(None);
+        }
+        let target_end = shared.index.read().unwrap().committed_record_end();
+        if !scan_filter_range(
+            shared,
+            &query,
+            &matchers,
+            &groups,
+            max_column,
+            &edits,
+            &mut scanner,
+            &mut chunk,
+            &mut absolute_start,
+            target_end,
+            &mut row_number,
+            &mut record_start,
+            &mut record,
+            &mut field_ranges,
+            &mut filter_index,
+            cancel,
+        )? {
+            return Ok(None);
+        }
+        if let Some(hook) = before_install_hook.take() {
+            hook();
+        }
+        // Acquire locks in the exact same order as `reconcile_once` (`index` then `filter`) so
+        // no concurrent commit can land between our frontier check and filter installation.
+        let index_guard = shared.index.read().unwrap();
+        let mut filter_guard = shared.filter.write().unwrap();
+        if cancel.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+            return Ok(None);
+        }
+        let latest_end = index_guard.committed_record_end();
+        if latest_end < absolute_start {
+            return Err(QuarryError::SourceChanged);
+        }
+        let gap = latest_end - absolute_start;
+        if gap > INLINE_CATCHUP_MAX_BYTES {
+            drop(filter_guard);
+            drop(index_guard);
+            continue;
+        }
+        if gap > 0
+            && !scan_filter_range(
+                shared,
+                &query,
+                &matchers,
+                &groups,
+                max_column,
+                &edits,
+                &mut scanner,
+                &mut chunk,
+                &mut absolute_start,
+                latest_end,
+                &mut row_number,
+                &mut record_start,
+                &mut record,
+                &mut field_ranges,
+                &mut filter_index,
+                cancel,
+            )?
+        {
+            return Ok(None);
+        }
+        filter_index.set_complete(true);
+        let snapshot_index = filter_index.clone();
+        *filter_guard = Some(WatchFilterState::new(filter_index, shared.data_start));
+        drop(filter_guard);
+        drop(index_guard);
+        {
+            let mut snap = shared.snapshot.write().unwrap();
+            snap.filter_matches_found = Some(snapshot_index.matches_found());
+            snap.generation = snap.generation.saturating_add(1);
+        }
+        return Ok(Some(snapshot_index));
+    }
+}
+
 fn run_watch_loop(
     shared: Arc<WatchShared>,
     mut tail: TailScanner,
@@ -1210,17 +1538,32 @@ fn run_watch_loop(
 
     loop {
         if shared.stop_requested.load(Ordering::Acquire) {
-            // Drain any already-written bytes once before clean stop when still actively watching.
-            if status.is_active()
-                && let Ok(ReconcileOutcome::Alert(alert)) =
-                    reconcile_once(&shared, &mut tail, &mut read_buf, &mut status)
-            {
-                status = WatchStatus::Alert(alert);
-                publish_snapshot(&shared, &tail, &status, events_coalesced);
-                return WatchWorkerResult {
-                    tail,
-                    final_status: status,
-                };
+            // Drain any already-written bytes once before clean stop when still actively watching,
+            // propagating both alerts and scan/IO errors rather than reporting a false `Stopped`.
+            if status.is_active() {
+                match reconcile_once(&shared, &mut tail, &mut read_buf, &mut status) {
+                    Ok(ReconcileOutcome::Alert(alert)) => {
+                        status = WatchStatus::Alert(alert);
+                        publish_snapshot(&shared, &tail, &status, events_coalesced);
+                        return WatchWorkerResult {
+                            tail,
+                            final_status: status,
+                        };
+                    }
+                    Err(err) => {
+                        let alert = match err {
+                            QuarryError::Io(io_err) => WatchAlert::IoError(io_err.to_string()),
+                            other => WatchAlert::ParseError(other.to_string()),
+                        };
+                        status = WatchStatus::Alert(alert);
+                        publish_snapshot(&shared, &tail, &status, events_coalesced);
+                        return WatchWorkerResult {
+                            tail,
+                            final_status: status,
+                        };
+                    }
+                    Ok(ReconcileOutcome::Changed | ReconcileOutcome::Unchanged) => {}
+                }
             }
             status = WatchStatus::Stopped;
             publish_snapshot(&shared, &tail, &status, events_coalesced);
@@ -1298,12 +1641,89 @@ fn check_path_identity(path: &Path, expected: Option<FileIdentity>) -> PathIdent
     }
 }
 
-fn reconcile_once(
+enum DrainOutcome {
+    Unchanged,
+    Changed,
+    Alert(WatchAlert),
+}
+
+fn drain_open_fd_locked(
+    open_file: &File,
+    tail: &mut TailScanner,
+    read_buf: &mut [u8],
+    index: &mut StructuralIndex,
+    mut filter: Option<&mut WatchFilterState>,
+) -> Result<DrainOutcome, QuarryError> {
+    let mut changed = false;
+
+    let meta = open_file.metadata()?;
+    let current_len = meta.len();
+    if current_len < tail.observed_file_len || current_len < tail.committed_record_end {
+        let previous_len = tail.observed_file_len.max(tail.committed_record_end);
+        tail.observed_file_len = current_len;
+        return Ok(DrainOutcome::Alert(WatchAlert::Truncated {
+            previous_len,
+            current_len,
+        }));
+    }
+
+    match tail.verify_seam(open_file)? {
+        SeamCheck::Ok => {}
+        SeamCheck::Truncated { current_len } => {
+            let previous_len = tail.observed_file_len.max(tail.committed_record_end);
+            tail.observed_file_len = current_len;
+            return Ok(DrainOutcome::Alert(WatchAlert::Truncated {
+                previous_len,
+                current_len,
+            }));
+        }
+        SeamCheck::Rewritten => {
+            return Ok(DrainOutcome::Alert(WatchAlert::Rewritten));
+        }
+    }
+
+    if current_len > tail.observed_file_len {
+        tail.observed_file_len = current_len;
+        changed = true;
+    }
+
+    while tail.scanner_consumed_bytes < tail.observed_file_len {
+        let want = usize::try_from(tail.observed_file_len - tail.scanner_consumed_bytes)
+            .unwrap_or(read_buf.len())
+            .min(read_buf.len());
+        let read = read_at_exact_or_eof(
+            open_file,
+            tail.scanner_consumed_bytes,
+            &mut read_buf[..want],
+        )?;
+        if read < want {
+            let previous_len = tail.observed_file_len;
+            let actual_len = tail.scanner_consumed_bytes + read as u64;
+            tail.observed_file_len = actual_len;
+            return Ok(DrainOutcome::Alert(WatchAlert::Truncated {
+                previous_len,
+                current_len: actual_len,
+            }));
+        }
+
+        let committed = tail.feed_bytes(&read_buf[..read], index, filter.as_deref_mut())?;
+        if committed > 0 {
+            changed = true;
+        }
+    }
+
+    Ok(if changed {
+        DrainOutcome::Changed
+    } else {
+        DrainOutcome::Unchanged
+    })
+}
+
+fn drain_open_fd(
     shared: &WatchShared,
     tail: &mut TailScanner,
     read_buf: &mut [u8],
-    status: &mut WatchStatus,
-) -> Result<ReconcileOutcome, QuarryError> {
+) -> Result<DrainOutcome, QuarryError> {
     let mut changed = false;
 
     // 1. Reconcile open FD size and catch truncation before reading.
@@ -1312,25 +1732,25 @@ fn reconcile_once(
     if current_len < tail.observed_file_len || current_len < tail.committed_record_end {
         let previous_len = tail.observed_file_len.max(tail.committed_record_end);
         tail.observed_file_len = current_len;
-        return Ok(ReconcileOutcome::Alert(WatchAlert::Truncated {
+        return Ok(DrainOutcome::Alert(WatchAlert::Truncated {
             previous_len,
             current_len,
         }));
     }
 
-    // 2. Verify committed tail seam on every growth or reconciliation check.
+    // 2. Verify committed tail seam + retained provisional bytes on every reconciliation check.
     match tail.verify_seam(&shared.open_file)? {
         SeamCheck::Ok => {}
         SeamCheck::Truncated { current_len } => {
             let previous_len = tail.observed_file_len.max(tail.committed_record_end);
             tail.observed_file_len = current_len;
-            return Ok(ReconcileOutcome::Alert(WatchAlert::Truncated {
+            return Ok(DrainOutcome::Alert(WatchAlert::Truncated {
                 previous_len,
                 current_len,
             }));
         }
         SeamCheck::Rewritten => {
-            return Ok(ReconcileOutcome::Alert(WatchAlert::Rewritten));
+            return Ok(DrainOutcome::Alert(WatchAlert::Rewritten));
         }
     }
 
@@ -1354,7 +1774,7 @@ fn reconcile_once(
             let previous_len = tail.observed_file_len;
             let actual_len = tail.scanner_consumed_bytes + read as u64;
             tail.observed_file_len = actual_len;
-            return Ok(ReconcileOutcome::Alert(WatchAlert::Truncated {
+            return Ok(DrainOutcome::Alert(WatchAlert::Truncated {
                 previous_len,
                 current_len: actual_len,
             }));
@@ -1369,8 +1789,28 @@ fn reconcile_once(
         }
     }
 
-    // 4. Reconcile current path identity (after draining the open FD so `tail -f` rotation
-    //    delivers final records written to the old inode before stopping and offering "Open new file").
+    Ok(if changed {
+        DrainOutcome::Changed
+    } else {
+        DrainOutcome::Unchanged
+    })
+}
+
+fn reconcile_once(
+    shared: &WatchShared,
+    tail: &mut TailScanner,
+    read_buf: &mut [u8],
+    status: &mut WatchStatus,
+) -> Result<ReconcileOutcome, QuarryError> {
+    let mut changed = match drain_open_fd(shared, tail, read_buf)? {
+        DrainOutcome::Alert(alert) => return Ok(ReconcileOutcome::Alert(alert)),
+        DrainOutcome::Changed => true,
+        DrainOutcome::Unchanged => false,
+    };
+
+    // 4. Reconcile current path identity (draining the open FD again on `Replaced` so any final
+    //    records written to the old inode between step 3 and replacement are delivered before
+    //    stopping and offering "Open new file").
     match check_path_identity(&shared.path, shared.open_identity) {
         PathIdentityCheck::SameFile => {
             if *status == WatchStatus::FollowingUnlinked {
@@ -1385,6 +1825,9 @@ fn reconcile_once(
             }
         }
         PathIdentityCheck::Replaced => {
+            if let DrainOutcome::Alert(alert) = drain_open_fd(shared, tail, read_buf)? {
+                return Ok(ReconcileOutcome::Alert(alert));
+            }
             return Ok(ReconcileOutcome::Alert(WatchAlert::Rotated));
         }
     }
@@ -1430,27 +1873,135 @@ fn publish_snapshot(
 // Platform-native OS notification backends (`kqueue`, `inotify`, `poll`)
 // ---------------------------------------------------------------------------
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-struct OwnedRawFd(libc::c_int);
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+mod linux_sys {
+    use std::ffi::{c_char, c_int, c_short, c_void};
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+    // Linux asm-generic constants shared identically by x86_64 and aarch64.
+    pub const O_NONBLOCK: c_int = 0o0004000;
+    pub const O_CLOEXEC: c_int = 0o2000000;
+    pub const IN_NONBLOCK: c_int = O_NONBLOCK;
+    pub const IN_CLOEXEC: c_int = O_CLOEXEC;
+    pub const IN_MODIFY: u32 = 0x0000_0002;
+    pub const IN_ATTRIB: u32 = 0x0000_0004;
+    pub const IN_MOVED_FROM: u32 = 0x0000_0040;
+    pub const IN_MOVED_TO: u32 = 0x0000_0080;
+    pub const IN_CREATE: u32 = 0x0000_0100;
+    pub const IN_DELETE: u32 = 0x0000_0200;
+    pub const IN_DELETE_SELF: u32 = 0x0000_0400;
+    pub const IN_MOVE_SELF: u32 = 0x0000_0800;
+    pub const POLLIN: c_short = 0x0001;
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct PollFd {
+        pub fd: c_int,
+        pub events: c_short,
+        pub revents: c_short,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct InotifyEvent {
+        pub wd: c_int,
+        pub mask: u32,
+        pub cookie: u32,
+        pub len: u32,
+    }
+
+    unsafe extern "C" {
+        pub fn pipe2(fds: *mut c_int, flags: c_int) -> c_int;
+        pub fn inotify_init1(flags: c_int) -> c_int;
+        pub fn inotify_add_watch(fd: c_int, pathname: *const c_char, mask: u32) -> c_int;
+        pub fn poll(fds: *mut PollFd, nfds: usize, timeout: c_int) -> c_int;
+        pub fn read(fd: c_int, buf: *mut c_void, count: usize) -> isize;
+        pub fn write(fd: c_int, buf: *const c_void, count: usize) -> isize;
+        pub fn close(fd: c_int) -> c_int;
+    }
+}
+
+#[cfg(any(
+    target_os = "macos",
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+struct OwnedRawFd(std::ffi::c_int);
+
+#[cfg(any(
+    target_os = "macos",
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
 impl OwnedRawFd {
-    fn raw(&self) -> libc::c_int {
+    fn raw(&self) -> std::ffi::c_int {
         self.0
     }
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(
+    target_os = "macos",
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
 impl Drop for OwnedRawFd {
     fn drop(&mut self) {
         // SAFETY: `self.0` is an exclusively owned valid file descriptor.
         unsafe {
+            #[cfg(target_os = "macos")]
             libc::close(self.0);
+            #[cfg(target_os = "linux")]
+            linux_sys::close(self.0);
         }
     }
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(
+    target_os = "macos",
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+fn write_wakeup_byte(write_fd: &OwnedRawFd) {
+    let byte = [1u8];
+    // SAFETY: writing one byte to our non-blocking self-pipe only wakes poll/kevent.
+    unsafe {
+        #[cfg(target_os = "macos")]
+        let _ = libc::write(write_fd.raw(), byte.as_ptr().cast(), 1);
+        #[cfg(target_os = "linux")]
+        let _ = linux_sys::write(write_fd.raw(), byte.as_ptr().cast(), 1);
+    }
+}
+
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+fn create_wakeup_pipe() -> io::Result<(OwnedRawFd, OwnedRawFd)> {
+    let mut fds = [0 as std::ffi::c_int; 2];
+    // SAFETY: `fds` is a valid 2-element array for `pipe2`.
+    if unsafe {
+        linux_sys::pipe2(
+            fds.as_mut_ptr(),
+            linux_sys::O_NONBLOCK | linux_sys::O_CLOEXEC,
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok((OwnedRawFd(fds[0]), OwnedRawFd(fds[1])))
+}
+
+#[cfg(target_os = "macos")]
 fn create_wakeup_pipe() -> io::Result<(OwnedRawFd, OwnedRawFd)> {
     let mut fds = [0 as libc::c_int; 2];
     // SAFETY: `fds` is a valid 2-element array for `pipe`.
@@ -1461,26 +2012,45 @@ fn create_wakeup_pipe() -> io::Result<(OwnedRawFd, OwnedRawFd)> {
     let write_fd = OwnedRawFd(fds[1]);
     for fd in [&read_fd, &write_fd] {
         // SAFETY: setting `FD_CLOEXEC` and `O_NONBLOCK` on our freshly opened pipe descriptors.
-        unsafe {
+        let ok = unsafe {
             let flags = libc::fcntl(fd.raw(), libc::F_GETFD);
-            if flags >= 0 {
-                libc::fcntl(fd.raw(), libc::F_SETFD, flags | libc::FD_CLOEXEC);
-            }
-            let fl = libc::fcntl(fd.raw(), libc::F_GETFL);
-            if fl >= 0 {
-                libc::fcntl(fd.raw(), libc::F_SETFL, fl | libc::O_NONBLOCK);
-            }
+            let cloexec_set =
+                flags >= 0 && libc::fcntl(fd.raw(), libc::F_SETFD, flags | libc::FD_CLOEXEC) >= 0;
+            let fl = if cloexec_set {
+                libc::fcntl(fd.raw(), libc::F_GETFL)
+            } else {
+                -1
+            };
+            fl >= 0 && libc::fcntl(fd.raw(), libc::F_SETFL, fl | libc::O_NONBLOCK) >= 0
+        };
+        if !ok {
+            return Err(io::Error::last_os_error());
         }
     }
     Ok((read_fd, write_fd))
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(
+    target_os = "macos",
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
 fn drain_wakeup_pipe(read_fd: &OwnedRawFd) {
     let mut buf = [0u8; 64];
     loop {
         // SAFETY: non-blocking read into stack buffer from owned pipe FD.
-        let n = unsafe { libc::read(read_fd.raw(), buf.as_mut_ptr().cast(), buf.len()) };
+        let n = unsafe {
+            #[cfg(target_os = "macos")]
+            {
+                libc::read(read_fd.raw(), buf.as_mut_ptr().cast(), buf.len())
+            }
+            #[cfg(target_os = "linux")]
+            {
+                linux_sys::read(read_fd.raw(), buf.as_mut_ptr().cast(), buf.len())
+            }
+        };
         if n <= 0 {
             break;
         }
@@ -1493,7 +2063,10 @@ enum OsNotifier {
         kq: OwnedRawFd,
         wake_read: OwnedRawFd,
     },
-    #[cfg(target_os = "linux")]
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     Inotify {
         inotify_fd: OwnedRawFd,
         wake_read: OwnedRawFd,
@@ -1523,11 +2096,12 @@ impl OsNotifier {
         }
         let kq = OwnedRawFd(raw_kq);
         // SAFETY: setting `FD_CLOEXEC` on our newly opened kqueue FD.
-        unsafe {
+        let cloexec_ok = unsafe {
             let flags = libc::fcntl(kq.raw(), libc::F_GETFD);
-            if flags >= 0 {
-                libc::fcntl(kq.raw(), libc::F_SETFD, flags | libc::FD_CLOEXEC);
-            }
+            flags >= 0 && libc::fcntl(kq.raw(), libc::F_SETFD, flags | libc::FD_CLOEXEC) >= 0
+        };
+        if !cloexec_ok {
+            return (Self::Polling, WatchBackend::Polling, None);
         }
         let changelist = [
             libc::kevent {
@@ -1573,7 +2147,10 @@ impl OsNotifier {
         )
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     fn create(
         _open_file: &File,
         path: &Path,
@@ -1589,7 +2166,8 @@ impl OsNotifier {
             return (Self::Polling, WatchBackend::Polling, None);
         };
         // SAFETY: `inotify_init1` returns a new FD or -1.
-        let raw_fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+        let raw_fd =
+            unsafe { linux_sys::inotify_init1(linux_sys::IN_NONBLOCK | linux_sys::IN_CLOEXEC) };
         if raw_fd < 0 {
             return (Self::Polling, WatchBackend::Polling, None);
         }
@@ -1599,10 +2177,13 @@ impl OsNotifier {
         };
         // SAFETY: `c_path` is NUL-terminated and `inotify_fd` is owned.
         let file_wd = unsafe {
-            libc::inotify_add_watch(
+            linux_sys::inotify_add_watch(
                 inotify_fd.raw(),
                 c_path.as_ptr(),
-                libc::IN_MODIFY | libc::IN_ATTRIB | libc::IN_DELETE_SELF | libc::IN_MOVE_SELF,
+                linux_sys::IN_MODIFY
+                    | linux_sys::IN_ATTRIB
+                    | linux_sys::IN_DELETE_SELF
+                    | linux_sys::IN_MOVE_SELF,
             )
         };
         if file_wd < 0 {
@@ -1614,10 +2195,13 @@ impl OsNotifier {
             // Best-effort parent directory watch so rename-rotation wakes promptly.
             // SAFETY: `c_parent` is NUL-terminated and `inotify_fd` is owned.
             let _ = unsafe {
-                libc::inotify_add_watch(
+                linux_sys::inotify_add_watch(
                     inotify_fd.raw(),
                     c_parent.as_ptr(),
-                    libc::IN_MOVED_TO | libc::IN_CREATE | libc::IN_MOVED_FROM | libc::IN_DELETE,
+                    linux_sys::IN_MOVED_TO
+                        | linux_sys::IN_CREATE
+                        | linux_sys::IN_MOVED_FROM
+                        | linux_sys::IN_DELETE,
                 )
             };
         }
@@ -1631,7 +2215,13 @@ impl OsNotifier {
         )
     }
 
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(not(any(
+        target_os = "macos",
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
+    )))]
     fn create(
         _open_file: &File,
         _path: &Path,
@@ -1682,34 +2272,37 @@ impl OsNotifier {
                 }
                 count
             }
-            #[cfg(target_os = "linux")]
+            #[cfg(all(
+                target_os = "linux",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            ))]
             Self::Inotify {
                 inotify_fd,
                 wake_read,
             } => {
                 let mut fds = [
-                    libc::pollfd {
+                    linux_sys::PollFd {
                         fd: inotify_fd.raw(),
-                        events: libc::POLLIN,
+                        events: linux_sys::POLLIN,
                         revents: 0,
                     },
-                    libc::pollfd {
+                    linux_sys::PollFd {
                         fd: wake_read.raw(),
-                        events: libc::POLLIN,
+                        events: linux_sys::POLLIN,
                         revents: 0,
                     },
                 ];
-                let timeout_ms = timeout.as_millis().min(libc::c_int::MAX as u128) as libc::c_int;
+                let timeout_ms =
+                    timeout.as_millis().min(std::ffi::c_int::MAX as u128) as std::ffi::c_int;
                 // SAFETY: `fds` holds two valid owned file descriptors.
-                let rc =
-                    unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout_ms) };
+                let rc = unsafe { linux_sys::poll(fds.as_mut_ptr(), fds.len(), timeout_ms) };
                 if rc <= 0 {
                     return 0;
                 }
-                if (fds[1].revents & libc::POLLIN) != 0 {
+                if (fds[1].revents & linux_sys::POLLIN) != 0 {
                     drain_wakeup_pipe(wake_read);
                 }
-                if (fds[0].revents & libc::POLLIN) == 0 {
+                if (fds[0].revents & linux_sys::POLLIN) == 0 {
                     return 0;
                 }
                 // Drain all queued inotify events to coalesce bursts into one reconciliation pass.
@@ -1717,19 +2310,20 @@ impl OsNotifier {
                 let mut events_count = 0u64;
                 loop {
                     // SAFETY: non-blocking read from owned inotify descriptor.
-                    let n =
-                        unsafe { libc::read(inotify_fd.raw(), buf.as_mut_ptr().cast(), buf.len()) };
+                    let n = unsafe {
+                        linux_sys::read(inotify_fd.raw(), buf.as_mut_ptr().cast(), buf.len())
+                    };
                     if n <= 0 {
                         break;
                     }
                     let mut pos = 0usize;
                     let len = n as usize;
-                    let hdr_size = std::mem::size_of::<libc::inotify_event>();
+                    let hdr_size = std::mem::size_of::<linux_sys::InotifyEvent>();
                     while pos + hdr_size <= len {
-                        // SAFETY: reading an aligned/unaligned `inotify_event` header inside `buf[..len]`.
+                        // SAFETY: reading an aligned/unaligned `InotifyEvent` header inside `buf[..len]`.
                         let ev = unsafe {
                             std::ptr::read_unaligned(
-                                buf.as_ptr().add(pos).cast::<libc::inotify_event>(),
+                                buf.as_ptr().add(pos).cast::<linux_sys::InotifyEvent>(),
                             )
                         };
                         events_count += 1;
@@ -2113,7 +2707,10 @@ mod tests {
             s.committed_rows == 3 && s.status == WatchStatus::FollowingUnlinked
         }));
 
-        // Now create the rotated replacement file at `path`.
+        // Now append one final row to the old inode AND create the replacement file at `path`
+        // BEFORE nudging so the simultaneous drain-on-Replaced path is exercised directly.
+        old_writer.write_all(b"3,final_before_rotate\n").unwrap();
+        old_writer.flush().unwrap();
         std::fs::write(&path, b"id,msg\n100,new_file\n").unwrap();
         watch.nudge();
 
@@ -2121,9 +2718,11 @@ mod tests {
             watch.snapshot().status == WatchStatus::Alert(WatchAlert::Rotated)
         }));
 
-        // Old FD still readable for the drained row!
-        let rows = watch.read_rows(2, 1).unwrap();
+        // Both old-FD drained rows must be committed and readable!
+        assert_eq!(watch.snapshot().committed_rows, 4);
+        let rows = watch.read_rows(2, 2).unwrap();
         assert_eq!(rows[0].fields[1], b"drained_from_old_fd");
+        assert_eq!(rows[1].fields[1], b"final_before_rotate");
 
         let stopped = watch.stop().unwrap();
         assert_eq!(
@@ -2193,8 +2792,9 @@ mod tests {
             )
             .unwrap();
 
-        let total_appended = 50_000u64;
+        let total_appended = 100_000u64;
         let burst_size = 1_000u64;
+        let mem_before = crate::process_memory_usage().map(|sample| sample.bytes);
         let started = Instant::now();
         let mut writer = FsOpenOptions::new().append(true).open(&path).unwrap();
         let mut buf = String::with_capacity(32 * 1024);
@@ -2212,6 +2812,9 @@ mod tests {
             }
             writer.write_all(buf.as_bytes()).unwrap();
             writer.flush().unwrap();
+            if burst % 25 == 24 {
+                thread::sleep(Duration::from_millis(2));
+            }
         }
         watch.nudge();
 
@@ -2224,13 +2827,23 @@ mod tests {
             rows_per_min >= 1_000_000.0,
             "expected >= 1M rows/min ingestion, measured {rows_per_min:.0} rows/min ({elapsed:?})"
         );
-        assert_eq!(watch.snapshot().filter_matches_found, Some(5_000));
+        if let (Some(before), Some(after)) = (
+            mem_before,
+            crate::process_memory_usage().map(|sample| sample.bytes),
+        ) {
+            let delta = after.saturating_sub(before);
+            assert!(
+                delta < 64 * 1024 * 1024,
+                "sustained Live Watch RSS delta must stay bounded (< 64 MiB), grew by {delta} bytes"
+            );
+        }
+        assert_eq!(watch.snapshot().filter_matches_found, Some(10_000));
 
         let stopped = watch.stop().unwrap();
         assert_eq!(stopped.final_status, WatchStatus::Stopped);
         assert_eq!(stopped.index.indexed_rows(), total_appended + 1);
         let watched_filter = stopped.filter_index.unwrap();
-        assert_eq!(watched_filter.matches_found(), 5_000);
+        assert_eq!(watched_filter.matches_found(), 10_000);
 
         // Verify exact match parity against a fresh independent static open + filter.
         let (oracle_session, oracle_index) =
@@ -2244,10 +2857,10 @@ mod tests {
         assert_eq!(
             stopped
                 .session
-                .read_filtered_rows(&watched_filter, 4_995, 5)
+                .read_filtered_rows(&watched_filter, 9_995, 5)
                 .unwrap(),
             oracle_session
-                .read_filtered_rows(&oracle_filter, 4_995, 5)
+                .read_filtered_rows(&oracle_filter, 9_995, 5)
                 .unwrap()
         );
     }
@@ -2311,5 +2924,312 @@ mod tests {
             .unwrap();
         assert!(reindexed.telemetry().cache_hit);
         assert_eq!(reindexed.indexed_rows(), 202);
+    }
+
+    #[test]
+    fn same_size_provisional_tail_rewrite_alerts_and_never_persists_wrong_sidecar() {
+        use std::io::{Seek, SeekFrom};
+
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = dir.path().join("private-cache");
+        let path = dir.path().join("provisional_rewrite.csv");
+        let initial = b"id\n1\n";
+        std::fs::write(&path, initial).unwrap();
+
+        let cache_config = IndexCacheConfig {
+            enabled: true,
+            cache_dir: Some(cache_dir.clone()),
+            min_file_bytes: 0,
+            max_cache_bytes: 16 * 1024 * 1024,
+        };
+        let (session, index) = open_and_index(&path, Some(Encoding::Utf8), HeaderMode::FirstRow);
+        let watch = session
+            .start_live_watch(
+                &index,
+                None,
+                WatchConfig {
+                    poll_interval: Duration::from_millis(500),
+                    force_polling: true,
+                    cache_config: cache_config.clone(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        // Append unterminated 3-byte provisional tail `abc` and let watcher consume it.
+        let mut writer = FsOpenOptions::new().append(true).open(&path).unwrap();
+        writer.write_all(b"abc").unwrap();
+        writer.flush().unwrap();
+        watch.nudge();
+        assert!(wait_until(Duration::from_secs(2), || {
+            watch.snapshot().scanner_consumed_bytes == (initial.len() + 3) as u64
+        }));
+        assert_eq!(watch.snapshot().committed_rows, 2);
+
+        // Overwrite those exact 3 provisional bytes in place with `a\nb` (same length, 2 rows!),
+        // then immediately stop: must detect `Rewritten` and NEVER write a bogus sidecar!
+        let mut rw = FsOpenOptions::new().write(true).open(&path).unwrap();
+        rw.seek(SeekFrom::Start(initial.len() as u64)).unwrap();
+        rw.write_all(b"a\nb").unwrap();
+        rw.flush().unwrap();
+
+        let stopped = watch.stop().unwrap();
+        assert_eq!(
+            stopped.final_status,
+            WatchStatus::Alert(WatchAlert::Rewritten)
+        );
+        assert!(!stopped.index.is_complete());
+        assert!(!cache_dir.exists());
+
+        // Fresh reopen with the same cache_config sees the true 4 rows (header + 1 + a + b).
+        let reopened = Session::open(&path, OpenOptions::default()).unwrap();
+        let reindexed = reopened
+            .start_indexing_with_options(IndexConfig::default(), Some(1), cache_config)
+            .unwrap()
+            .wait()
+            .unwrap();
+        assert!(!reindexed.telemetry().cache_hit);
+        assert_eq!(reindexed.indexed_rows(), 4);
+    }
+
+    #[test]
+    fn attach_filter_during_concurrent_commit_preserves_every_match_and_ordinal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("concurrent_filter.csv");
+        std::fs::write(&path, b"id,tag\n1,HIT\n2,MISS\n").unwrap();
+
+        let (session, index) = open_and_index(&path, Some(Encoding::Utf8), HeaderMode::FirstRow);
+        let watch = session
+            .start_live_watch(
+                &index,
+                None,
+                WatchConfig {
+                    poll_interval: Duration::from_millis(15),
+                    cache_config: IndexCacheConfig::disabled(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        let path_for_hook = path.clone();
+        let shared_for_hook = Arc::clone(&watch.shared);
+        let query = FilterQuery::single(1, FilterOperator::Equals, b"HIT".to_vec());
+        // Hook runs AFTER initial scan of `[0..initial_end)` and BEFORE atomic installation:
+        // append a matching row and wait for the watcher to commit it into `shared.index`!
+        let attached = watch
+            .attach_filter_query_with_hook(query.clone(), move || {
+                let mut writer = FsOpenOptions::new()
+                    .append(true)
+                    .open(&path_for_hook)
+                    .unwrap();
+                writer.write_all(b"3,HIT\n4,MISS\n").unwrap();
+                writer.flush().unwrap();
+                shared_for_hook.signal_wakeup();
+                assert!(wait_until(Duration::from_secs(2), || {
+                    shared_for_hook.snapshot.read().unwrap().committed_rows == 5
+                }));
+            })
+            .unwrap();
+
+        // Both row 1 (before hook) and row 3 (committed mid-attach) must be captured!
+        assert_eq!(attached.matches_found(), 2);
+
+        // Append one more matching row AFTER attach -> incremental path captures row 5 too!
+        let mut writer = FsOpenOptions::new().append(true).open(&path).unwrap();
+        writer.write_all(b"5,HIT\n").unwrap();
+        writer.flush().unwrap();
+        watch.nudge();
+        assert!(wait_until(Duration::from_secs(2), || {
+            watch.snapshot().committed_rows == 6 && watch.snapshot().filter_matches_found == Some(3)
+        }));
+
+        let stopped = watch.stop().unwrap();
+        assert_eq!(stopped.final_status, WatchStatus::Stopped);
+        let watched_filter = stopped.filter_index.unwrap();
+        let (oracle_session, _) = open_and_index(&path, Some(Encoding::Utf8), HeaderMode::FirstRow);
+        let oracle_filter = oracle_session.start_filter(query).unwrap().wait().unwrap();
+        assert_eq!(
+            stopped
+                .session
+                .read_filtered_rows(&watched_filter, 0, 10)
+                .unwrap(),
+            oracle_session
+                .read_filtered_rows(&oracle_filter, 0, 10)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn utf16_odd_and_even_truncation_returns_source_changed_across_all_readers() {
+        for truncate_to_odd in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir
+                .path()
+                .join(format!("utf16_trunc_{truncate_to_odd}.csv"));
+            let mut content = Encoding::Utf16Le.bom().to_vec();
+            content.extend_from_slice(
+                &Encoding::Utf16Le
+                    .encode(b"id,tag\n1,HIT\n2,HIT\n3,HIT\n", 4096)
+                    .unwrap(),
+            );
+            std::fs::write(&path, &content).unwrap();
+
+            let (session, index) =
+                open_and_index(&path, Some(Encoding::Utf16Le), HeaderMode::FirstRow);
+            let query = FilterQuery::single(1, FilterOperator::Equals, b"HIT".to_vec());
+            let initial_filter = session.start_filter(query.clone()).unwrap().wait().unwrap();
+            // Long polling interval so the worker stays idle while we test direct readers on the
+            // truncated file descriptor.
+            let watch = session
+                .start_live_watch(
+                    &index,
+                    Some(&initial_filter),
+                    WatchConfig {
+                        poll_interval: Duration::from_secs(60),
+                        force_polling: true,
+                        cache_config: IndexCacheConfig::disabled(),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+
+            // Truncate below committed_record_end to either an odd byte count (e.g. 1 byte) or an
+            // even byte count inside row 1.
+            let trunc_len = if truncate_to_odd { 1u64 } else { 18u64 };
+            let f = FsOpenOptions::new().write(true).open(&path).unwrap();
+            f.set_len(trunc_len).unwrap();
+
+            // 1. Unfiltered reader must return SourceChanged (never a torn record or hang).
+            assert!(matches!(
+                watch.read_rows(0, 4),
+                Err(QuarryError::SourceChanged)
+            ));
+            // 2. Filtered reader must return SourceChanged (never silently return partial matches).
+            assert!(matches!(
+                watch.read_filtered_rows(0, 3),
+                Err(QuarryError::SourceChanged)
+            ));
+            // 3. Filter attachment must return SourceChanged immediately (never spin on odd byte!).
+            assert!(matches!(
+                watch.attach_filter_query(query),
+                Err(QuarryError::SourceChanged)
+            ));
+
+            let stopped = watch.stop().unwrap();
+            assert!(matches!(
+                stopped.final_status,
+                WatchStatus::Alert(WatchAlert::Truncated { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn malformed_append_right_before_stop_propagates_parse_error_and_incomplete_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("malformed_before_stop.csv");
+        std::fs::write(&path, b"id,v\n1,ok\n").unwrap();
+
+        let (session, index) = open_and_index(&path, Some(Encoding::Utf8), HeaderMode::FirstRow);
+        let watch = session
+            .start_live_watch(
+                &index,
+                None,
+                WatchConfig {
+                    poll_interval: Duration::from_secs(60),
+                    force_polling: true,
+                    max_record_bytes: 32,
+                    cache_config: IndexCacheConfig::disabled(),
+                },
+            )
+            .unwrap();
+
+        // Append an oversized row immediately before calling `stop()` without nudging first.
+        let mut writer = FsOpenOptions::new().append(true).open(&path).unwrap();
+        writer
+            .write_all(b"2,aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n")
+            .unwrap();
+        writer.flush().unwrap();
+
+        let stopped = watch.stop().unwrap();
+        assert!(matches!(
+            stopped.final_status,
+            WatchStatus::Alert(WatchAlert::ParseError(_))
+        ));
+        assert!(!stopped.index.is_complete());
+        assert!(stopped.session.completed_record_count().is_none());
+    }
+
+    #[test]
+    fn row_zero_corruption_still_delivers_rewritten_alert_on_stop() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("corrupt_row0.csv");
+        std::fs::write(&path, b"id,v\n1,ok\n").unwrap();
+
+        let (session, index) = open_and_index(&path, Some(Encoding::Utf8), HeaderMode::FirstRow);
+        let watch = session
+            .start_live_watch(
+                &index,
+                None,
+                WatchConfig {
+                    poll_interval: Duration::from_millis(15),
+                    cache_config: IndexCacheConfig::disabled(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        // Overwrite row 0 in place with malformed unclosed quote CSV (same length -> seam mismatch).
+        let mut f = FsOpenOptions::new().write(true).open(&path).unwrap();
+        f.write_all(b"\"unclosed\n1,ok\n").unwrap();
+        f.flush().unwrap();
+        watch.nudge();
+
+        assert!(wait_until(Duration::from_secs(2), || {
+            watch.snapshot().status == WatchStatus::Alert(WatchAlert::Rewritten)
+        }));
+        let stopped = watch.stop().expect("stop must still deliver alert cleanly");
+        assert_eq!(
+            stopped.final_status,
+            WatchStatus::Alert(WatchAlert::Rewritten)
+        );
+        assert!(!stopped.index.is_complete());
+    }
+
+    #[test]
+    fn start_live_watch_rejects_partial_or_cross_session_filter_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let path_a = dir.path().join("a.csv");
+        let path_b = dir.path().join("b.csv");
+        std::fs::write(&path_a, b"id,v\n1,a\n2,b\n").unwrap();
+        std::fs::write(&path_b, b"id,v\n1,a\n2,b\n").unwrap();
+
+        let (session_a, index_a) =
+            open_and_index(&path_a, Some(Encoding::Utf8), HeaderMode::FirstRow);
+        let (session_b, _) = open_and_index(&path_b, Some(Encoding::Utf8), HeaderMode::FirstRow);
+        let query = FilterQuery::single(1, FilterOperator::Equals, b"a".to_vec());
+
+        // 1. Cross-session FilterIndex must be rejected.
+        let filter_b = session_b
+            .start_filter(query.clone())
+            .unwrap()
+            .wait()
+            .unwrap();
+        assert!(filter_b.is_complete());
+        assert!(matches!(
+            session_a.start_live_watch(&index_a, Some(&filter_b), WatchConfig::default()),
+            Err(QuarryError::InvalidOption(_))
+        ));
+
+        // 2. Bounded/paused (incomplete) FilterIndex must be rejected.
+        let bounded_filter = session_a
+            .start_filter_with_edits_and_limit(query, Arc::default(), Some(9))
+            .unwrap()
+            .wait()
+            .unwrap();
+        assert!(!bounded_filter.is_complete());
+        assert!(matches!(
+            session_a.start_live_watch(&index_a, Some(&bounded_filter), WatchConfig::default()),
+            Err(QuarryError::InvalidOption(_))
+        ));
     }
 }

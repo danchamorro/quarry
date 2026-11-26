@@ -138,8 +138,9 @@ pub use storage::{
     validate_scratch_directory,
 };
 pub use watch::{
-    DEFAULT_WATCH_POLL_INTERVAL, LiveWatchJob, NETWORK_WATCH_POLL_INTERVAL, WatchAlert,
-    WatchBackend, WatchConfig, WatchProvisionalTail, WatchSnapshot, WatchStatus, WatchStopOutcome,
+    DEFAULT_WATCH_POLL_INTERVAL, LiveWatchFilterJob, LiveWatchJob, NETWORK_WATCH_POLL_INTERVAL,
+    WatchAlert, WatchBackend, WatchConfig, WatchProvisionalTail, WatchSnapshot, WatchStatus,
+    WatchStopOutcome,
 };
 
 const DEFAULT_SAMPLE_BYTES: usize = 1024 * 1024;
@@ -1109,6 +1110,7 @@ impl Session {
         LiveWatchJob::start(self, index, active_filter, config)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn from_watch_stop_parts(
         path: PathBuf,
         encoding: Encoding,
@@ -1117,30 +1119,29 @@ impl Session {
         open_file: &File,
         final_stamp: SourceStamp,
         final_index: &StructuralIndex,
+        reuse_first_rows: Option<Vec<Row>>,
     ) -> Result<Self, QuarryError> {
         let file_size = final_stamp.file_size();
-        let first_rows = if final_index.indexed_rows() == 0 {
-            Vec::new()
-        } else {
-            let count = (final_index.indexed_rows() as usize).min(100);
-            read_rows_from_open_file(
+        let first_rows = match reuse_first_rows {
+            Some(rows) => rows,
+            None => read_bootstrap_rows_from_open_file(
                 open_file,
                 dialect.delimiter,
-                final_index,
-                0,
-                count,
-                DEFAULT_MAX_RECORD_BYTES,
                 encoding,
                 final_index.committed_record_end(),
-                true,
-            )?
+                100,
+                DEFAULT_BOOTSTRAP_LIMIT,
+            )?,
         };
-        let completed_record_count = Arc::new(Mutex::new(Some(CompletedRecordCount {
-            delimiter: dialect.delimiter,
-            encoding,
-            file_size,
-            records: final_index.indexed_rows(),
-        })));
+        let completed = (final_index.is_complete()
+            && final_index.committed_record_end() == file_size)
+            .then_some(CompletedRecordCount {
+                delimiter: dialect.delimiter,
+                encoding,
+                file_size,
+                records: final_index.indexed_rows(),
+            });
+        let completed_record_count = Arc::new(Mutex::new(completed));
         Ok(Self {
             path,
             source_stamp: final_stamp,
@@ -1677,6 +1678,61 @@ fn cell_kind(value: &[u8]) -> CellKind {
     }
 }
 
+fn read_bootstrap_rows_from_open_file(
+    file: &File,
+    delimiter: u8,
+    encoding: Encoding,
+    end: u64,
+    max_rows: usize,
+    byte_limit: usize,
+) -> Result<Vec<Row>, QuarryError> {
+    if end == 0 || max_rows == 0 || byte_limit == 0 {
+        return Ok(Vec::new());
+    }
+    let mut limit = usize::try_from(end).unwrap_or(byte_limit).min(byte_limit);
+    if encoding.is_utf16() {
+        limit &= !1;
+    }
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let mut scanner = RecordScanner::new(delimiter, encoding)?;
+    let mut bytes = Vec::with_capacity(DEFAULT_READ_CHUNK.min(limit));
+    let mut chunk = vec![0; encoding.chunk_size(DEFAULT_READ_CHUNK.min(limit))];
+    let mut ends = Vec::with_capacity(max_rows);
+    let mut offset = 0u64;
+
+    while ends.len() < max_rows && bytes.len() < limit {
+        let mut allowed = (limit - bytes.len()).min(chunk.len());
+        if encoding.is_utf16() {
+            allowed &= !1;
+        }
+        if allowed == 0 {
+            break;
+        }
+        let read = positional_io::read_at_exact_or_eof(file, offset, &mut chunk[..allowed])?;
+        if read < allowed {
+            return Err(QuarryError::SourceChanged);
+        }
+        bytes.extend_from_slice(&chunk[..read]);
+        scanner.scan_chunk(&chunk[..read], offset, |rec_end| {
+            if ends.len() < max_rows {
+                ends.push(rec_end);
+            }
+        })?;
+        offset += read as u64;
+    }
+
+    if offset == end && ends.len() < max_rows {
+        scanner.finish(offset, |rec_end| {
+            if ends.len() < max_rows {
+                ends.push(rec_end);
+            }
+        })?;
+    }
+    materialize_rows(&bytes, &ends, delimiter, encoding)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn read_rows_from_open_file(
     file: &File,
@@ -1719,6 +1775,9 @@ pub(crate) fn read_rows_from_open_file(
         let read = if remaining == 0 {
             0
         } else {
+            if encoding.is_utf16() && remaining == 1 {
+                return Err(QuarryError::SourceChanged);
+            }
             let mut limit = chunk
                 .len()
                 .min(usize::try_from(remaining).unwrap_or(usize::MAX));
@@ -1726,19 +1785,15 @@ pub(crate) fn read_rows_from_open_file(
                 limit &= !1;
             }
             if limit == 0 {
-                0
-            } else {
-                let got =
-                    positional_io::read_at_exact_or_eof(file, absolute_start, &mut chunk[..limit])?;
-                if encoding.is_utf16() && !got.is_multiple_of(2) {
-                    return Err(QuarryError::EncodingAt {
-                        encoding,
-                        offset: absolute_start + got.saturating_sub(1) as u64,
-                        reason: "incomplete UTF-16 code unit".into(),
-                    });
-                }
-                got
+                return Err(QuarryError::SourceChanged);
             }
+            let got =
+                positional_io::read_at_exact_or_eof(file, absolute_start, &mut chunk[..limit])?;
+            if got < limit {
+                // Any short read below the committed frontier indicates concurrent truncation.
+                return Err(QuarryError::SourceChanged);
+            }
+            got
         };
         if read == 0 {
             if !record.is_empty() && row_number >= start && row_number < target_end {

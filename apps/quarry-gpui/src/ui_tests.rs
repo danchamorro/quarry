@@ -4944,12 +4944,9 @@ fn live_watch_streams_appended_rows_pauses_scroll_and_handles_rotation(cx: &mut 
         "starting Live Watch must emit a quiet transition announcement"
     );
 
-    // Pause tail-follow by jumping up to row 1, then append 20 new rows.
+    // Pause tail-follow by jumping up to row 1 via the real navigation/scroll path, then append 20 new rows.
     cx.update_window(handle.into(), |_, window, cx| {
         view.update(cx, |q, cx| {
-            let _ = q.controller.update(cx, |c, cx| {
-                c.set_live_watch_tail_follow_active(win_id, false, cx)
-            });
             q.row_input
                 .update(cx, |input, cx| input.set_value("1", window, cx));
             q.go_to_row(cx);
@@ -4957,6 +4954,11 @@ fn live_watch_streams_appended_rows_pauses_scroll_and_handles_rotation(cx: &mut 
     })
     .unwrap();
     cx.run_until_parked();
+    let snap_after_jump = cx.update(|cx| view.read(cx).snapshot(cx).unwrap());
+    assert!(
+        !snap_after_jump.live_watch.tail_follow,
+        "navigating up to row 1 while watching must pause tail-follow automatically"
+    );
 
     let mut writer = std::fs::OpenOptions::new()
         .append(true)

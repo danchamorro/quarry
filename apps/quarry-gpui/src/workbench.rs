@@ -1092,7 +1092,7 @@ impl WorkbenchController {
             .map(|col| doc.column_name(col))
             .collect::<Vec<_>>();
         let filter_active = doc.filter_active();
-        let filter_done = doc.filter_job.is_none() && !doc.filter_rows_loading();
+        let filter_done = !doc.is_filter_scanning() && !doc.filter_rows_loading();
         let (structural_running, structural_progress, duplicate_preview) = match &doc.structural_job
         {
             None => (false, None, None),
@@ -1222,7 +1222,7 @@ impl WorkbenchController {
             available_rows: doc.grid_total_rows(),
             filter_active,
             filter_done,
-            filter_running: doc.filter_job.is_some(),
+            filter_running: doc.is_filter_scanning(),
             filter_status: doc.filter_status.clone(),
             can_export_filtered: doc.is_filtered_export_ready(),
             export_running: doc.export_job.is_some(),

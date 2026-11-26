@@ -226,7 +226,7 @@ impl WorkbenchTab {
                 || document.section_verify_job.is_some()
                 || document.decompressing()
                 || document.search_job.is_some()
-                || document.filter_job.is_some()
+                || document.is_filter_scanning()
                 || document.filter_rows_loading()
                 || document.save_job.is_some()
                 || document.export_job.is_some()

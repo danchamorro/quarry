@@ -2,7 +2,7 @@ use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{Seek, SeekFrom};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, mpsc};
 use std::thread::{self, JoinHandle};
@@ -237,6 +237,7 @@ pub struct FilterIndex {
     edits: FilterEdits,
     source: Option<FilterSource>,
     scan_limit: Option<u64>,
+    complete: bool,
     checkpoints: Vec<FilterCheckpoint>,
     checkpoint_every: u64,
     max_checkpoints: usize,
@@ -257,11 +258,44 @@ impl FilterIndex {
             edits: Arc::default(),
             source: None,
             scan_limit: None,
+            complete: false,
             checkpoints: Vec::with_capacity(max_checkpoints.min(4)),
             checkpoint_every: 1,
             max_checkpoints,
             matches_found: 0,
         })
+    }
+
+    pub fn is_complete(&self) -> bool {
+        self.complete
+    }
+
+    pub(crate) fn set_complete(&mut self, complete: bool) {
+        self.complete = complete;
+    }
+
+    /// Returns true only when this filter index completed an unbounded whole-file scan without
+    /// edits against the exact source file and framing expected by Live Watch Mode.
+    pub(crate) fn is_complete_for_watch(
+        &self,
+        path: &Path,
+        stamp: &SourceStamp,
+        delimiter: u8,
+        data_start: u64,
+        encoding: Encoding,
+    ) -> bool {
+        self.complete
+            && self.scan_limit.is_none()
+            && self.edits.is_empty()
+            && self.source.as_ref().is_some_and(|source| {
+                source.path == path
+                    && source.stamp == *stamp
+                    && source.delimiter == delimiter
+                    && source.data_start == data_start
+                    && source.encoding == encoding
+                    && source.section_range == (0, stamp.file_size())
+                    && source.strip_bom_at_zero
+            })
     }
 
     pub(crate) fn record_match(&mut self, row: u64, offset: u64) {
@@ -300,7 +334,7 @@ impl FilterIndex {
         }
     }
 
-    /// Updates `FilterIndex` source stamp and scan bounds when Live Watch stops cleanly.
+    /// Updates `FilterIndex` source stamp and scan bounds when Live Watch stops.
     pub(crate) fn update_source_after_watch(
         &mut self,
         path: PathBuf,
@@ -308,6 +342,7 @@ impl FilterIndex {
         delimiter: u8,
         data_start: u64,
         encoding: Encoding,
+        complete: bool,
     ) {
         let file_size = stamp.file_size();
         self.source = Some(FilterSource {
@@ -320,6 +355,7 @@ impl FilterIndex {
             strip_bom_at_zero: true,
         });
         self.scan_limit = None;
+        self.complete = complete;
     }
 
     /// Creates an empty live-watch `FilterIndex` bound to the watched file's framing.
@@ -384,6 +420,9 @@ impl FilterIndex {
             if remaining == 0 {
                 break;
             }
+            if encoding.is_utf16() && remaining == 1 {
+                return Err(QuarryError::SourceChanged);
+            }
             let mut cap = usize::try_from(remaining)
                 .unwrap_or(chunk.len())
                 .min(chunk.len());
@@ -391,16 +430,14 @@ impl FilterIndex {
                 cap &= !1;
             }
             if cap == 0 {
-                break;
+                return Err(QuarryError::SourceChanged);
             }
             let read = read_at_exact_or_eof(file, absolute_start, &mut chunk[..cap])?;
-            if read == 0 {
-                break;
+            if read < cap {
+                // Any short read below the committed frontier indicates concurrent truncation.
+                return Err(QuarryError::SourceChanged);
             }
-            let effective_read = if encoding.is_utf16() { read & !1 } else { read };
-            if effective_read == 0 {
-                break;
-            }
+            let effective_read = read;
             let mut segment_start = 0;
             let mut deferred_error = None;
             scanner.scan_chunk(&chunk[..effective_read], absolute_start, |absolute_end| {
@@ -730,6 +767,13 @@ impl FilterJob {
                     )
                 };
                 let result = result.and_then(|()| source.check_file(&guard_file));
+                if result.is_ok()
+                    && !worker_state.cancelled.load(Ordering::Acquire)
+                    && !worker_state.bounded_scan
+                    && !is_section
+                {
+                    worker_state.index.write().unwrap().complete = true;
+                }
                 if let Err(error) = &result {
                     *worker_state.error.lock().unwrap() = Some(error.to_string());
                 }

@@ -23,7 +23,7 @@ Introduce an explicit, opt-in, append-only **Live Watch Mode** (`LiveWatchJob` i
 
 - Live Watch is opt-in and eligible only for **clean**, **uncompressed** (`.csv.gz` rejected), **whole-file** (bounded sections rejected) documents whose initial `StructuralIndex` reached validated EOF (`index.is_complete()`), with no active write, structural, or search jobs and no existing `source_changed` conflict.
 - While Live Watch is active, the tab enters an explicit `"append expected"` mode and is **pinned** (`PinReason::LiveWatching`, with its OS descriptors explicitly accounted in `FdBudgetLedger`).
-- All edits, Undo/Redo, structural transforms, Save / Save As / Save As UTF-8, Replace All, Rename Header, Reload, Open Section, and Format changes are **mutually exclusive** with Live Watch and remain disabled until the user stops watching.
+- All edits, Undo/Redo, structural transforms, Save / Save As / Save As UTF-8, Replace All, Rename Header, Reload, Split at Bookmarks, and Format/encoding reopen are **mutually exclusive** with Live Watch and remain disabled until the user stops watching. Bounded section documents cannot enter Live Watch (`File → Open Section…` opens a separate read-only section tab without mutating the watched tab).
 - Stopping Live Watch cleanly transitions the document back to normal `SourceStamp`-guarded mode at the latest reconciled file state, finalizing any valid unterminated EOF record and refreshing the optional persistent sidecar cache once via ordinary validated cache rules.
 
 ### 2. Three Separate Frontiers & Provisional Tail Record

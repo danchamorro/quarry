@@ -870,10 +870,13 @@ impl TableDelegate for Grid {
                 .map_or((false, 0), |doc| {
                     (doc.is_live_watching(), doc.grid_total_rows())
                 });
-            if is_watching && range.start < prev_start {
-                let _ = controller.set_live_watch_tail_follow_active(window_id, false, cx);
-            } else if is_watching && total_rows > 0 && (range.end as u64) >= total_rows {
-                let _ = controller.set_live_watch_tail_follow_active(window_id, true, cx);
+            if is_watching {
+                let at_bottom = total_rows == 0 || (range.end as u64) >= total_rows;
+                if at_bottom {
+                    let _ = controller.set_live_watch_tail_follow_active(window_id, true, cx);
+                } else if range.start < prev_start {
+                    let _ = controller.set_live_watch_tail_follow_active(window_id, false, cx);
+                }
             }
             controller.request_viewport_rows(window_id, range.start as u64, range.len().max(1), cx);
         });

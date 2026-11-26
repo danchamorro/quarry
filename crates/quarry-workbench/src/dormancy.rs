@@ -2017,6 +2017,7 @@ impl WorkbenchScheduler {
                 && doc.job.is_none()
                 && doc.index.is_some()
                 && !doc.saving_in_place
+                && !doc.is_live_watching()
             {
                 doc.refresh_bookmark_offsets_from_buffers();
                 if doc
@@ -2322,6 +2323,16 @@ impl WorkbenchScheduler {
         if slot.tab.document_writing() {
             return Err(SchedulerError::OpenFailed(
                 "Wait for the active file operation before reopening this document.".into(),
+            ));
+        }
+        if slot
+            .tab
+            .document
+            .as_ref()
+            .is_some_and(Document::is_live_watching)
+        {
+            return Err(SchedulerError::OpenFailed(
+                crate::document::LIVE_WATCH_READ_ONLY_REASON.into(),
             ));
         }
         if slot

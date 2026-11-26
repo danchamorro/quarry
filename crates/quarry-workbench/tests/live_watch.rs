@@ -351,3 +351,108 @@ fn live_watch_rejects_dirty_and_section_documents_and_surfaces_rotation_alert() 
     );
     let _ = WorkbenchTab::new(1);
 }
+
+#[test]
+fn live_watch_unterminated_baseline_rollback_reports_zero_then_one_and_blocks_reopen_and_bookmarks()
+{
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("unterminated_wb.csv");
+    // Header + 1 unterminated row (no trailing newline).
+    std::fs::write(&path, b"id,val\n1,par").unwrap();
+
+    let (mut scheduler, doc_id) = open_completed_scheduler(&path);
+    assert_eq!(
+        scheduler
+            .tab(doc_id)
+            .unwrap()
+            .document
+            .as_ref()
+            .unwrap()
+            .available_data_rows(),
+        1
+    );
+
+    scheduler
+        .start_live_watch_with_config(
+            doc_id,
+            WatchConfig {
+                poll_interval: Duration::from_millis(15),
+                cache_config: quarry_core::IndexCacheConfig::disabled(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    // Unterminated baseline row rolled back -> authoritative `available_data_rows()` MUST be 0!
+    {
+        let doc = scheduler.tab(doc_id).unwrap().document.as_ref().unwrap();
+        assert_eq!(doc.available_data_rows(), 0);
+        assert!(doc.split_at_bookmarks_disabled_reason().is_some());
+    }
+
+    // Reopen tab (Format/encoding change) MUST be blocked while Live Watch is active!
+    assert!(
+        scheduler
+            .reopen_tab(WindowId::PRIMARY, doc_id, OpenOptions::default(), None)
+            .is_err()
+    );
+
+    // Finish the unterminated row -> `available_data_rows()` becomes 1 cleanly!
+    let mut writer = FsOpenOptions::new().append(true).open(&path).unwrap();
+    writer.write_all(b"tial\n").unwrap();
+    writer.flush().unwrap();
+    scheduler
+        .tab(doc_id)
+        .unwrap()
+        .document
+        .as_ref()
+        .unwrap()
+        .live_watch
+        .as_ref()
+        .unwrap()
+        .nudge();
+
+    assert!(wait_until(Duration::from_secs(2), || {
+        let _ = scheduler.poll_all();
+        scheduler
+            .tab(doc_id)
+            .unwrap()
+            .document
+            .as_ref()
+            .unwrap()
+            .available_data_rows()
+            == 1
+    }));
+
+    // Overwrite row 0 in place with malformed unclosed-quote CSV -> `poll_all` must surface
+    // `WatchAlert::Rewritten` and set `source_changed = true` rather than swallowing the error!
+    let mut rw = FsOpenOptions::new().write(true).open(&path).unwrap();
+    rw.write_all(b"\"broken\n1,partial\n").unwrap();
+    rw.flush().unwrap();
+    if let Some(watch) = scheduler
+        .tab(doc_id)
+        .unwrap()
+        .document
+        .as_ref()
+        .unwrap()
+        .live_watch
+        .as_ref()
+    {
+        watch.nudge();
+    }
+
+    assert!(wait_until(Duration::from_secs(2), || {
+        let _ = scheduler.poll_all();
+        scheduler
+            .tab(doc_id)
+            .unwrap()
+            .document
+            .as_ref()
+            .unwrap()
+            .live_watch_alert
+            == Some(WatchAlert::Rewritten)
+    }));
+    let doc = scheduler.tab(doc_id).unwrap().document.as_ref().unwrap();
+    assert!(!doc.is_live_watching());
+    assert!(doc.source_changed);
+}
