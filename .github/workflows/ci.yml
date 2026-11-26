@@ -29,6 +29,8 @@ jobs:
       - run: cargo test --workspace --locked
       - run: cargo build --workspace --release --locked
       - run: ./scripts/macos-app.sh self-test
+      - run: ./scripts/linux-app.sh self-test
+      - run: ./scripts/generate-notices.sh --release-check --all-targets
       - run: ./scripts/macos-app.sh package
 
   linux-core-cli:

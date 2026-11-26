@@ -357,3 +357,40 @@ zero new dependencies or license changes (`397` locked packages for
 `aarch64-apple-darwin`), and leaves `THIRD_PARTY_NOTICES.html` package/license
 coverage intact. `packaging/licenses/manifest.json` and `reviewed.sha256` were
 refreshed with checksum-verified `cargo-about 0.9.2`.
+
+## 2026-11-26 Multi-target Linux (`x86_64` and `arm64`) GPUI notice inventories
+
+Extended `packaging/licenses/generate.py` and `scripts/generate-notices.sh` to
+generate and verify audited notice inventories for `x86_64-unknown-linux-gnu`
+(`507` locked packages, merging `apps/quarry-gpui` and `apps/quarry-cli`) and
+`aarch64-unknown-linux-gnu` (`503` locked packages, merging `apps/quarry-gpui`
+and `apps/quarry-cli`) under `packaging/licenses/targets/<triple>/` alongside
+the existing `aarch64-apple-darwin` inventory (`397` locked packages), using
+checksum-verified `cargo-about 0.9.2` and Rust `1.100.0` runtime notices.
+
+- **License allowlist parity:** All Linux dependencies satisfy the existing
+  OSI-approved `about.toml` allowlist with zero GPL, LGPL, AGPL, or non-OSI
+  selections (`self_cell@1.3.0` offers `Apache-2.0 OR GPL-2.0-only` and selects
+  `Apache-2.0`; `option-ext@0.2.0` retains its existing MPL-2.0 Section 3.2(a)
+  source-obtainment notice).
+- **Linux supplemental coverage (`supplemental.json`):** Scoped macOS-only
+  `objc2`/`block2`/`dispatch2`/`accesskit_macos` records to
+  `aarch64-apple-darwin` and added eight hash-verified Linux records covering
+  every Linux fallback/placeholder crate: `sha1_smol@1.0.1` (`LICENSE` and
+  referenced `AUTHORS`, `BSD-3-Clause`), `wayland-protocols-plasma@0.3.12`
+  (`LICENSE.txt`, `MIT`), `accesskit_consumer@0.38.0` /
+  `accesskit_atspi_common@0.19.1` / `accesskit_unix@0.22.1` (pinned
+  `AccessKit/accesskit@c88605b9...` `LICENSE-MIT` and `LICENSE.chromium`),
+  `spirv@0.4.0+sdk-1.4.341.0` (pinned `gfx-rs/rspirv@8afc3d0a...` `LICENSE`,
+  `Apache-2.0`), `harfrust@0.5.2` (pinned `harfbuzz/harfrust@efdae314...`
+  `LICENSE`, `MIT`), and `xim-ctext@0.3.0` / `xim-parser@0.2.2` (pinned
+  `Riey/xim-rs@65f77e44...` `LICENSE`, `MIT`, byte-identical to `7300de35...`).
+  Linux inventories also merge the `apps/quarry-gpui` and `apps/quarry-cli`
+  dependency graphs so both shipped Linux binaries are covered by construction,
+  and `generate.py` fails closed if any fallback/placeholder crate lacks a
+  matching supplemental notice for its target.
+- **macOS notice stability:** `aarch64-apple-darwin` `THIRD_PARTY_NOTICES.html`
+  content remains unchanged; its manifest and review hash reflect the updated
+  generator, `supplemental.json`, and this audit record. All three targets'
+  `reviewed.sha256` hashes were recorded after inspecting the generated HTML and
+  verifying zero uncollected fallback gaps.

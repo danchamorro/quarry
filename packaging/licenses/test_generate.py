@@ -35,6 +35,12 @@ class NoticeChecks(unittest.TestCase):
             "packaging/licenses/manifest.json",
             "packaging/licenses/reviewed.sha256",
             "packaging/licenses/THIRD_PARTY_NOTICES.html",
+            "packaging/licenses/targets/x86_64-unknown-linux-gnu/manifest.json",
+            "packaging/licenses/targets/x86_64-unknown-linux-gnu/reviewed.sha256",
+            "packaging/licenses/targets/x86_64-unknown-linux-gnu/THIRD_PARTY_NOTICES.html",
+            "packaging/licenses/targets/aarch64-unknown-linux-gnu/manifest.json",
+            "packaging/licenses/targets/aarch64-unknown-linux-gnu/reviewed.sha256",
+            "packaging/licenses/targets/aarch64-unknown-linux-gnu/THIRD_PARTY_NOTICES.html",
         ]
         for relative in files:
             destination = self.root / relative
@@ -53,9 +59,20 @@ class NoticeChecks(unittest.TestCase):
 
     def test_current_inventory_passes_offline(self):
         env = dict(os.environ, CARGO_HOME=str(self.root / "empty-cargo-cache"))
-        result = self.run_check("--check", "--target", "aarch64-apple-darwin", env=env)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("Review is checked separately", result.stdout)
+        for target in (
+            "aarch64-apple-darwin",
+            "x86_64-unknown-linux-gnu",
+            "aarch64-unknown-linux-gnu",
+        ):
+            with self.subTest(target=target):
+                result = self.run_check("--check", "--target", target, env=env)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("Review is checked separately", result.stdout)
+        all_res = self.run_check("--release-check", "--all-targets", env=env)
+        self.assertEqual(all_res.returncode, 0, all_res.stderr)
+        self.assertIn("aarch64-apple-darwin", all_res.stdout)
+        self.assertIn("x86_64-unknown-linux-gnu", all_res.stdout)
+        self.assertIn("aarch64-unknown-linux-gnu", all_res.stdout)
 
     def test_dependency_input_change_rejects_stale_inventory(self):
         for relative in ("Cargo.lock", "apps/quarry-gpui/Cargo.toml"):
@@ -251,6 +268,52 @@ class NoticeChecks(unittest.TestCase):
                 path.write_text(json.dumps({"notices": [], "assets": [changed]}))
                 with self.assertRaisesRegex(ValueError, error):
                     generator["render"](raw)
+
+    def test_wrong_target_scope_supplemental_fails_for_linux_fallback(self):
+        generator = runpy.run_path(str(self.root / "packaging/licenses/generate.py"))
+        notice = {
+            "packages": ["linux-only@1"],
+            "source": "https://example.invalid/MIT",
+            "text": "MIT terms",
+            "sha256": generator["digest"](b"MIT terms"),
+            "targets": ["aarch64-apple-darwin"],
+        }
+        (self.root / "packaging/licenses/supplemental.json").write_text(
+            json.dumps({"notices": [notice], "assets": []})
+        )
+        package = {"name": "linux-only", "version": "1", "license": "MIT", "source": "registry"}
+        raw = {
+            "crates": [{"package": package}],
+            "licenses": [{"id": "MIT", "source_path": None, "used_by": [{"crate": package}]}],
+        }
+        with self.assertRaisesRegex(ValueError, "missing supplemental notice for x86_64-unknown-linux-gnu"):
+            generator["render"](raw, target="x86_64-unknown-linux-gnu")
+
+    def test_corrupted_linux_review_hash_fails_all_targets_release_check(self):
+        review_path = self.root / "packaging/licenses/targets/x86_64-unknown-linux-gnu/reviewed.sha256"
+        review_path.write_text("0" * 64 + "\n")
+        result = self.run_check("--release-check", "--all-targets")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Notice inventory review required for x86_64-unknown-linux-gnu", result.stderr)
+
+    def test_merge_cargo_about_outputs_unions_cli_only_dependency(self):
+        generator = runpy.run_path(str(self.root / "packaging/licenses/generate.py"))
+        gui_pkg = {"name": "gui-crate", "version": "1", "license": "MIT", "source": "registry"}
+        cli_pkg = {"name": "cli-only-crate", "version": "2", "license": "MIT", "source": "registry"}
+        merged = generator["merge_cargo_about_outputs"]([
+            {
+                "crates": [{"package": gui_pkg}],
+                "licenses": [{"id": "MIT", "source_path": None, "used_by": [{"crate": gui_pkg}]}],
+            },
+            {
+                "crates": [{"package": gui_pkg}, {"package": cli_pkg}],
+                "licenses": [{"id": "MIT", "source_path": None, "used_by": [{"crate": gui_pkg}, {"crate": cli_pkg}]}],
+            },
+        ])
+        crate_ids = {f"{c['package']['name']}@{c['package']['version']}" for c in merged["crates"]}
+        self.assertEqual(crate_ids, {"gui-crate@1", "cli-only-crate@2"})
+        used_ids = {f"{u['crate']['name']}@{u['crate']['version']}" for u in merged["licenses"][0]["used_by"]}
+        self.assertEqual(used_ids, {"gui-crate@1", "cli-only-crate@2"})
 
 
 if __name__ == "__main__":

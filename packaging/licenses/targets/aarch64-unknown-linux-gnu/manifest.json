@@ -1,0 +1,31 @@
+{
+  "artifact_sha256": "296630d19e285336a5331cab1b861f58dd396171a7ba24b91534a4c3e15c937d",
+  "cargo_about_version": "0.9.2",
+  "inputs": {
+    "Cargo.lock": "f8715a509cc2c2b15eb068f530eaf24be00aab58c7072bac0227dccce10c12e7",
+    "Cargo.toml": "d17bd0bdce649ebfc44373b61d3438ea26ed52b93a7ce6596b8d9fc036bff09c",
+    "LICENSE-APACHE": "e7092afa91dcebd506f0f1174ab4ab938df63f906df74df2aa2e1ea66e7e0f52",
+    "LICENSE-MIT": "3641f379cac8e0f6903292982d0617f3cb6193271fdf74b06f2e01f25e23d70f",
+    "apps/quarry-appkit/Cargo.toml": "9a123247711d0e7f97da51fae0bb44d1be9bd33b183b980558eb57c89dbd418c",
+    "apps/quarry-cli/Cargo.toml": "34ba3abb45443fc4fae5dd19613c606a80ffb47c2a7bb14a4c231a9f9614b440",
+    "apps/quarry-gpui/Cargo.toml": "3e83ad475f3579ce6149a43d113cd957f9d49a8a2734484f0943716e583d7067",
+    "crates/quarry-core/Cargo.toml": "ed52dade77a6911de699ef83e01dd1e19cbf08bddcdbf7810e3bdc23c824b081",
+    "crates/quarry-delimited/Cargo.toml": "b0a79530d15e05119b569db3fbb163ae8e087914c011cd643a18527b50b8bf38",
+    "crates/quarry-workbench/Cargo.toml": "2534229c6c5f328347bc3a395baa5071ddc29970f2826d0159e8e0bf90c2387e",
+    "packaging/licenses/AUDIT.md": "3b13686401552d5a4df2a9f5a5360a93f54475d7483d33f7bb60bb39f861c978",
+    "packaging/licenses/about.toml": "f7ec23664aca4f5fb86ec00517a7bfd6a3f46829270ed92df0a05b4ca82399c0",
+    "packaging/licenses/generate.py": "4d295f0f5723ca70113f5e704981302d1cb0faa55eeb96b04c6c932971d88f61",
+    "packaging/licenses/rust/COPYRIGHT-backtrace.html": "3f75bc40ac42851491dcb65fd6f18c258325578e9f3efa63391a9eb682628461",
+    "packaging/licenses/rust/COPYRIGHT-library.html": "626556344c12679d7cab2c1aa2ce80de01937b62c2c88c62f0650a469be18799",
+    "packaging/licenses/rust/LICENSE-APACHE": "62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a",
+    "packaging/licenses/rust/LICENSE-MIT": "b71bd43a069ca0641a9ecfe585ca7b3c53b5cc1608f8b68321168698e28b5ea1",
+    "packaging/licenses/rust/Unicode-3.0.txt": "f5062c9a188d81dfe66b56db4182dcf9e4b17c0d9b0d311a8e20b3a1b075c443",
+    "packaging/licenses/rust/compiler-builtins-libm-LICENSE.txt": "3823dda7cf046602f4b4e77ec8e227863dc4736037cc85bb33d9f19febe16bb7",
+    "packaging/licenses/rust/compiler-rt-CREDITS.TXT": "a9901f47a089da41e4690682d00ce4cedaa2baf41fedbe79beee366d43ac2461",
+    "packaging/licenses/supplemental.json": "75f620220eed9302a1d3b19a1c944863c0a863f9e1c9ceae8a6ae77264faf7f7",
+    "rust-toolchain.toml": "c3dcaa2e4c0d9b494b33f2d1539f78166c78b3f1355bb68934405d559af4db43",
+    "scripts/generate-notices.sh": "88eba763ed0172649e8bd4a6c8ab828929acc80095027eff89983acd76395028"
+  },
+  "status": "collected",
+  "target": "aarch64-unknown-linux-gnu"
+}

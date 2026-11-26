@@ -103,11 +103,47 @@ Partitioned multi-threaded **Hash-Join** (with automatic sort-merge skew fallbac
 
 ---
 
-## Install & Build from Source
+## Download & Install
+
+Prebuilt betas are published on [GitHub Releases](https://github.com/danchamorro/quarry/releases) (no Rust toolchain required).
+
+### macOS (Apple Silicon)
+
+1. Download **`Quarry-<tag>-macos-arm64.dmg`** (or `.zip`) from the [latest GitHub Release](https://github.com/danchamorro/quarry/releases).
+2. Open the `.dmg` and drag **Quarry** into **Applications**.
+3. Launch **Quarry**—official releases are Developer ID signed, Apple-notarized, and stapled.
+
+Optionally verify your download against `SHA256SUMS-macos-arm64.txt`:
+
+```bash
+shasum -a 256 -c SHA256SUMS-macos-arm64.txt
+```
+
+### Linux & Omarchy (`x86_64` & `arm64`)
+
+Prebuilt Linux tarballs (`Quarry-<tag>-linux-x86_64.tar.gz` and `Quarry-<tag>-linux-arm64.tar.gz`) are built in CI for upcoming releases starting with `v0.2.0-beta.2` (use `./scripts/linux-app.sh install` under [Build from Source](#linux--omarchy-from-source) if no Linux archive is attached to the latest release yet):
+
+1. Download **`Quarry-<tag>-linux-x86_64.tar.gz`** (most desktops/laptops) or **`Quarry-<tag>-linux-arm64.tar.gz`** from [GitHub Releases](https://github.com/danchamorro/quarry/releases).
+2. Extract and run the included user installer (no `sudo` required):
+
+```bash
+ARCHIVE="Quarry-<tag>-linux-x86_64.tar.gz"
+tar -xzf "$ARCHIVE" &&
+  cd "${ARCHIVE%.tar.gz}" &&
+  ./install.sh
+```
+
+This installs the GPU-rendered desktop app (`~/.local/bin/quarry-gpui`), the headless CLI (`~/.local/bin/quarry`), an XDG launcher entry (`Quarry` in Omarchy's app launcher / Walker and *"Open With"* for `.csv`/`.tsv`), the app icon, and third-party notices into `~/.local/bin` and `${XDG_DATA_HOME:-~/.local/share}`. On Omarchy, choose **View → Theme → Omarchy** to follow your active theme live. To uninstall cleanly (keeping `~/.config/quarry`), run `${XDG_DATA_HOME:-~/.local/share}/doc/quarry/uninstall.sh`.
+
+See the [Linux & Omarchy Guide](docs/LINUX_AND_OMARCHY.md) for Wayland/Hyprland, theme sync, runtime library notes, and AT-SPI accessibility.
+
+---
+
+## Build from Source
 
 Quarry pins its Rust toolchain in [`rust-toolchain.toml`](rust-toolchain.toml) (currently **Rust `1.100.0`**). Install `rustup` first if you do not have it.
 
-### macOS (Current GPUI App from Source)
+### macOS (from Source)
 
 Build, package, install into `/Applications/Quarry.app`, and verify the local bundle:
 
@@ -121,30 +157,21 @@ open /Applications/Quarry.app
 
 See [macOS Packaging & Verification](docs/MACOS_PACKAGING.md) for ad-hoc vs Developer ID signing, rollback archives (`./scripts/macos-app.sh rollback`), and third-party license bundling.
 
-### Linux & Omarchy (Current GPUI App from Source)
+### Linux & Omarchy (from Source)
 
-Build and run the native Wayland GPUI app on Linux (`x86_64` or `arm64`) or Omarchy (Hyprland):
+Build and install the desktop app, CLI, `.desktop` entry, and icon into `~/.local` in one command:
 
 ```bash
 git clone https://github.com/danchamorro/quarry.git
 cd quarry
-cargo build --release -p quarry-gpui --locked
-./target/release/quarry-gpui /path/to/file.csv
+./scripts/linux-app.sh install
 ```
 
-On Omarchy, select **View → Theme → Omarchy** to follow your active Omarchy theme automatically. See the [Linux & Omarchy Guide](docs/LINUX_AND_OMARCHY.md) for system dependencies, Wayland/Vulkan notes, fractional scaling, and AT-SPI accessibility.
-
-### Prebuilt macOS Beta Snapshot (`v0.1.0-beta.3`)
-
-An earlier signed and notarized Apple Silicon macOS ZIP is available on GitHub Releases:
-
-- [Quarry `v0.1.0-beta.3` (Apple Silicon macOS ZIP)](https://github.com/danchamorro/quarry/releases/tag/v0.1.0-beta.3)
-
-> **Note:** `v0.1.0-beta.3` is an earlier macOS-only pre-GPUI (`egui`) snapshot. Current `main` uses the GPU-accelerated GPUI desktop app for both macOS and Linux/Omarchy; updated signed macOS and Linux release packages will be published once v1.0 cross-platform validation is complete.
+See the [Linux & Omarchy Guide](docs/LINUX_AND_OMARCHY.md) for system build dependencies on Arch/Omarchy and Ubuntu/Debian.
 
 ### CLI (`quarry-cli`)
 
-Build and run the headless engine CLI on macOS or Linux:
+The prebuilt Linux bundle installs `quarry` automatically into `~/.local/bin/quarry`. To build the headless CLI directly from source on macOS or Linux:
 
 ```bash
 cargo build --release -p quarry-cli --locked
@@ -157,7 +184,7 @@ cargo build --release -p quarry-cli --locked
 
 Quarry is actively working toward v1.0. High-level upcoming areas include:
 
-- **Large-File Ergonomics & Streaming:** Adaptive word wrap with automatic scale-back on large files, and opt-in append-only **Live Watch Mode** for growing logs/exports.
+- **Streaming & Live Files:** Opt-in append-only **Live Watch Mode** for growing logs and exports.
 - **Power-User UX & Querying:** Interactive `/` regex & expression query bar, keyboard-first navigation (`hjkl`, `gg`, `G`) and fuzzy Command Palette (`Cmd/Ctrl+K`), Cell Inspector Drawer for embedded JSON/Markdown/stack traces, Smart Copy (`CSV`, `Markdown`, `JSON`, `SQL IN`), multi-row freeze & column pinning, async column summary headers, Focus Mode, and custom TOML themes.
 - **File Split, Combine & Format Conversion:** Guided File Splitter (every N rows or at bookmarked rows with header/footer injection), Combine Files v2 (opt-in column alignment, schema-drift flagging, `_source_file` column), `.csv.zst` support, format converters (`CSV`/`TSV`/`PSV`/`JSON`/`NDJSON`/`Markdown`), and reusable custom CSV format profiles.
 - **Analysis & Data Tools:** Out-of-core Pivot Tables (`SUM`, `AVG`, `COUNT`, `MIN`, `MAX`), Autofill (series/dates) & Flash Fill by example, Combine Lines rollup, Transpose, and Extract Frequent Strings.
