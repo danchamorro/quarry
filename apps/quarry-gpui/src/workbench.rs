@@ -19,15 +19,16 @@ use quarry_workbench::compressed::{
 };
 use quarry_workbench::{
     AppMessage, CombineWorkflow, CommandContext, CommandId, CommandResolution,
-    DEFAULT_NOFILE_TARGET, DelimiterMode, Document, DocumentId, FailedOpen, GridSelection,
-    HudAnnouncement, HudAnnouncementTracker, HudIndexPhase, InspectWorkflow, JOIN_INPUT_RESERVED,
-    JoinWorkflow, MessageSeverity, Palette, ResidencyState, ResolvedTheme, ResourceHudSample,
-    ResourceHudSampler, ResourceHudTargets, SchedulerError, SelectionModifiers, StoragePreferences,
-    StructuralDialog, StructuralJob, ThemeAppearance, ThemePreference, ThemePreferences,
-    WakeOutcome, WindowId, WorkbenchScheduler, WorkbenchSchedulerConfig, WorkbenchTab,
-    clear_index_cache_summary, evaluate_command, inspect_temporary_storage,
-    materialization_progress, omarchy_theme_fingerprint, resolve_theme, select_column,
-    sort_progress, whitespace,
+    DEFAULT_NOFILE_TARGET, DelimiterMode, Document, DocumentId, EffectiveWordWrap, FailedOpen,
+    GridSelection, HudAnnouncement, HudAnnouncementTracker, HudIndexPhase, InspectWorkflow,
+    JOIN_INPUT_RESERVED, JoinWorkflow, MessageSeverity, Palette, ResidencyState, ResolvedTheme,
+    ResourceHudSample, ResourceHudSampler, ResourceHudTargets, SchedulerError, SelectionModifiers,
+    StoragePreferences, StructuralDialog, StructuralJob, ThemeAppearance, ThemePreference,
+    ThemePreferences, WakeOutcome, WindowId, WordWrapPreferences, WordWrapToggleOutcome,
+    WorkbenchScheduler, WorkbenchSchedulerConfig, WorkbenchTab, clear_index_cache_summary,
+    evaluate_command, inspect_temporary_storage, materialization_progress,
+    omarchy_theme_fingerprint, resolve_theme, resolve_word_wrap, select_column, sort_progress,
+    whitespace,
 };
 
 /// Shared global concurrency cap across document saves, exports, structural edits, decompressions,
@@ -80,6 +81,8 @@ pub struct DocumentSnapshot {
     pub filename: String,
     pub file_size: u64,
     pub active_byte_len: u64,
+    pub word_wrap: EffectiveWordWrap,
+    pub word_wrap_threshold_bytes: u64,
     pub section: Option<Box<SectionSnapshot>>,
     pub bookmark_count: usize,
     pub bookmarks: Vec<BookmarkListEntry>,
@@ -243,6 +246,7 @@ pub struct WorkbenchController {
     viewport_read_seq: BTreeMap<DocumentId, u64>,
     pending_reveal_cells: BTreeMap<DocumentId, (u64, usize)>,
     whitespace_prefs: whitespace::Preferences,
+    word_wrap_prefs: WordWrapPreferences,
     window_messages: BTreeMap<WindowId, AppMessage>,
     pending_review: Option<PendingReviewScope>,
     active_review_token: Option<u64>,
@@ -348,6 +352,7 @@ impl WorkbenchController {
             viewport_read_seq: BTreeMap::new(),
             pending_reveal_cells: BTreeMap::new(),
             whitespace_prefs: whitespace::Preferences::load(None),
+            word_wrap_prefs: WordWrapPreferences::load(None),
             window_messages: BTreeMap::new(),
             pending_review: None,
             active_review_token: None,
@@ -374,6 +379,7 @@ impl WorkbenchController {
         let storage_prefs = StoragePreferences::application();
         let theme_prefs = ThemePreferences::load_default();
         let whitespace_prefs = whitespace::Preferences::application();
+        let word_wrap_prefs = WordWrapPreferences::application();
         let theme_home = std::env::var_os("HOME").map(PathBuf::from);
         let config = WorkbenchSchedulerConfig {
             defer_gzip_decompression: true,
@@ -382,6 +388,7 @@ impl WorkbenchController {
         let entity = cx.new(|_| {
             Self::new_with_all_prefs(config, storage_prefs, theme_prefs, theme_home)
                 .with_whitespace_prefs(whitespace_prefs)
+                .with_word_wrap_prefs(word_wrap_prefs)
         });
         cx.set_global(WorkbenchGlobal(entity.clone()));
 
@@ -833,6 +840,97 @@ impl WorkbenchController {
         self
     }
 
+    pub fn with_word_wrap_prefs(mut self, prefs: WordWrapPreferences) -> Self {
+        self.word_wrap_prefs = prefs;
+        self
+    }
+
+    pub fn word_wrap_auto_disable_bytes(&self) -> u64 {
+        self.word_wrap_prefs.auto_disable_bytes
+    }
+
+    pub fn effective_word_wrap(&self, window: WindowId) -> EffectiveWordWrap {
+        let Some(doc_id) = self.scheduler.active_document(window) else {
+            return resolve_word_wrap(&self.word_wrap_prefs, None, None);
+        };
+        let Some(tab) = self.scheduler.tab(doc_id) else {
+            return resolve_word_wrap(&self.word_wrap_prefs, None, None);
+        };
+        let active_byte_len = tab
+            .document
+            .as_ref()
+            .map(|doc| doc.session.active_byte_len());
+        resolve_word_wrap(
+            &self.word_wrap_prefs,
+            tab.word_wrap_override,
+            active_byte_len,
+        )
+    }
+
+    pub fn toggle_word_wrap(
+        &mut self,
+        window: WindowId,
+        cx: &mut Context<Self>,
+    ) -> WordWrapToggleOutcome {
+        let active_doc_id = self.scheduler.active_document(window);
+        let (tab_override, active_byte_len) = active_doc_id
+            .and_then(|id| self.scheduler.tab(id))
+            .map(|tab| {
+                (
+                    tab.word_wrap_override,
+                    tab.document
+                        .as_ref()
+                        .map(|doc| doc.session.active_byte_len()),
+                )
+            })
+            .unwrap_or((None, None));
+        let prev_effective =
+            resolve_word_wrap(&self.word_wrap_prefs, tab_override, active_byte_len);
+        let outcome = self
+            .word_wrap_prefs
+            .toggle_for_tab(tab_override, active_byte_len);
+        if let Some(doc_id) = active_doc_id
+            && let Some(tab) = self.scheduler.tab_mut(doc_id)
+        {
+            tab.word_wrap_override = outcome.next_tab_override;
+        }
+        if outcome.effective != prev_effective {
+            self.last_hud_announcement.insert(
+                window,
+                HudAnnouncement {
+                    text: outcome.effective.transition_announcement(),
+                    is_alert: false,
+                },
+            );
+        }
+        cx.notify();
+        outcome
+    }
+
+    pub fn set_word_wrap_auto_disable_bytes(
+        &mut self,
+        bytes: u64,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        self.word_wrap_prefs
+            .set_auto_disable_bytes(bytes)
+            .map_err(|error| format!("Could not save word wrap threshold: {error}"))?;
+        cx.notify();
+        Ok(())
+    }
+
+    pub fn push_hud_announcement(
+        &mut self,
+        window: WindowId,
+        text: String,
+        is_alert: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.last_hud_announcement
+            .insert(window, HudAnnouncement { text, is_alert });
+        cx.notify();
+    }
+
     pub fn show_all_whitespace(&self) -> bool {
         self.whitespace_prefs.show_all
     }
@@ -1028,6 +1126,12 @@ impl WorkbenchController {
                     )
                 });
         let active_byte_len = doc.session.active_byte_len();
+        let word_wrap = resolve_word_wrap(
+            &self.word_wrap_prefs,
+            tab.word_wrap_override,
+            Some(active_byte_len),
+        );
+        let word_wrap_threshold_bytes = self.word_wrap_prefs.auto_disable_bytes;
         let section = doc.section_bounds().map(|bounds| {
             Box::new(SectionSnapshot {
                 bounds,
@@ -1063,6 +1167,8 @@ impl WorkbenchController {
             filename,
             file_size: doc.session.file_size,
             active_byte_len,
+            word_wrap,
+            word_wrap_threshold_bytes,
             section,
             bookmark_count,
             bookmarks,

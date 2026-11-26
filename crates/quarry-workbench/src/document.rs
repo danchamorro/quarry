@@ -314,6 +314,7 @@ pub struct Document {
     pub header_renames: Arc<BTreeMap<usize, Arc<String>>>,
     pub header_edit: Option<HeaderEdit>,
     pub cell_edits: SharedCellEdits,
+    pub edit_revision: u64,
     pub cell_edit: Option<CellEdit>,
     pub total_columns: usize,
     pub columns: ColumnView,
@@ -608,6 +609,7 @@ impl Document {
             header_renames: Arc::default(),
             header_edit: None,
             cell_edits: Arc::default(),
+            edit_revision: 0,
             cell_edit: None,
             total_columns,
             columns,
@@ -4426,6 +4428,7 @@ impl Document {
                 } else {
                     Arc::make_mut(&mut self.cell_edits).remove(&(row, column));
                 }
+                self.edit_revision = self.edit_revision.wrapping_add(1);
                 self.queue_filter_refresh();
             }
         }
@@ -4464,6 +4467,7 @@ impl Document {
         self.discard_header_edits();
         self.cell_edit = None;
         self.cell_edits = Arc::default();
+        self.edit_revision = self.edit_revision.wrapping_add(1);
         self.edit_history = EditHistory::default();
         self.selection = None;
         self.clear_row_selection();

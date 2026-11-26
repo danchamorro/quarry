@@ -12,12 +12,14 @@ use gpui_kit::component::{
     ActiveTheme, Disableable, IndexPath, Sizable, WindowExt,
     button::{Button, ButtonVariants},
     checkbox::Checkbox,
+    input::{Input, InputState},
     select::{SearchableVec, Select, SelectEvent, SelectItem, SelectState},
 };
 use gpui_kit::{prelude::*, *};
 use quarry_core::{Encoding, HeaderMode, JoinMode, JoinSource};
 use quarry_workbench::{
-    ADAPTIVE_MEMORY_BUDGET_BYTES, DelimiterMode, JoinSideSource, WindowId, format_bytes,
+    ADAPTIVE_MEMORY_BUDGET_BYTES, DelimiterMode, JoinSideSource, MAX_CONFIGURABLE_AUTO_DISABLE_MB,
+    WindowId, format_bytes, format_decimal_mb,
 };
 
 use crate::menus::encoding_from_label;
@@ -1780,6 +1782,11 @@ pub fn open_temporary_storage_dialog(
         (controller.clone(), sub)
     });
     let action_error = cx.new(|_| Option::<String>::None);
+    let initial_wrap_mb =
+        (controller.read(cx).word_wrap_auto_disable_bytes() / 1_000_000).to_string();
+    let wrap_threshold_input =
+        cx.new(|cx| InputState::new(window, cx).default_value(initial_wrap_mb));
+    let wrap_threshold_status = cx.new(|_| Option::<String>::None);
     let on_closed = std::rc::Rc::new(on_closed);
     let anchor = DialogAnchor::new(cx);
 
@@ -1788,6 +1795,8 @@ pub fn open_temporary_storage_dialog(
         let _obs = observer.read(cx);
         let c_body = controller.clone();
         let err_state = action_error.clone();
+        let wrap_input = wrap_threshold_input.clone();
+        let wrap_status = wrap_threshold_status.clone();
         let anchor_el = anchor.clone();
         let anchor_close = anchor.clone();
 
@@ -1807,15 +1816,21 @@ pub fn open_temporary_storage_dialog(
                 let cache_enabled = c.index_cache_enabled();
                 let cache_clearing = c.cache_clear_running();
                 let cache_status = c.cache_clear_status().cloned();
+                let wrap_threshold_bytes = c.word_wrap_auto_disable_bytes();
+                let wrap_status_msg = wrap_status.read(cx).clone();
                 let local_err = err_state.read(cx).clone();
 
                 let c_choose = c_body.clone();
                 let c_reset = c_body.clone();
                 let c_cache_tog = c_body.clone();
                 let c_cache_clr = c_body.clone();
+                let c_wrap_apply = c_body.clone();
                 let err_choose = err_state.clone();
                 let err_reset = err_state.clone();
                 let err_cache = err_state.clone();
+                let err_wrap = err_state.clone();
+                let wrap_input_apply = wrap_input.clone();
+                let wrap_status_apply = wrap_status.clone();
 
                 let space_line = if checking {
                     "Checking temporary folder space…".to_owned()
@@ -1986,6 +2001,114 @@ pub fn open_temporary_storage_dialog(
                                                     cx.theme().muted_foreground
                                                 })
                                                 .child(text),
+                                        )
+                                    }),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .pt_1()
+                            .border_t_1()
+                            .border_color(cx.theme().border)
+                            .child(
+                                div()
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .child(format!(
+                                        "Adaptive word wrap auto-disable threshold (current: {})",
+                                        if wrap_threshold_bytes == 0 {
+                                            "Never auto-disable".to_owned()
+                                        } else {
+                                            format_decimal_mb(wrap_threshold_bytes)
+                                        }
+                                    )),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(12.))
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child("Files larger than this size auto-disable word wrap by default (0 disables auto-scale-back; default 300 MB)."),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        Input::new(&wrap_input)
+                                            .aria_label("Word wrap auto-disable threshold in MB")
+                                            .small()
+                                            .w(px(96.)),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(12.))
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child("MB"),
+                                    )
+                                    .child(
+                                        Button::new("storage-apply-wrap-threshold")
+                                            .label("Apply")
+                                            .small()
+                                            .on_click(move |_, _, cx| {
+                                                let raw = wrap_input_apply
+                                                    .read(cx)
+                                                    .value()
+                                                    .trim()
+                                                    .to_owned();
+                                                let parsed = raw.parse::<u64>();
+                                                match parsed {
+                                                    Ok(mb) if mb <= MAX_CONFIGURABLE_AUTO_DISABLE_MB => {
+                                                        let bytes = mb.saturating_mul(1_000_000);
+                                                        let res = c_wrap_apply.update(cx, |c, cx| {
+                                                            c.set_word_wrap_auto_disable_bytes(bytes, cx)
+                                                        });
+                                                        match res {
+                                                            Ok(()) => {
+                                                                err_wrap.update(cx, |e, cx| {
+                                                                    *e = None;
+                                                                    cx.notify();
+                                                                });
+                                                                wrap_status_apply.update(cx, |s, cx| {
+                                                                    *s = Some(if bytes == 0 {
+                                                                        "Saved: never auto-disable.".into()
+                                                                    } else {
+                                                                        format!(
+                                                                            "Saved: {}.",
+                                                                            format_decimal_mb(bytes)
+                                                                        )
+                                                                    });
+                                                                    cx.notify();
+                                                                });
+                                                            }
+                                                            Err(err) => {
+                                                                err_wrap.update(cx, |e, cx| {
+                                                                    *e = Some(err);
+                                                                    cx.notify();
+                                                                });
+                                                            }
+                                                        }
+                                                    }
+                                                    _ => {
+                                                        err_wrap.update(cx, |e, cx| {
+                                                            *e = Some(format!(
+                                                                "Enter a whole number of MB from 0 to {MAX_CONFIGURABLE_AUTO_DISABLE_MB}."
+                                                            ));
+                                                            cx.notify();
+                                                        });
+                                                    }
+                                                }
+                                            }),
+                                    )
+                                    .when_some(wrap_status_msg, |row, msg| {
+                                        row.child(
+                                            div()
+                                                .id("storage-wrap-threshold-status")
+                                                .text_size(px(12.))
+                                                .text_color(cx.theme().muted_foreground)
+                                                .child(msg),
                                         )
                                     }),
                             ),

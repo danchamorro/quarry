@@ -92,6 +92,7 @@ pub enum CommandId {
     InsertRows,
     InsertColumns,
     ShowAllWhitespace,
+    ToggleWordWrap,
     Columns,
     Filters,
     PauseResumeIndexing,
@@ -200,6 +201,7 @@ pub fn evaluate_command(command: CommandId, ctx: &CommandContext<'_>) -> Command
         | CommandId::CombineFiles
         | CommandId::JoinFiles
         | CommandId::ShowAllWhitespace
+        | CommandId::ToggleWordWrap
         | CommandId::Quit
         | CommandId::UserGuide
         | CommandId::ReportIssue => Some(CommandTarget::Application),
@@ -274,6 +276,7 @@ pub fn evaluate_command(command: CommandId, ctx: &CommandContext<'_>) -> Command
             | CommandId::Paste
             | CommandId::SelectAll
             | CommandId::ShowAllWhitespace
+            | CommandId::ToggleWordWrap
             | CommandId::Quit
             | CommandId::UserGuide
             | CommandId::ReportIssue => CommandResolution {
@@ -304,6 +307,7 @@ pub fn evaluate_command(command: CommandId, ctx: &CommandContext<'_>) -> Command
         | CommandId::Paste
         | CommandId::SelectAll
         | CommandId::ShowAllWhitespace
+        | CommandId::ToggleWordWrap
         | CommandId::Quit
         | CommandId::UserGuide
         | CommandId::ReportIssue => true,

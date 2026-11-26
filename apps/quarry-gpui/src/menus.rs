@@ -52,6 +52,7 @@ gpui_kit::actions!(
         PauseResumeIndexing,
         VerifySectionBoundary,
         ShowAllWhitespace,
+        ToggleWordWrap,
         ThemeSystem,
         ThemeLight,
         ThemeDark,
@@ -121,6 +122,7 @@ pub fn bind_shortcuts(cx: &mut App) {
         KeyBinding::new("cmd-b", ToggleBookmark, Some("QuarryWindow && !Input")),
         KeyBinding::new("cmd-]", NextBookmark, Some("QuarryWindow && !Input")),
         KeyBinding::new("cmd-[", PreviousBookmark, Some("QuarryWindow && !Input")),
+        KeyBinding::new("alt-z", ToggleWordWrap, Some("QuarryWindow && !Input")),
         KeyBinding::new("cmd-shift-]", NextTab, Some(QUARRY_KEY_CONTEXT)),
         KeyBinding::new("cmd-shift-[", PreviousTab, Some(QUARRY_KEY_CONTEXT)),
     ];
@@ -147,6 +149,7 @@ pub fn bind_shortcuts(cx: &mut App) {
         KeyBinding::new("ctrl-b", ToggleBookmark, Some("QuarryWindow && !Input")),
         KeyBinding::new("ctrl-]", NextBookmark, Some("QuarryWindow && !Input")),
         KeyBinding::new("ctrl-[", PreviousBookmark, Some("QuarryWindow && !Input")),
+        KeyBinding::new("alt-z", ToggleWordWrap, Some("QuarryWindow && !Input")),
         KeyBinding::new("ctrl-tab", NextTab, Some(QUARRY_KEY_CONTEXT)),
         KeyBinding::new("ctrl-shift-tab", PreviousTab, Some(QUARRY_KEY_CONTEXT)),
     ];
@@ -250,6 +253,7 @@ pub fn build_app_menus() -> Vec<Menu> {
             disabled: false,
             items: vec![
                 MenuItem::action("Show All Whitespace", ShowAllWhitespace),
+                MenuItem::action("Word Wrap", ToggleWordWrap),
                 MenuItem::separator(),
                 MenuItem::submenu(Menu {
                     name: "Theme".into(),
