@@ -344,3 +344,16 @@ Following owner sign-off after Phase 4B-3 cutover verification, the retired
 `packaging/licenses/manifest.json` was refreshed with `cargo-about 0.9.2` to
 record the updated `Cargo.toml`, `Cargo.lock`, workspace manifest list, and
 this audit entry.
+
+## 2026-11-25 Temporary `gpui-pre-macos` paravirtual display-link patch
+
+Following owner sign-off (`T19`), added a temporary `[patch.crates-io]` pin for
+`gpui-pre-macos@0.3.12` (`https://github.com/danchamorro/gpui-pre-macos.git`,
+rev `7e0297f71d5d6ee878b55cdd4616deb9a529df41`) to fall back to `CVDisplayLink`
+on Apple Silicon paravirtualized Metal devices (`Apple Paravirtual device`,
+tracking `zed-industries/zed#67295`). The patched crate preserves the exact
+`0.3.12` `Apache-2.0` license and upstream `LICENSE-APACHE` file, introduces
+zero new dependencies or license changes (`397` locked packages for
+`aarch64-apple-darwin`), and leaves `THIRD_PARTY_NOTICES.html` package/license
+coverage intact. `packaging/licenses/manifest.json` and `reviewed.sha256` were
+refreshed with checksum-verified `cargo-about 0.9.2`.
