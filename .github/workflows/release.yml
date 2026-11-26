@@ -197,6 +197,7 @@ jobs:
           APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
           APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
         run: |
+          cargo fetch --locked
           ./scripts/macos-app.sh release --tag "$TAG"
       - name: Upload signed macOS artifacts to Draft Release
         if: steps.signing.outputs.enabled == 'true'
