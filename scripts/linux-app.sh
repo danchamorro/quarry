@@ -505,17 +505,33 @@ PY
     QUARRY_SKIP_ARCH_CHECK=1 QUARRY_SKIP_LDD_CHECK=1 "$fake_bundle/install.sh" --prefix "$fail_prefix" >/dev/null
     [[ -x "$fail_prefix/bin/quarry-gpui" ]] || fail "self-test: retry after failed first install did not succeed"
 
-    # 9. Active installation lock blocks concurrent install and uninstall cleanly.
-    mkdir "$fail_prefix/share/.quarry-install.lock"
-    if QUARRY_SKIP_ARCH_CHECK=1 QUARRY_SKIP_LDD_CHECK=1 "$fake_bundle/install.sh" --prefix "$fail_prefix" >/dev/null 2>&1; then
-        rmdir "$fail_prefix/share/.quarry-install.lock" 2>/dev/null || true
-        fail "self-test: locked prefix should have blocked concurrent install"
+    # 9. Active installation lock blocks concurrent install/uninstall; stale fallback lock recovers cleanly.
+    if command -v flock >/dev/null 2>&1; then
+        (
+            exec 9>"$fail_prefix/share/.quarry-install.lock"
+            flock -n 9
+            if QUARRY_SKIP_ARCH_CHECK=1 QUARRY_SKIP_LDD_CHECK=1 "$fake_bundle/install.sh" --prefix "$fail_prefix" >/dev/null 2>&1; then
+                exit 1
+            fi
+            if "$fail_prefix/share/doc/quarry/uninstall.sh" >/dev/null 2>&1; then
+                exit 1
+            fi
+        ) || fail "self-test: active flock should have blocked concurrent install and uninstall"
+    else
+        mkdir "$fail_prefix/share/.quarry-install.lock.d"
+        printf '%s\n' "$$" > "$fail_prefix/share/.quarry-install.lock.d/pid"
+        if QUARRY_SKIP_ARCH_CHECK=1 QUARRY_SKIP_LDD_CHECK=1 "$fake_bundle/install.sh" --prefix "$fail_prefix" >/dev/null 2>&1; then
+            rm -rf "$fail_prefix/share/.quarry-install.lock.d"
+            fail "self-test: active PID lock should have blocked concurrent install"
+        fi
+        if "$fail_prefix/share/doc/quarry/uninstall.sh" >/dev/null 2>&1; then
+            rm -rf "$fail_prefix/share/.quarry-install.lock.d"
+            fail "self-test: active PID lock should have blocked concurrent uninstall"
+        fi
+        # Simulate a stale lock left by a SIGKILL'd process; install should recover automatically.
+        printf '999999\n' > "$fail_prefix/share/.quarry-install.lock.d/pid"
+        QUARRY_SKIP_ARCH_CHECK=1 QUARRY_SKIP_LDD_CHECK=1 "$fake_bundle/install.sh" --prefix "$fail_prefix" >/dev/null
     fi
-    if "$fail_prefix/share/doc/quarry/uninstall.sh" >/dev/null 2>&1; then
-        rmdir "$fail_prefix/share/.quarry-install.lock" 2>/dev/null || true
-        fail "self-test: locked prefix should have blocked concurrent uninstall"
-    fi
-    rmdir "$fail_prefix/share/.quarry-install.lock"
     "$fail_prefix/share/doc/quarry/uninstall.sh" >/dev/null
     [[ ! -e "$fail_prefix/bin/quarry-gpui" ]] || fail "self-test: uninstall after unlocking failed"
 

@@ -148,7 +148,8 @@ ICON_512_DIR="$DATA_DIR/icons/hicolor/512x512/apps"
 ICON_256_DIR="$DATA_DIR/icons/hicolor/256x256/apps"
 DOC_DIR="$DATA_DIR/doc/quarry"
 MANIFEST_FILE="$DOC_DIR/installed-files.txt"
-LOCK_DIR="$DATA_DIR/.quarry-install.lock"
+LOCK_PATH="$DATA_DIR/.quarry-install.lock"
+LOCK_MODE=""
 LOCK_HELD=0
 INSTALL_COMMITTED=0
 JOURNAL_WRITTEN=0
@@ -156,6 +157,39 @@ OLD_FILES=()
 CREATED_NEW_FILES=()
 DESKTOP_TMP=""
 MANIFEST_TMP=""
+
+acquire_install_lock() {
+    mkdir -p "$DATA_DIR"
+    if command -v flock >/dev/null 2>&1; then
+        exec 9>"$LOCK_PATH"
+        if ! flock -n 9; then
+            fail "another Quarry install or uninstall is currently in progress (lock: $LOCK_PATH)"
+        fi
+        LOCK_MODE="flock"
+        LOCK_HELD=1
+        return 0
+    fi
+
+    # Fallback for systems without flock (e.g. macOS self-tests): atomic lock dir
+    # with PID tracking and safe stale-lock recovery when the owning PID is dead.
+    local lock_dir="${LOCK_PATH}.d"
+    if ! mkdir "$lock_dir" 2>/dev/null; then
+        local owner_pid=""
+        if [[ -f "$lock_dir/pid" ]]; then
+            owner_pid="$(tr -d '[:space:]' < "$lock_dir/pid" 2>/dev/null || true)"
+        fi
+        if [[ "$owner_pid" =~ ^[0-9]+$ ]] && ! kill -0 "$owner_pid" 2>/dev/null; then
+            rm -f -- "$lock_dir/pid"
+            rmdir "$lock_dir" 2>/dev/null || true
+        fi
+        if ! mkdir "$lock_dir" 2>/dev/null; then
+            fail "another Quarry install or uninstall is currently in progress (lock: $lock_dir)"
+        fi
+    fi
+    printf '%s\n' "$$" > "$lock_dir/pid"
+    LOCK_MODE="dir"
+    LOCK_HELD=1
+}
 
 release_and_rollback_on_exit() {
     [[ -n "$DESKTOP_TMP" ]] && rm -f -- "$DESKTOP_TMP"
@@ -175,7 +209,12 @@ release_and_rollback_on_exit() {
         fi
     fi
     if [[ "$LOCK_HELD" -eq 1 ]]; then
-        rmdir "$LOCK_DIR" 2>/dev/null || true
+        if [[ "$LOCK_MODE" == "flock" ]]; then
+            exec 9>&- 2>/dev/null || true
+        elif [[ "$LOCK_MODE" == "dir" ]]; then
+            rm -f -- "${LOCK_PATH}.d/pid"
+            rmdir "${LOCK_PATH}.d" 2>/dev/null || true
+        fi
         LOCK_HELD=0
     fi
 }
@@ -200,11 +239,7 @@ validate_bundle_arch
 validate_linux_binaries
 
 # Acquire exclusive installation lock before reading the ownership manifest.
-mkdir -p "$DATA_DIR"
-if ! mkdir "$LOCK_DIR" 2>/dev/null; then
-    fail "another Quarry install or uninstall is currently in progress (lock: $LOCK_DIR)"
-fi
-LOCK_HELD=1
+acquire_install_lock
 
 # Build exact list of target files before writing anything.
 NEW_FILES=(

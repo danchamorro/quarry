@@ -67,20 +67,48 @@ if [[ ! -d "$DATA_DIR" ]]; then
     exit 0
 fi
 
-LOCK_DIR="$DATA_DIR/.quarry-install.lock"
+LOCK_PATH="$DATA_DIR/.quarry-install.lock"
+LOCK_MODE=""
 LOCK_HELD=0
 release_lock() {
     if [[ "$LOCK_HELD" -eq 1 ]]; then
-        rmdir "$LOCK_DIR" 2>/dev/null || true
+        if [[ "$LOCK_MODE" == "flock" ]]; then
+            exec 9>&- 2>/dev/null || true
+        elif [[ "$LOCK_MODE" == "dir" ]]; then
+            rm -f -- "${LOCK_PATH}.d/pid"
+            rmdir "${LOCK_PATH}.d" 2>/dev/null || true
+        fi
         LOCK_HELD=0
     fi
 }
 trap release_lock EXIT
 
-if ! mkdir "$LOCK_DIR" 2>/dev/null; then
-    fail "another Quarry install or uninstall is currently in progress (lock: $LOCK_DIR)"
+if command -v flock >/dev/null 2>&1; then
+    exec 9>"$LOCK_PATH"
+    if ! flock -n 9; then
+        fail "another Quarry install or uninstall is currently in progress (lock: $LOCK_PATH)"
+    fi
+    LOCK_MODE="flock"
+    LOCK_HELD=1
+else
+    lock_dir="${LOCK_PATH}.d"
+    if ! mkdir "$lock_dir" 2>/dev/null; then
+        owner_pid=""
+        if [[ -f "$lock_dir/pid" ]]; then
+            owner_pid="$(tr -d '[:space:]' < "$lock_dir/pid" 2>/dev/null || true)"
+        fi
+        if [[ "$owner_pid" =~ ^[0-9]+$ ]] && ! kill -0 "$owner_pid" 2>/dev/null; then
+            rm -f -- "$lock_dir/pid"
+            rmdir "$lock_dir" 2>/dev/null || true
+        fi
+        if ! mkdir "$lock_dir" 2>/dev/null; then
+            fail "another Quarry install or uninstall is currently in progress (lock: $lock_dir)"
+        fi
+    fi
+    printf '%s\n' "$$" > "$lock_dir/pid"
+    LOCK_MODE="dir"
+    LOCK_HELD=1
 fi
-LOCK_HELD=1
 
 MANIFEST_FILE="$DOC_DIR/installed-files.txt"
 if [[ ! -f "$MANIFEST_FILE" ]]; then
