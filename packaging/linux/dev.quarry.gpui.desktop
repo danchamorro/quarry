@@ -1,0 +1,15 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Quarry
+GenericName=Large CSV & Delimited File Editor
+Comment=GPU-accelerated editor for multi-gigabyte CSV, TSV, and delimited text files
+Exec=quarry-gpui %F
+TryExec=quarry-gpui
+Icon=dev.quarry.gpui
+Terminal=false
+Categories=Utility;Development;Office;TextEditor;
+Keywords=csv;tsv;delimited;table;spreadsheet;data;editor;large;
+MimeType=text/csv;text/tab-separated-values;text/x-comma-separated-values;text/plain;
+StartupNotify=true
+StartupWMClass=dev.quarry.gpui

@@ -68,10 +68,12 @@ jobs:
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "commit_sha=$HEAD_COMMIT" >> "$GITHUB_OUTPUT"
           echo "is_prerelease=$IS_PRE" >> "$GITHUB_OUTPUT"
-      - name: Verify reviewed macOS notice inventory
-        run: ./scripts/generate-notices.sh --release-check
-      - name: Verify release note extractor tests
-        run: python3 -B scripts/test_extract_release_notes.py
+      - name: Verify reviewed multi-target notice inventories
+        run: ./scripts/generate-notices.sh --release-check --all-targets
+      - name: Verify release note extractor and Linux packaging self-tests
+        run: |
+          python3 -B scripts/test_extract_release_notes.py
+          ./scripts/linux-app.sh self-test
       - name: Extract release notes from CHANGELOG.md
         env:
           TAG: ${{ steps.meta.outputs.tag }}
@@ -218,3 +220,61 @@ jobs:
             security delete-keychain "$QUARRY_RELEASE_KEYCHAIN" || true
           fi
           rm -f "${APPLE_API_KEY_PATH:-}" "$RUNNER_TEMP/developer-id.p12"
+
+  linux-release:
+    needs: draft-release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.draft-release.outputs.commit_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify checked-out commit matches release tag
+        env:
+          TAG: ${{ needs.draft-release.outputs.tag }}
+          EXPECTED_SHA: ${{ needs.draft-release.outputs.commit_sha }}
+        run: |
+          TAG_COMMIT="$(git rev-parse --verify "refs/tags/$TAG^{commit}")"
+          HEAD_COMMIT="$(git rev-parse --verify HEAD)"
+          if [[ "$HEAD_COMMIT" != "$EXPECTED_SHA" || "$TAG_COMMIT" != "$EXPECTED_SHA" ]]; then
+            echo "error: commit mismatch (HEAD=$HEAD_COMMIT, tag $TAG=$TAG_COMMIT, expected=$EXPECTED_SHA)" >&2
+            exit 1
+          fi
+      - name: Install Linux desktop build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config clang cmake \
+            libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libvulkan-dev libfontconfig1-dev libfreetype-dev \
+            libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
+      - uses: dtolnay/rust-toolchain@d5e4d57b030548f435d0befec15ff413a2c60eff # 1.100.0
+      - name: Build and package Linux release tarball
+        env:
+          TAG: ${{ needs.draft-release.outputs.tag }}
+        run: |
+          cargo fetch --locked
+          ./scripts/linux-app.sh self-test
+          ./scripts/linux-app.sh release --tag "$TAG"
+      - name: Upload Linux release artifacts to Draft Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.draft-release.outputs.tag }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          OUT="target/release-artifacts/$TAG"
+          gh release upload "$TAG" \
+            "$OUT/Quarry-$TAG-linux-$ARCH.tar.gz" \
+            "$OUT/SHA256SUMS-linux-$ARCH.txt" \
+            --clobber

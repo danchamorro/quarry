@@ -316,15 +316,15 @@ def format_release_notes(
     lines.append("\n---")
     lines.append("\n### Platform & Verification Notes")
     lines.append(
-        "- **macOS (Apple Silicon `arm64`):** Signed with Developer ID, Apple-notarized, and stapled (`.dmg` and `.zip`)."
+        "- **macOS (Apple Silicon `arm64`):** Signed with Developer ID, Apple-notarized, and stapled (`Quarry-<tag>-macos-arm64.dmg` and `.zip`). Open the `.dmg` and drag **Quarry** to **Applications**."
     )
     lines.append(
-        "- **Linux & Omarchy (`x86_64` / `arm64`):** Build from source via [`docs/LINUX_AND_OMARCHY.md`](https://github.com/"
+        "- **Linux & Omarchy (`x86_64` & `arm64`):** Download `Quarry-<tag>-linux-x86_64.tar.gz` (or `arm64`), extract, and run `./install.sh` (installs the desktop app, `quarry` CLI, app launcher entry, icon, and license notices into `~/.local` with no `sudo` or Rust required). See [`docs/LINUX_AND_OMARCHY.md`](https://github.com/"
         + repo
-        + f"/blob/{link_ref}/docs/LINUX_AND_OMARCHY.md) while multi-target Linux packaging completes for v1.0."
+        + f"/blob/{link_ref}/docs/LINUX_AND_OMARCHY.md)."
     )
     lines.append(
-        "- **Verify downloads:** Check `SHA256SUMS-macos-arm64.txt` with `shasum -a 256 -c SHA256SUMS-macos-arm64.txt`."
+        "- **Verify downloads:** Check `SHA256SUMS-macos-arm64.txt` (`shasum -a 256 -c`) or `SHA256SUMS-linux-*.txt` (`sha256sum -c`)."
     )
     if tag and previous_tag:
         lines.append(

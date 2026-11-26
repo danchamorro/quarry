@@ -15,6 +15,36 @@ Quarry runs natively on Linux (`x86_64` and `arm64`) and [Omarchy](https://omarc
 
 ---
 
+## Installing a Prebuilt Release (Recommended)
+
+Prebuilt Linux tarballs for **`x86_64`** (most desktops and laptops) and **`arm64`** (`aarch64`) are published on [GitHub Releases](https://github.com/danchamorro/quarry/releases) starting with `v0.2.0-beta.2`—no Rust toolchain or compiler required.
+
+1. Download `Quarry-<tag>-linux-x86_64.tar.gz` (or `arm64`) and `SHA256SUMS-linux-<arch>.txt`.
+2. Verify the checksum and run the included user installer:
+
+```bash
+sha256sum -c SHA256SUMS-linux-*.txt
+tar -xzf Quarry-*-linux-*.tar.gz
+cd Quarry-*-linux-*
+./install.sh
+```
+
+By default `./install.sh` installs cleanly into `~/.local` (no `sudo` needed; pass `--prefix /usr/local` for a system-wide install):
+
+- Desktop app: `~/.local/bin/quarry-gpui`
+- Headless CLI: `~/.local/bin/quarry`
+- App launcher entry: `~/.local/share/applications/dev.quarry.gpui.desktop` (appears as **Quarry** in Omarchy's app launcher / Walker and *"Open With"* for `.csv`/`.tsv`)
+- App icon: `~/.local/share/icons/hicolor/512x512/apps/dev.quarry.gpui.png`
+- Licenses & third-party notices: `~/.local/share/doc/quarry/`
+
+`install.sh` also checks `ldd` for missing runtime shared libraries and warns with the exact `pacman`/`apt` command if anything is absent on a minimal system. To uninstall cleanly (preserving `~/.config/quarry`), run:
+
+```bash
+~/.local/share/doc/quarry/uninstall.sh
+```
+
+---
+
 ## Building from Source
 
 Quarry pins its Rust toolchain in [`rust-toolchain.toml`](../rust-toolchain.toml) (currently **Rust `1.100.0`**).
@@ -38,32 +68,26 @@ sudo apt-get update
 sudo apt-get install -y build-essential pkg-config clang cmake \
   libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev \
   libvulkan-dev libfontconfig1-dev libfreetype-dev \
-  libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
-  libssl-dev
+  libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
 ```
 
-*(Note: Quarry itself does not link OpenSSL/TLS into its shipping app; install a Vulkan driver for your GPU or `mesa` / `vulkan-swrast` in virtual machines.)*
+*(Install a Vulkan driver for your GPU or `mesa` / `vulkan-swrast` in virtual machines.)*
 
-### 2. Build & Run
+### 2. Build & Install Locally
+
+Build and install the desktop app, CLI, `.desktop` launcher, icon, and license notices into `~/.local`:
 
 ```bash
 git clone https://github.com/danchamorro/quarry.git
 cd quarry
+./scripts/linux-app.sh install
+```
+
+Or run directly from the build tree without installing:
+
+```bash
 cargo build --release -p quarry-gpui --locked
-./target/release/quarry-gpui
-```
-
-Open one or more files directly from the command line:
-
-```bash
-./target/release/quarry-gpui /path/to/data.csv /path/to/lookup.tsv
-```
-
-Build the headless CLI as well:
-
-```bash
-cargo build --release -p quarry-cli --locked
-./target/release/quarry --help
+./target/release/quarry-gpui /path/to/data.csv
 ```
 
 ---
@@ -110,4 +134,4 @@ Quarry uses `Ctrl` on Linux where macOS uses `Command`:
 - **AT-SPI:** Quarry exposes its window, grid, toolbar, dialogs, status badges, and live announcements through `accesskit_unix` over the session AT-SPI bus.
 - **Wayland vs XWayland:** On Hyprland and other Wayland compositors, Quarry runs natively on Wayland without XWayland. You can confirm this on Hyprland with `hyprctl clients -j` (`"xwayland": false` for class `dev.quarry.gpui`).
 - **Software Vulkan in VMs:** Inside headless or virtualized Linux guests without a passthrough GPU, Mesa's `llvmpipe` Vulkan ICD works out of the box (though frame pacing reflects software rendering rather than hardware GPU performance).
-- **Prebuilt Linux packages:** Prebuilt Linux packages are planned for v1.0 after cross-platform packaging and bare-metal verification complete ([Roadmap](ROADMAP.md), [v1.0 Claim Ledger](V1_CLAIM_LEDGER.md)). Building from source is currently the supported way to run Quarry on Linux and Omarchy.
+- **Prebuilt Linux tarballs:** Prebuilt `x86_64` and `arm64` `.tar.gz` bundles with audited third-party notices and desktop integration are built in CI and attached to GitHub Releases; additional distro-native packages (such as Flatpak/AppImage/AUR) are tracked for v1.0 ([Roadmap](ROADMAP.md), [v1.0 Claim Ledger](V1_CLAIM_LEDGER.md)).

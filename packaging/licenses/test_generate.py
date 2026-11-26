@@ -35,6 +35,12 @@ class NoticeChecks(unittest.TestCase):
             "packaging/licenses/manifest.json",
             "packaging/licenses/reviewed.sha256",
             "packaging/licenses/THIRD_PARTY_NOTICES.html",
+            "packaging/licenses/targets/x86_64-unknown-linux-gnu/manifest.json",
+            "packaging/licenses/targets/x86_64-unknown-linux-gnu/reviewed.sha256",
+            "packaging/licenses/targets/x86_64-unknown-linux-gnu/THIRD_PARTY_NOTICES.html",
+            "packaging/licenses/targets/aarch64-unknown-linux-gnu/manifest.json",
+            "packaging/licenses/targets/aarch64-unknown-linux-gnu/reviewed.sha256",
+            "packaging/licenses/targets/aarch64-unknown-linux-gnu/THIRD_PARTY_NOTICES.html",
         ]
         for relative in files:
             destination = self.root / relative
@@ -53,9 +59,20 @@ class NoticeChecks(unittest.TestCase):
 
     def test_current_inventory_passes_offline(self):
         env = dict(os.environ, CARGO_HOME=str(self.root / "empty-cargo-cache"))
-        result = self.run_check("--check", "--target", "aarch64-apple-darwin", env=env)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("Review is checked separately", result.stdout)
+        for target in (
+            "aarch64-apple-darwin",
+            "x86_64-unknown-linux-gnu",
+            "aarch64-unknown-linux-gnu",
+        ):
+            with self.subTest(target=target):
+                result = self.run_check("--check", "--target", target, env=env)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("Review is checked separately", result.stdout)
+        all_res = self.run_check("--release-check", "--all-targets", env=env)
+        self.assertEqual(all_res.returncode, 0, all_res.stderr)
+        self.assertIn("aarch64-apple-darwin", all_res.stdout)
+        self.assertIn("x86_64-unknown-linux-gnu", all_res.stdout)
+        self.assertIn("aarch64-unknown-linux-gnu", all_res.stdout)
 
     def test_dependency_input_change_rejects_stale_inventory(self):
         for relative in ("Cargo.lock", "apps/quarry-gpui/Cargo.toml"):
