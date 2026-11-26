@@ -678,6 +678,9 @@ fn count_encoded_record_fields(
     } else {
         record
     };
+    // `record` is already a single structurally validated record (ending at EOF, `\n`, or `\r\n`).
+    // Scan every byte/code-unit without stopping at bare `\r` (which is valid unquoted field data)
+    // so unquoted delimiters after a bare CR are counted identically to `StructuralScanner`.
     if !encoding.is_utf16() {
         let mut fields = 1usize;
         let mut in_quotes = false;
@@ -686,8 +689,6 @@ fn count_encoded_record_fields(
                 in_quotes = !in_quotes;
             } else if !in_quotes && byte == delimiter {
                 fields = fields.saturating_add(1);
-            } else if !in_quotes && (byte == b'\r' || byte == b'\n') {
-                break;
             }
         }
         fields
@@ -696,8 +697,6 @@ fn count_encoded_record_fields(
         let mut in_quotes = false;
         let delim = u16::from(delimiter);
         let quote = u16::from(b'"');
-        let cr = u16::from(b'\r');
-        let lf = u16::from(b'\n');
         for &pair in body.as_chunks::<2>().0 {
             let unit = match encoding {
                 Encoding::Utf16Le => u16::from_le_bytes(pair),
@@ -708,8 +707,6 @@ fn count_encoded_record_fields(
                 in_quotes = !in_quotes;
             } else if !in_quotes && unit == delim {
                 fields = fields.saturating_add(1);
-            } else if !in_quotes && (unit == cr || unit == lf) {
-                break;
             }
         }
         fields
@@ -3654,5 +3651,54 @@ mod tests {
         let stopped = watch.stop().unwrap();
         assert_eq!(stopped.final_status, WatchStatus::Stopped);
         assert_eq!(stopped.index.maximum_width(), 1024 * 1024 + 1);
+    }
+
+    #[test]
+    fn counts_delimiters_after_bare_carriage_returns_in_utf8_and_utf16() {
+        // Direct unit check on UTF-8 and UTF-16LE records with bare CR inside unquoted fields.
+        assert_eq!(
+            count_encoded_record_fields(b"x\ry,z,q\n", b',', false, Encoding::Utf8),
+            3
+        );
+        let utf16le: Vec<u8> = "x\ry,z,q\n"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        assert_eq!(
+            count_encoded_record_fields(&utf16le, b',', false, Encoding::Utf16Le),
+            3
+        );
+
+        // End-to-end watch parity check against a 2-column baseline.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bare_cr.csv");
+        std::fs::write(&path, b"a,b\n1,2\n").unwrap();
+
+        let (session, index) = open_and_index(&path, Some(Encoding::Utf8), HeaderMode::FirstRow);
+        let watch = session
+            .start_live_watch(
+                &index,
+                None,
+                WatchConfig {
+                    poll_interval: Duration::from_millis(15),
+                    cache_config: IndexCacheConfig::disabled(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        let mut f = FsOpenOptions::new().append(true).open(&path).unwrap();
+        f.write_all(b"x\ry,z,q\n").unwrap();
+        f.flush().unwrap();
+        watch.nudge();
+
+        assert!(wait_until(Duration::from_secs(2), || {
+            watch.snapshot().committed_rows == 3
+        }));
+        assert_eq!(watch.snapshot().maximum_width, 3);
+
+        let stopped = watch.stop().unwrap();
+        assert_eq!(stopped.final_status, WatchStatus::Stopped);
+        assert_eq!(stopped.index.maximum_width(), 3);
     }
 }
