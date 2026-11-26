@@ -8,6 +8,13 @@ Tagged beta releases are noted on the day they were published, with exact
 checksums and verification details under `docs/releases/`. Numbers in
 parentheses are GitHub pull requests.
 
+## [2026-11-26]
+
+### Added
+
+- Added opt-in adaptive word wrap for grid cells via **View → Word Wrap**, `Option+Z` (macOS) / `Alt+Z` (Linux), and the toolbar **Wrap** toggle, displaying up to two wrapped lines per row while preserving top-row scroll position and bounded frame budgets. (#221)
+- Added a configurable word-wrap auto-disable file-size threshold (default `300 MB`, with one-click per-tab override) under **File → Temporary Storage…** that persists across restarts. (#221)
+
 ## [2026-11-25]
 
 ### Added
