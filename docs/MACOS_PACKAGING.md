@@ -230,6 +230,20 @@ license resources. Run `./scripts/macos-app.sh verify` as an additional check
 only when the restored bundle includes all current required license resources;
 its stricter current-package contract still applies to new builds.
 
+## Cutting a milestone release
+
+Milestone pre-releases (such as `v0.2.0-beta.1`) use `.github/workflows/release.yml` together with `scripts/extract-release-notes.py` and `./scripts/macos-app.sh release`:
+
+1. **Tag a clean `main` commit** (e.g. `git tag -a v0.2.0-beta.1 -m "Quarry 0.2.0-beta.1"` and push the tag). `.github/workflows/release.yml` verifies the reviewed notice inventory (`--release-check`), generates release notes directly from `CHANGELOG.md` via `scripts/extract-release-notes.py`, and creates a **Draft** GitHub Release (never auto-publishing).
+2. **Sign, notarize, and staple Apple Silicon artifacts:**
+   - **Local Keychain mode (default):** Run from clean `main`:
+     ```bash
+     ./scripts/macos-app.sh release --tag v0.2.0-beta.1
+     ```
+     This validates clean Git status and `--release-check`, builds `Quarry.app`, signs it with Developer ID (`--options runtime --timestamp`), submits to Apple notarization via the Keychain `quarry-notary` profile, staples and Gatekeeper-validates the `.app`, creates a verified `Quarry-<tag>-macos-arm64.zip` and a signed/notarized/stapled `Quarry-<tag>-macos-arm64.dmg`, and writes `SHA256SUMS-macos-arm64.txt` + `release-manifest.json` under `target/release-artifacts/<tag>/`.
+   - **CI signing mode (optional):** When the GitHub `release` environment defines `MACOS_DEVELOPER_ID_P12_BASE64`, `MACOS_DEVELOPER_ID_P12_PASSWORD`, `APPLE_API_KEY_P8_BASE64`, `APPLE_API_KEY_ID`, and `APPLE_API_ISSUER_ID`, `.github/workflows/release.yml` runs `./scripts/macos-app.sh release` automatically and uploads the signed `.dmg`, `.zip`, and `SHA256SUMS` to the Draft Release.
+3. **Verify quarantined download in a macOS VM** (checksum, `spctl`, `stapler validate`, launch, smoke test), upload verified local artifacts to the Draft Release with `gh release upload <tag> ... --clobber` if built locally, and publish the release explicitly.
+
 ## Signing limitation
 
 The packaging script still produces an ad-hoc signature. The signature detects

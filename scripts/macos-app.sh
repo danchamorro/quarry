@@ -25,6 +25,7 @@ INSTALL_REPLACED=false
 INSTALL_COMMITTED=false
 BACKUP_TEMP=""
 BACKUP_VERIFY_DIR=""
+RELEASE_STAGE=""
 LICENSE_RESOURCES=(LICENSE-MIT LICENSE-APACHE THIRD_PARTY_NOTICES.html
     Rust/COPYRIGHT-library.html Rust/COPYRIGHT-backtrace.html
     Rust/LICENSE-MIT Rust/LICENSE-APACHE Rust/Unicode-3.0.txt
@@ -409,7 +410,197 @@ cleanup() {
     case "$BACKUP_TEMP" in
         "$BACKUP_DIR"/*.tmp.*) /bin/rm -f "$BACKUP_TEMP" ;;
     esac
+    case "$RELEASE_STAGE" in
+        "$ROOT"/target/.quarry-release.*) /bin/rm -rf "$RELEASE_STAGE" ;;
+    esac
     return "$status"
+}
+
+discover_developer_id() {
+    local matches count
+    if [[ -n "${QUARRY_SIGN_IDENTITY:-}" ]]; then
+        printf '%s\n' "$QUARRY_SIGN_IDENTITY"
+        return 0
+    fi
+    matches="$(/usr/bin/security find-identity -v -p codesigning | /usr/bin/sed -n 's/.*"\(Developer ID Application: [^"]*\)".*/\1/p')"
+    count="$(printf '%s\n' "$matches" | /usr/bin/sed '/^$/d' | /usr/bin/wc -l | /usr/bin/tr -d ' ')"
+    if [[ "$count" -eq 0 ]]; then
+        fail "no valid 'Developer ID Application' signing identity found in Keychain (set --identity or QUARRY_SIGN_IDENTITY)."
+    fi
+    if [[ "$count" -gt 1 ]]; then
+        fail "multiple 'Developer ID Application' identities found; specify one with --identity or QUARRY_SIGN_IDENTITY."
+    fi
+    printf '%s\n' "$matches"
+}
+
+submit_for_notarization() {
+    local artifact="$1"
+    local notary_profile="$2"
+    local log_path="$3"
+    local submit_args=(submit "$artifact" --wait --output-format json)
+
+    if [[ -n "${APPLE_API_KEY_PATH:-}" && -n "${APPLE_API_KEY_ID:-}" && -n "${APPLE_API_ISSUER_ID:-}" ]]; then
+        submit_args+=(--key "$APPLE_API_KEY_PATH" --key-id "$APPLE_API_KEY_ID" --issuer "$APPLE_API_ISSUER_ID")
+    elif [[ -n "${APPLE_ID:-}" && -n "${APPLE_TEAM_ID:-}" && -n "${APPLE_APP_PASSWORD:-}" ]]; then
+        submit_args+=(--apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD")
+    else
+        submit_args+=(--keychain-profile "$notary_profile")
+    fi
+
+    /usr/bin/xcrun notarytool "${submit_args[@]}" > "$log_path"
+    python3 - "$log_path" <<'PY'
+import json, sys
+data = json.load(open(sys.argv[1], encoding="utf-8"))
+status = data.get("status")
+sub_id = data.get("id", "<unknown>")
+print(f"Notarization submission {sub_id}: {status}")
+if status != "Accepted":
+    sys.exit(f"error: notarization failed with status {status!r} (see {sys.argv[1]})")
+PY
+}
+
+release_app() {
+    local tag="" identity="" notary_profile="${QUARRY_NOTARY_PROFILE:-quarry-notary}" out_dir=""
+    local version build revision arch source_status app_stage app submit_zip dmg_stage
+    local final_zip final_dmg verify_extract sums_file manifest_file
+
+    while [[ "$#" -gt 0 ]]; do
+        case "$1" in
+            --tag)
+                [[ "$#" -ge 2 ]] || fail "--tag requires a value."
+                tag="$2"
+                shift 2
+                ;;
+            --identity)
+                [[ "$#" -ge 2 ]] || fail "--identity requires a value."
+                identity="$2"
+                shift 2
+                ;;
+            --notary-profile)
+                [[ "$#" -ge 2 ]] || fail "--notary-profile requires a value."
+                notary_profile="$2"
+                shift 2
+                ;;
+            --out-dir)
+                [[ "$#" -ge 2 ]] || fail "--out-dir requires a value."
+                out_dir="$2"
+                shift 2
+                ;;
+            *)
+                fail "unknown release option: $1"
+                ;;
+        esac
+    done
+
+    for cmd in hdiutil security shasum spctl xcrun; do
+        command -v "$cmd" >/dev/null || fail "required release command is unavailable: $cmd"
+    done
+
+    if [[ -n "$(git -C "$ROOT" status --porcelain --untracked-files=normal)" ]]; then
+        fail "release packaging requires a clean Git working tree."
+    fi
+    "$ROOT/scripts/generate-notices.sh" --release-check
+
+    if [[ -z "$identity" ]]; then
+        identity="$(discover_developer_id)"
+    fi
+
+    package_app
+
+    version="$(plist_value CFBundleShortVersionString "$PACKAGE_APP/Contents/Info.plist")"
+    build="$(plist_value CFBundleVersion "$PACKAGE_APP/Contents/Info.plist")"
+    revision="$(plist_value QuarryGitRevision "$PACKAGE_APP/Contents/Info.plist")"
+    arch="$(plist_value QuarryArchitecture "$PACKAGE_APP/Contents/Info.plist")"
+    source_status="$(plist_value QuarrySourceStatus "$PACKAGE_APP/Contents/Info.plist")"
+    [[ "$source_status" == clean ]] || fail "release candidate must have QuarrySourceStatus=clean (got: $source_status)."
+
+    if [[ -z "$tag" ]]; then
+        tag="v$version"
+    fi
+    [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] \
+        || fail "release tag must match vX.Y.Z or vX.Y.Z-prerelease: $tag"
+    if [[ -z "$out_dir" ]]; then
+        out_dir="$ROOT/target/release-artifacts/$tag"
+    fi
+
+    /bin/mkdir -p "$out_dir"
+    RELEASE_STAGE="$(mktemp -d "$ROOT/target/.quarry-release.XXXXXX")"
+    app_stage="$RELEASE_STAGE/app"
+    app="$app_stage/$APP_NAME.app"
+    submit_zip="$RELEASE_STAGE/$APP_NAME-notarization.zip"
+    dmg_stage="$RELEASE_STAGE/dmg-root"
+    verify_extract="$RELEASE_STAGE/verify-zip"
+    final_zip="$out_dir/$APP_NAME-$tag-macos-$arch.zip"
+    final_dmg="$out_dir/$APP_NAME-$tag-macos-$arch.dmg"
+    sums_file="$out_dir/SHA256SUMS-macos-$arch.txt"
+    manifest_file="$out_dir/release-manifest.json"
+
+    /bin/mkdir -p "$app_stage" "$dmg_stage" "$verify_extract"
+    /usr/bin/ditto "$PACKAGE_APP" "$app"
+
+    printf 'Signing %s with %s\n' "$app" "$identity"
+    /usr/bin/codesign --force --deep --options runtime --timestamp --sign "$identity" "$app"
+    verify_app "$app" || fail "Developer ID signed app verification failed."
+
+    printf 'Submitting %s for Apple notarization...\n' "$APP_NAME.app"
+    /usr/bin/ditto -c -k --sequesterRsrc --keepParent "$app" "$submit_zip"
+    submit_for_notarization "$submit_zip" "$notary_profile" "$out_dir/notarization-app.json"
+
+    /usr/bin/xcrun stapler staple "$app"
+    /usr/bin/xcrun stapler validate "$app"
+    /usr/sbin/spctl --assess --type execute --verbose=2 "$app"
+
+    # Repack stapled .app into final release ZIP and verify extraction round-trip.
+    /bin/rm -f "$final_zip"
+    /usr/bin/ditto -c -k --sequesterRsrc --keepParent "$app" "$final_zip"
+    /usr/bin/ditto -x -k "$final_zip" "$verify_extract"
+    verify_app "$verify_extract/$APP_NAME.app" || fail "extracted release ZIP verification failed."
+    /usr/bin/xcrun stapler validate "$verify_extract/$APP_NAME.app"
+
+    # Build, Developer ID sign, notarize, and staple the release DMG.
+    /usr/bin/ditto "$app" "$dmg_stage/$APP_NAME.app"
+    /bin/ln -s /Applications "$dmg_stage/Applications"
+    /bin/rm -f "$final_dmg"
+    /usr/bin/hdiutil create -volname "$APP_NAME" -srcfolder "$dmg_stage" -ov -format UDZO "$final_dmg" >/dev/null
+    /usr/bin/codesign --force --timestamp --sign "$identity" "$final_dmg"
+    /usr/bin/codesign --verify --verbose=2 "$final_dmg"
+
+    printf 'Submitting %s for Apple notarization...\n' "$(basename "$final_dmg")"
+    submit_for_notarization "$final_dmg" "$notary_profile" "$out_dir/notarization-dmg.json"
+    /usr/bin/xcrun stapler staple "$final_dmg"
+    /usr/bin/xcrun stapler validate "$final_dmg"
+
+    (
+        cd "$out_dir"
+        /usr/bin/shasum -a 256 "$(basename "$final_dmg")" "$(basename "$final_zip")" > "$sums_file"
+    )
+    python3 - "$manifest_file" "$tag" "$version" "$build" "$revision" "$arch" "$final_dmg" "$final_zip" <<'PY'
+import hashlib, json, pathlib, sys
+manifest_path, tag, version, build, rev, arch, dmg_p, zip_p = sys.argv[1:]
+def info(p):
+    path = pathlib.Path(p)
+    data = path.read_bytes()
+    return {
+        "file": path.name,
+        "bytes": len(data),
+        "sha256": hashlib.sha256(data).hexdigest(),
+    }
+payload = {
+    "tag": tag,
+    "version": version,
+    "build": build,
+    "git_revision": rev,
+    "architecture": arch,
+    "artifacts": [info(dmg_p), info(zip_p)],
+}
+pathlib.Path(manifest_path).write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+print(json.dumps(payload, indent=2))
+PY
+
+    /bin/rm -rf "$RELEASE_STAGE"
+    RELEASE_STAGE=""
+    printf 'Release artifacts ready in %s\n' "$out_dir"
+    /bin/cat "$sums_file"
 }
 
 make_test_signed_app() {
@@ -563,7 +754,7 @@ self_test_licenses() {
 }
 
 usage() {
-    printf 'Usage: %s package|install|rollback [archive-path]|verify [app-path]|self-test\n' "$0"
+    printf 'Usage: %s package|install|release [--tag vX.Y.Z] [--identity ID] [--notary-profile NAME] [--out-dir DIR]|rollback [archive-path]|verify [app-path]|self-test\n' "$0"
 }
 
 trap cleanup EXIT
@@ -572,7 +763,7 @@ trap 'exit 143' TERM
 
 require_macos
 case "${1:-package}" in
-    package | install | rollback) run_with_lock "$@" ;;
+    package | install | release | rollback) run_with_lock "$@" ;;
 esac
 case "${1:-package}" in
     package)
@@ -582,6 +773,10 @@ case "${1:-package}" in
     install)
         [[ "$#" -eq 1 ]] || { usage >&2; exit 2; }
         install_app
+        ;;
+    release)
+        shift
+        release_app "$@"
         ;;
     rollback)
         [[ "$#" -le 2 ]] || { usage >&2; exit 2; }
@@ -597,6 +792,7 @@ case "${1:-package}" in
         self_test_rollback
         self_test_licenses
         python3 "$ROOT/packaging/licenses/test_generate.py"
+        python3 "$ROOT/scripts/test_extract_release_notes.py"
         ;;
     *)
         usage >&2

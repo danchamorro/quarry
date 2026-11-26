@@ -1,9 +1,9 @@
 {
-  "artifact_sha256": "d5725cc6d1441c7af4611db563b0e34b4d29288bcc5acc272b4f8d001154e7f9",
+  "artifact_sha256": "258d48a10581c6804777a6cd64f453dbb81806bfe81f714430f618ebc173e502",
   "cargo_about_version": "0.9.2",
   "inputs": {
-    "Cargo.lock": "6e405c5be6e30e1e2b1a62874f3cd05a591ae46e32b89cdd38499721b07a0b17",
-    "Cargo.toml": "8092d8b0be003d9a4df0b583da6b054e23b1a05c2e1ed5d7d27a6a2c89a7ede0",
+    "Cargo.lock": "f8715a509cc2c2b15eb068f530eaf24be00aab58c7072bac0227dccce10c12e7",
+    "Cargo.toml": "d17bd0bdce649ebfc44373b61d3438ea26ed52b93a7ce6596b8d9fc036bff09c",
     "LICENSE-APACHE": "e7092afa91dcebd506f0f1174ab4ab938df63f906df74df2aa2e1ea66e7e0f52",
     "LICENSE-MIT": "3641f379cac8e0f6903292982d0617f3cb6193271fdf74b06f2e01f25e23d70f",
     "apps/quarry-appkit/Cargo.toml": "9a123247711d0e7f97da51fae0bb44d1be9bd33b183b980558eb57c89dbd418c",
