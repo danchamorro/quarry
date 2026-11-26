@@ -1449,6 +1449,10 @@ impl WorkbenchController {
             true
         };
         if changed {
+            if follow {
+                let entry = self.viewport_read_seq.entry(id).or_insert(0);
+                *entry = entry.wrapping_add(1);
+            }
             let text = if follow {
                 "Following live tail.".to_owned()
             } else {

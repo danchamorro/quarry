@@ -2441,10 +2441,19 @@ impl Document {
         self.progress.bytes_read = snap.observed_file_len;
         self.progress.file_size = snap.observed_file_len;
         self.progress.columns_found = snap.maximum_width;
+        let initial_committed_rows = snap.committed_rows;
         self.live_watch_last_generation = snap.generation;
         self.live_watch_last_ui_sync = Instant::now() - WATCH_REPAINT_THROTTLE;
         self.live_watch_snapshot = Some(snap);
-        self.live_watch_header_row = None;
+        self.live_watch_header_row =
+            if self.session.dialect.has_header && initial_committed_rows > 0 {
+                job.read_rows(0, 1).ok().and_then(|mut rows| rows.pop())
+            } else {
+                None
+            };
+        if self.live_watch_header_row.is_some() {
+            self.refresh_column_headers();
+        }
         self.live_watch_alert = None;
         self.live_watch_tail_follow = true;
         self.live_watch = Some(job);
@@ -2674,7 +2683,10 @@ impl Document {
         self.progress.bytes_read = snap.observed_file_len;
         self.progress.file_size = snap.observed_file_len;
         self.progress.columns_found = snap.maximum_width;
-        if self.session.dialect.has_header && prev_rows == 0 && snap.committed_rows > 0 {
+        if self.session.dialect.has_header
+            && self.live_watch_header_row.is_none()
+            && snap.committed_rows > 0
+        {
             if let Ok(mut rows) = job.read_rows(0, 1) {
                 self.live_watch_header_row = rows.pop();
             }
@@ -3334,7 +3346,31 @@ impl Document {
                     if matches!(error, QuarryError::SourceChanged) {
                         self.invalidate_changed_source();
                     }
-                    self.filter_progress = None;
+                    // Keep `filter_query`, `filter_index`, and the watcher's live filter aligned
+                    // when a replacement attachment fails instead of leaving the failed query
+                    // paired with the previous filter's index.
+                    if let Some(existing) = self
+                        .live_watch
+                        .as_ref()
+                        .and_then(LiveWatchJob::filter_index_snapshot)
+                    {
+                        let matches = existing.matches_found();
+                        self.filter_query = Some(existing.query().clone());
+                        self.filter_index = Some(existing);
+                        self.filter_progress = Some(FilterProgress {
+                            bytes_scanned: self.progress.bytes_scanned,
+                            rows_scanned: self.progress.rows_scanned,
+                            matches_found: matches,
+                            file_size: self.progress.file_size,
+                            elapsed: Duration::ZERO,
+                            done: true,
+                            cancelled: false,
+                        });
+                    } else {
+                        self.filter_query = None;
+                        self.filter_index = None;
+                        self.filter_progress = None;
+                    }
                     self.filter_status = Some("Filter failed.".into());
                     return Err(self.diagnostic_error(error));
                 }

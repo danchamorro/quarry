@@ -414,6 +414,14 @@ impl FilterIndex {
         let mut match_ordinal = plan.checkpoint.match_ordinal;
         let mut record = Vec::new();
         let mut rows = Vec::with_capacity(plan.result_capacity);
+        let max_column = plan
+            .query
+            .predicates
+            .iter()
+            .map(|predicate| predicate.column)
+            .max()
+            .unwrap_or(0);
+        let mut field_ranges = Vec::new();
 
         while match_ordinal < plan.target_end {
             let remaining = committed_end.saturating_sub(absolute_start);
@@ -449,7 +457,10 @@ impl FilterIndex {
                             limit: max_record_bytes,
                         });
                     } else {
-                        match matching_fields_with_edits_bounded(
+                        // Evaluate predicates without materializing all fields so non-matching
+                        // wide rows never fail a filtered page; apply the field cap only when
+                        // materializing a matching row for the requested output window.
+                        match record_matches_fast(
                             &record,
                             delimiter,
                             row_number,
@@ -457,25 +468,47 @@ impl FilterIndex {
                             &plan.query,
                             &matchers,
                             &groups,
+                            max_column,
                             &plan.edits,
                             encoding,
-                            Some(crate::MAX_TRANSFORMATION_COLUMNS),
+                            &mut field_ranges,
                         ) {
-                            Ok(Some(fields)) => {
+                            Ok(true) => {
                                 if match_ordinal >= plan.start_match {
-                                    rows.push(FilterMatch {
-                                        match_ordinal,
-                                        row: row_number,
-                                        record_offset: record_start,
-                                        fields: fields
-                                            .into_iter()
-                                            .map(|field| field.into_owned())
-                                            .collect(),
-                                    });
+                                    match parse_encoded_record_with_bom_and_field_limit(
+                                        &record,
+                                        delimiter,
+                                        row_number,
+                                        record_start == 0,
+                                        encoding,
+                                        crate::MAX_TRANSFORMATION_COLUMNS,
+                                    ) {
+                                        Ok(fields) => {
+                                            let mut owned: Vec<Vec<u8>> = fields
+                                                .into_iter()
+                                                .map(|field| field.into_owned())
+                                                .collect();
+                                            for ((_, col), value) in plan
+                                                .edits
+                                                .range((row_number, 0)..=(row_number, usize::MAX))
+                                            {
+                                                if let Some(slot) = owned.get_mut(*col) {
+                                                    *slot = value.to_vec();
+                                                }
+                                            }
+                                            rows.push(FilterMatch {
+                                                match_ordinal,
+                                                row: row_number,
+                                                record_offset: record_start,
+                                                fields: owned,
+                                            });
+                                        }
+                                        Err(error) => deferred_error = Some(error),
+                                    }
                                 }
                                 match_ordinal += 1;
                             }
-                            Ok(None) => {}
+                            Ok(false) => {}
                             Err(error) => deferred_error = Some(error),
                         }
                     }
@@ -1284,46 +1317,8 @@ pub(crate) fn matching_fields_with_edits<'a>(
     edits: &FilterEdits,
     encoding: Encoding,
 ) -> Result<Option<Vec<Cow<'a, [u8]>>>, QuarryError> {
-    matching_fields_with_edits_bounded(
-        record,
-        delimiter,
-        physical_row,
-        strip_bom,
-        query,
-        matchers,
-        groups,
-        edits,
-        encoding,
-        None,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn matching_fields_with_edits_bounded<'a>(
-    record: &'a [u8],
-    delimiter: u8,
-    physical_row: u64,
-    strip_bom: bool,
-    query: &FilterQuery,
-    matchers: &[PredicateMatcher<'_>],
-    groups: &[Vec<usize>],
-    edits: &FilterEdits,
-    encoding: Encoding,
-    max_fields: Option<usize>,
-) -> Result<Option<Vec<Cow<'a, [u8]>>>, QuarryError> {
-    let fields = match max_fields {
-        Some(limit) => parse_encoded_record_with_bom_and_field_limit(
-            record,
-            delimiter,
-            physical_row,
-            strip_bom,
-            encoding,
-            limit,
-        )?,
-        None => {
-            parse_encoded_record_with_bom(record, delimiter, physical_row, strip_bom, encoding)?
-        }
-    };
+    let fields =
+        parse_encoded_record_with_bom(record, delimiter, physical_row, strip_bom, encoding)?;
     if edits
         .range((physical_row, 0)..=(physical_row, usize::MAX))
         .next_back()

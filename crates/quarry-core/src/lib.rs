@@ -1984,13 +1984,12 @@ fn read_rows_from_index(
         };
         if read == 0 {
             if !record.is_empty() && row_number >= start && row_number < target_end {
-                let fields = parse_encoded_record_with_bom_and_field_limit(
+                let fields = parse_encoded_record_with_bom(
                     &record,
                     delimiter,
                     row_number,
                     strip_bom_at_zero && record_start == 0,
                     encoding,
-                    MAX_TRANSFORMATION_COLUMNS,
                 )?
                 .into_iter()
                 .map(|field| field.into_owned())
@@ -2013,13 +2012,12 @@ fn read_rows_from_index(
                         limit: max_record_bytes,
                     });
                 } else if deferred_error.is_none() {
-                    match parse_encoded_record_with_bom_and_field_limit(
+                    match parse_encoded_record_with_bom(
                         &record,
                         delimiter,
                         row_number,
                         strip_bom_at_zero && record_start == 0,
                         encoding,
-                        MAX_TRANSFORMATION_COLUMNS,
                     ) {
                         Ok(fields) => rows.push(Row {
                             offset: record_start,

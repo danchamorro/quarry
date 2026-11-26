@@ -773,21 +773,44 @@ fn detect_unterminated_baseline_row(
         return Ok(None);
     }
     let last_row = index.indexed_rows() - 1;
-    let rows = read_rows_from_open_file(
-        open_file,
+    let checkpoint = index.nearest_checkpoint(last_row);
+    let mut scanner = EncodedScanner::<false>::at_offset_with_bom_handling(
         delimiter,
-        index,
-        last_row,
-        1,
-        DEFAULT_MAX_RECORD_BYTES,
+        checkpoint.offset,
         encoding,
-        file_size,
         true,
     )?;
-    let Some(row) = rows.first() else {
+    let mut chunk = vec![0u8; encoding.chunk_size(DEFAULT_READ_CHUNK)];
+    let mut absolute_start = checkpoint.offset;
+    let mut row_number = checkpoint.row;
+    let mut record_start = checkpoint.offset;
+    while row_number < last_row && absolute_start < file_size {
+        let remaining = file_size - absolute_start;
+        if encoding.is_utf16() && remaining == 1 {
+            return Err(QuarryError::SourceChanged);
+        }
+        let mut limit = chunk
+            .len()
+            .min(usize::try_from(remaining).unwrap_or(usize::MAX));
+        if encoding.is_utf16() {
+            limit &= !1;
+        }
+        let read = read_at_exact_or_eof(open_file, absolute_start, &mut chunk[..limit])?;
+        if read < limit {
+            return Err(QuarryError::SourceChanged);
+        }
+        scanner.scan_chunk(&chunk[..read], absolute_start, |absolute_end| {
+            if row_number < last_row {
+                row_number += 1;
+                record_start = absolute_end;
+            }
+        })?;
+        absolute_start += read as u64;
+    }
+    if row_number != last_row {
         return Ok(None);
-    };
-    Ok(Some((last_row, row.offset)))
+    }
+    Ok(Some((last_row, record_start)))
 }
 
 struct WatchShared {
