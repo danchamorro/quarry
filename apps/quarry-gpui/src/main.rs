@@ -4607,6 +4607,15 @@ impl QuarryWindow {
                         )
                     };
                     (label, None, None, false)
+                } else if info.live_watch.alert.is_some() {
+                    let label = if info.source_changed {
+                        "Live Watch stopped · Reload from disk"
+                    } else {
+                        "Live Watch stopped"
+                    };
+                    (label.into(), None, None, false)
+                } else if info.source_changed {
+                    ("Source changed on disk".into(), None, None, false)
                 } else if info.index_done {
                     ("Index complete".into(), None, None, false)
                 } else if info.index_cancelled {
