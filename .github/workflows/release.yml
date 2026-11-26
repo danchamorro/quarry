@@ -207,6 +207,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ needs.draft-release.outputs.tag }}
         run: |
+          IS_DRAFT="$(gh release view "$TAG" --json isDraft --jq '.isDraft')"
+          if [[ "$IS_DRAFT" != "true" ]]; then
+            echo "error: release $TAG is already published (isDraft=$IS_DRAFT); refusing to overwrite assets." >&2
+            exit 1
+          fi
           OUT="target/release-artifacts/$TAG"
           gh release upload "$TAG" \
             "$OUT/Quarry-$TAG-macos-arm64.dmg" \
@@ -273,6 +278,11 @@ jobs:
           TAG: ${{ needs.draft-release.outputs.tag }}
           ARCH: ${{ matrix.arch }}
         run: |
+          IS_DRAFT="$(gh release view "$TAG" --json isDraft --jq '.isDraft')"
+          if [[ "$IS_DRAFT" != "true" ]]; then
+            echo "error: release $TAG is already published (isDraft=$IS_DRAFT); refusing to overwrite assets." >&2
+            exit 1
+          fi
           OUT="target/release-artifacts/$TAG"
           gh release upload "$TAG" \
             "$OUT/Quarry-$TAG-linux-$ARCH.tar.gz" \

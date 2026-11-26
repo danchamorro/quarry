@@ -8,6 +8,7 @@ DESKTOP_SOURCE="$ROOT/packaging/linux/dev.quarry.gpui.desktop"
 INSTALL_SCRIPT="$ROOT/packaging/linux/install.sh"
 UNINSTALL_SCRIPT="$ROOT/packaging/linux/uninstall.sh"
 RUST_LICENSES_DIR="$ROOT/packaging/licenses/rust"
+BUILD_TARGET_DIR="$ROOT/target/linux-package-build"
 
 STAGE_DIR=""
 cleanup() {
@@ -98,17 +99,34 @@ notice_html_for_target() {
 verify_ldd_binary() {
     local bin="$1"
     if command -v ldd >/dev/null 2>&1; then
-        local missing
-        missing="$(ldd "$bin" | grep '=> not found' || true)"
+        local out rc missing
+        set +e
+        out="$(ldd "$bin" 2>&1)"
+        rc=$?
+        set -e
+        [[ $rc -eq 0 ]] || fail "ldd failed for $bin:\n$out"
+        missing="$(printf '%s\n' "$out" | grep '=> not found' || true)"
         [[ -z "$missing" ]] || fail "missing shared libraries in $bin:\n$missing"
     fi
+}
+
+build_release_binaries() {
+    local target="$1"
+    # Pass explicit --target and --target-dir so ambient CARGO_TARGET_DIR or
+    # build.target settings can never cause staging to pick up stale binaries.
+    cargo build --release --locked \
+        --target "$target" \
+        --target-dir "$BUILD_TARGET_DIR" \
+        --manifest-path "$ROOT/Cargo.toml" \
+        -p quarry-gpui -p quarry-cli
 }
 
 stage_bundle() {
     local dest="$1"
     local target="$2"
     local arch="$3"
-    local tag="${4:-}"
+    local bin_src_dir="$4"
+    local tag="${5:-}"
     local version revision status notices_html
 
     version="$(app_version)"
@@ -116,6 +134,8 @@ stage_bundle() {
     status="$(source_status)"
     notices_html="$(notice_html_for_target "$target")"
 
+    [[ -x "$bin_src_dir/quarry-gpui" ]] || fail "missing built desktop binary: $bin_src_dir/quarry-gpui"
+    [[ -x "$bin_src_dir/quarry" ]] || fail "missing built CLI binary: $bin_src_dir/quarry"
     [[ -f "$notices_html" ]] || fail "missing third-party notices for $target: $notices_html"
     [[ -f "$ICON_SOURCE" ]] || fail "missing icon asset: $ICON_SOURCE"
     [[ -f "$DESKTOP_SOURCE" ]] || fail "missing desktop file: $DESKTOP_SOURCE"
@@ -128,8 +148,8 @@ stage_bundle() {
         "$dest/share/icons/hicolor/512x512/apps" \
         "$dest/share/doc/quarry/Rust"
 
-    install -m 755 "$ROOT/target/release/quarry-gpui" "$dest/bin/quarry-gpui"
-    install -m 755 "$ROOT/target/release/quarry" "$dest/bin/quarry"
+    install -m 755 "$bin_src_dir/quarry-gpui" "$dest/bin/quarry-gpui"
+    install -m 755 "$bin_src_dir/quarry" "$dest/bin/quarry"
     install -m 644 "$DESKTOP_SOURCE" "$dest/share/applications/dev.quarry.gpui.desktop"
     install -m 644 "$ICON_SOURCE" "$dest/share/icons/hicolor/512x512/apps/dev.quarry.gpui.png"
     install -m 644 "$ROOT/LICENSE-MIT" "$dest/share/doc/quarry/LICENSE-MIT"
@@ -164,17 +184,18 @@ PY
 
 package_app() {
     [[ "$(uname -s)" == "Linux" ]] || fail "linux-app.sh package must run on Linux."
-    local target arch rust_release out_bundle
+    local target arch rust_release out_bundle bin_src_dir
     target="$(host_target)"
     arch="$(host_arch_label)"
     rust_release="$(rust_release_version)"
 
     "$ROOT/scripts/generate-notices.sh" --check --target "$target" --rust-release "$rust_release"
-    cargo build --release --locked --manifest-path "$ROOT/Cargo.toml" -p quarry-gpui -p quarry-cli
+    build_release_binaries "$target"
+    bin_src_dir="$BUILD_TARGET_DIR/$target/release"
 
     out_bundle="$ROOT/target/package/linux-$arch/$APP_NAME"
     rm -rf "$out_bundle"
-    stage_bundle "$out_bundle" "$target" "$arch"
+    stage_bundle "$out_bundle" "$target" "$arch" "$bin_src_dir"
     printf 'Packaged Linux Quarry (%s, %s)\n%s\n' "$target" "$(source_status)" "$out_bundle"
 }
 
@@ -220,13 +241,14 @@ release_app() {
         fail "release packaging requires a clean Git working tree."
     fi
 
-    local target arch rust_release version revision tag_base_version tag_commit
+    local target arch rust_release version revision tag_base_version tag_commit bin_src_dir
     target="$(host_target)"
     arch="$(host_arch_label)"
     rust_release="$(rust_release_version)"
 
     "$ROOT/scripts/generate-notices.sh" --release-check --target "$target" --rust-release "$rust_release"
-    cargo build --release --locked --manifest-path "$ROOT/Cargo.toml" -p quarry-gpui -p quarry-cli
+    build_release_binaries "$target"
+    bin_src_dir="$BUILD_TARGET_DIR/$target/release"
 
     version="$(app_version)"
     revision="$(git -C "$ROOT" rev-parse HEAD)"
@@ -260,11 +282,11 @@ release_app() {
     local sums_file="$out_dir/SHA256SUMS-linux-$arch.txt"
     local manifest_file="$out_dir/release-manifest-linux-$arch.json"
 
-    stage_bundle "$bundle_dir" "$target" "$arch" "$tag"
+    stage_bundle "$bundle_dir" "$target" "$arch" "$bin_src_dir" "$tag"
     rm -f "$tarball"
     tar -C "$STAGE_DIR" -czf "$tarball" "$bundle_name"
 
-    # Verify tarball round-trip extraction and install/uninstall into a temp prefix.
+    # Verify tarball round-trip extraction, install, CLI execution, and clean uninstall.
     local verify_dir="$STAGE_DIR/verify"
     local verify_prefix="$STAGE_DIR/verify prefix"
     mkdir -p "$verify_dir"
@@ -273,8 +295,10 @@ release_app() {
     [[ -x "$verify_prefix/bin/quarry-gpui" ]] || fail "extracted tarball install missing quarry-gpui"
     [[ -x "$verify_prefix/bin/quarry" ]] || fail "extracted tarball install missing quarry"
     [[ -f "$verify_prefix/share/applications/dev.quarry.gpui.desktop" ]] || fail "extracted tarball install missing desktop file"
+    "$verify_prefix/bin/quarry" --help >/dev/null || fail "extracted CLI --help check failed"
     "$verify_prefix/share/doc/quarry/uninstall.sh"
     [[ ! -e "$verify_prefix/bin/quarry-gpui" ]] || fail "uninstall did not remove quarry-gpui"
+    [[ ! -e "$verify_prefix/bin/quarry" ]] || fail "uninstall did not remove quarry"
 
     if command -v sha256sum >/dev/null 2>&1; then
         (cd "$out_dir" && sha256sum "$(basename "$tarball")" > "$sums_file")
@@ -312,7 +336,8 @@ PY
 self_test() {
     STAGE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/quarry-linux-selftest.XXXXXX")"
     local fake_bundle="$STAGE_DIR/Quarry-v0.2.0-linux-x86_64"
-    local prefix="$STAGE_DIR/user prefix"
+    # Test spaces, apostrophe, and literal '%' in prefix path!
+    local prefix="$STAGE_DIR/o'brien 100% prefix"
     mkdir -p \
         "$fake_bundle/bin" \
         "$fake_bundle/share/applications" \
@@ -333,29 +358,129 @@ self_test() {
     cp "$UNINSTALL_SCRIPT" "$fake_bundle/uninstall.sh"
     chmod 755 "$fake_bundle/install.sh" "$fake_bundle/uninstall.sh"
 
-    # Unrelated file in prefix must remain untouched across install/uninstall.
-    printf 'keep\n' > "$prefix/bin/other-tool"
+    # 1. Wrong-architecture bundle must be rejected before modifying prefix.
+    printf '{"architecture": "mips64"}\n' > "$fake_bundle/share/doc/quarry/RELEASE_METADATA.json"
+    if QUARRY_SKIP_LDD_CHECK=1 "$fake_bundle/install.sh" --prefix "$prefix" >/dev/null 2>&1; then
+        fail "self-test: wrong-architecture bundle should have been rejected"
+    fi
+    [[ ! -e "$prefix/bin/quarry-gpui" ]] || fail "self-test: rejected wrong-arch install wrote files"
+    rm -f "$fake_bundle/share/doc/quarry/RELEASE_METADATA.json"
 
-    "$fake_bundle/install.sh" --prefix "$prefix" >/dev/null
+    # 2. Unrepresentable '=' in prefix must be rejected before modifying prefix.
+    local bad_prefix="$STAGE_DIR/bad=prefix"
+    if QUARRY_SKIP_ARCH_CHECK=1 QUARRY_SKIP_LDD_CHECK=1 "$fake_bundle/install.sh" --prefix "$bad_prefix" >/dev/null 2>&1; then
+        fail "self-test: '=' prefix should have been rejected"
+    fi
+    [[ ! -e "$bad_prefix/bin/quarry-gpui" ]] || fail "self-test: '=' prefix wrote files"
+
+    # 3. Unowned pre-existing bin/quarry must block install and remain intact.
+    printf 'unrelated-quarry-tool\n' > "$prefix/bin/quarry"
+    if QUARRY_SKIP_ARCH_CHECK=1 QUARRY_SKIP_LDD_CHECK=1 "$fake_bundle/install.sh" --prefix "$prefix" >/dev/null 2>&1; then
+        fail "self-test: collision with unowned bin/quarry should have failed"
+    fi
+    [[ "$(cat "$prefix/bin/quarry")" == "unrelated-quarry-tool" ]] || fail "self-test: unowned bin/quarry was overwritten"
+    [[ ! -e "$prefix/bin/quarry-gpui" ]] || fail "self-test: failed collision install wrote quarry-gpui"
+
+    # 4. Uninstall on a prefix where Quarry was never installed must delete nothing.
+    "$UNINSTALL_SCRIPT" --prefix "$prefix" >/dev/null
+    [[ "$(cat "$prefix/bin/quarry")" == "unrelated-quarry-tool" ]] || fail "self-test: uninstall deleted unowned bin/quarry"
+    rm -f "$prefix/bin/quarry"
+
+    # 5. Clean install into prefix with spaces, apostrophe, and '%'; verify XDG Exec/TryExec parsing.
+    printf 'keep\n' > "$prefix/bin/other-tool"
+    QUARRY_SKIP_ARCH_CHECK=1 QUARRY_SKIP_LDD_CHECK=1 "$fake_bundle/install.sh" --prefix "$prefix" >/dev/null
     [[ -x "$prefix/bin/quarry-gpui" ]] || fail "self-test: quarry-gpui not installed"
     [[ -x "$prefix/bin/quarry" ]] || fail "self-test: quarry CLI not installed"
     [[ -f "$prefix/share/icons/hicolor/512x512/apps/dev.quarry.gpui.png" ]] || fail "self-test: icon not installed"
     [[ -f "$prefix/share/doc/quarry/THIRD_PARTY_NOTICES.html" ]] || fail "self-test: notices not installed"
+    [[ -f "$prefix/share/doc/quarry/installed-files.txt" ]] || fail "self-test: ownership manifest missing"
     [[ -x "$prefix/share/doc/quarry/uninstall.sh" ]] || fail "self-test: uninstall.sh not installed"
 
     local desktop="$prefix/share/applications/dev.quarry.gpui.desktop"
-    grep -Fq "Exec=\"$prefix/bin/quarry-gpui\" %F" "$desktop" || fail "self-test: Exec line mismatch in $desktop"
-    grep -Fq "TryExec=$prefix/bin/quarry-gpui" "$desktop" || fail "self-test: TryExec line mismatch in $desktop"
-    grep -Fq "StartupWMClass=dev.quarry.gpui" "$desktop" || fail "self-test: StartupWMClass missing"
+    python3 -B - "$desktop" "$prefix/bin/quarry-gpui" <<'PY'
+import pathlib, sys
 
-    # Self-detecting uninstall from installed doc location.
+desktop_path, expected_bin = pathlib.Path(sys.argv[1]), sys.argv[2]
+kv = {}
+for line in desktop_path.read_text(encoding="utf-8").splitlines():
+    if "=" in line and not line.startswith("["):
+        k, v = line.split("=", 1)
+        kv[k] = v
+
+def unescape_desktop_string(s: str) -> str:
+    out, i = [], 0
+    while i < len(s):
+        if s[i] == "\\" and i + 1 < len(s):
+            nxt = s[i + 1]
+            out.append({"s": " ", "n": "\n", "t": "\t", "r": "\r", "\\": "\\"}.get(nxt, "\\" + nxt))
+            i += 2
+        else:
+            out.append(s[i])
+            i += 1
+    return "".join(out)
+
+assert kv["StartupWMClass"] == "dev.quarry.gpui"
+assert unescape_desktop_string(kv["TryExec"]) == expected_bin, (kv["TryExec"], expected_bin)
+
+exec_str = unescape_desktop_string(kv["Exec"])
+# Parse Desktop Entry Exec quoting (double quotes with \, ", $, ` escapes) and %% field code.
+tokens, cur, in_q, i = [], [], False, 0
+while i < len(exec_str):
+    ch = exec_str[i]
+    if in_q:
+        if ch == "\\" and i + 1 < len(exec_str):
+            cur.append(exec_str[i + 1])
+            i += 2
+        elif ch == '"':
+            in_q = False
+            i += 1
+        else:
+            cur.append(ch)
+            i += 1
+    else:
+        if ch.isspace():
+            if cur:
+                tokens.append("".join(cur))
+                cur = []
+            i += 1
+        elif ch == '"':
+            in_q = True
+            i += 1
+        else:
+            cur.append(ch)
+            i += 1
+if cur:
+    tokens.append("".join(cur))
+assert not in_q, f"Unclosed quote in Exec: {kv['Exec']}"
+assert len(tokens) == 2 and tokens[1] == "%F", tokens
+assert tokens[0].replace("%%", "%") == expected_bin, (tokens[0], expected_bin)
+PY
+
+    # 6. Extra user file inside doc dir must survive reinstall AND uninstall.
+    printf 'user-notes\n' > "$prefix/share/doc/quarry/my-notes.txt"
+    QUARRY_SKIP_ARCH_CHECK=1 QUARRY_SKIP_LDD_CHECK=1 "$fake_bundle/install.sh" --prefix "$prefix" >/dev/null
+    [[ "$(cat "$prefix/share/doc/quarry/my-notes.txt")" == "user-notes" ]] || fail "self-test: reinstall deleted user doc file"
+
     "$prefix/share/doc/quarry/uninstall.sh" >/dev/null
     [[ ! -e "$prefix/bin/quarry-gpui" ]] || fail "self-test: quarry-gpui not removed"
     [[ ! -e "$prefix/bin/quarry" ]] || fail "self-test: quarry CLI not removed"
     [[ ! -e "$desktop" ]] || fail "self-test: desktop entry not removed"
     [[ ! -e "$prefix/share/icons/hicolor/512x512/apps/dev.quarry.gpui.png" ]] || fail "self-test: icon not removed"
-    [[ ! -e "$prefix/share/doc/quarry" ]] || fail "self-test: doc dir not removed"
+    [[ ! -e "$prefix/share/doc/quarry/installed-files.txt" ]] || fail "self-test: manifest not removed"
+    [[ "$(cat "$prefix/share/doc/quarry/my-notes.txt")" == "user-notes" ]] || fail "self-test: uninstall deleted user doc file"
     [[ -f "$prefix/bin/other-tool" ]] || fail "self-test: unrelated file was modified or removed"
+
+    # 7. Default user install honors custom XDG_DATA_HOME and uninstalls cleanly.
+    local fake_home="$STAGE_DIR/home"
+    local custom_xdg="$STAGE_DIR/xdg-data"
+    mkdir -p "$fake_home" "$custom_xdg"
+    HOME="$fake_home" XDG_DATA_HOME="$custom_xdg" QUARRY_SKIP_ARCH_CHECK=1 QUARRY_SKIP_LDD_CHECK=1 \
+        "$fake_bundle/install.sh" >/dev/null
+    [[ -x "$fake_home/.local/bin/quarry-gpui" ]] || fail "self-test: XDG default install missing bin"
+    [[ -f "$custom_xdg/applications/dev.quarry.gpui.desktop" ]] || fail "self-test: XDG_DATA_HOME desktop missing"
+    HOME="$fake_home" XDG_DATA_HOME="$custom_xdg" "$custom_xdg/doc/quarry/uninstall.sh" >/dev/null
+    [[ ! -e "$fake_home/.local/bin/quarry-gpui" ]] || fail "self-test: XDG uninstall left binary"
+    [[ ! -e "$custom_xdg/applications/dev.quarry.gpui.desktop" ]] || fail "self-test: XDG uninstall left desktop"
 
     printf 'Linux packaging self-test passed.\n'
 }

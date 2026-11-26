@@ -2,7 +2,7 @@
 set -euo pipefail
 
 BUNDLE_DIR="$(cd "$(dirname "$0")" && pwd)"
-PREFIX="${HOME}/.local"
+EXPLICIT_PREFIX=""
 
 usage() {
     cat <<'EOF'
@@ -12,7 +12,7 @@ Usage:
   ./install.sh [--prefix DIR]
 
 Options:
-  --prefix DIR   Installation prefix (default: ~/.local)
+  --prefix DIR   Installation prefix (default: ~/.local/bin and $XDG_DATA_HOME or ~/.local/share)
   -h, --help     Show this help message
 EOF
 }
@@ -22,11 +22,93 @@ fail() {
     exit 1
 }
 
+host_arch_label() {
+    case "$(uname -m)" in
+        x86_64|amd64) printf 'x86_64\n' ;;
+        aarch64|arm64) printf 'arm64\n' ;;
+        *) printf '%s\n' "$(uname -m)" ;;
+    esac
+}
+
+validate_bundle_arch() {
+    [[ "${QUARRY_SKIP_ARCH_CHECK:-0}" == "1" ]] && return 0
+    local meta="$BUNDLE_DIR/share/doc/quarry/RELEASE_METADATA.json"
+    [[ -f "$meta" ]] || return 0
+    local bundle_arch host_arch
+    bundle_arch="$(sed -n 's/.*"architecture"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$meta" | head -n 1)"
+    [[ -n "$bundle_arch" ]] || return 0
+    host_arch="$(host_arch_label)"
+    if [[ "$bundle_arch" != "$host_arch" ]]; then
+        fail "bundle architecture ($bundle_arch) does not match this machine ($host_arch); download the matching Quarry archive."
+    fi
+}
+
+validate_linux_binaries() {
+    [[ "${QUARRY_SKIP_LDD_CHECK:-0}" == "1" ]] && return 0
+    [[ "$(uname -s)" == "Linux" ]] || return 0
+    command -v ldd >/dev/null 2>&1 || return 0
+
+    local bin out rc missing
+    for bin in "$BUNDLE_DIR/bin/quarry-gpui" "$BUNDLE_DIR/bin/quarry"; do
+        set +e
+        out="$(ldd "$bin" 2>&1)"
+        rc=$?
+        set -e
+        if [[ $rc -ne 0 ]]; then
+            printf '%s\n' "$out" >&2
+            fail "binary loader check failed for $(basename "$bin") (wrong architecture or incompatible runtime)."
+        fi
+        missing="$(printf '%s\n' "$out" | grep '=> not found' || true)"
+        if [[ -n "$missing" ]]; then
+            printf 'error: missing runtime shared libraries for %s:\n%s\n' "$(basename "$bin")" "$missing" >&2
+            cat >&2 <<'EOF'
+Install the required system libraries for your distribution and re-run ./install.sh:
+  Arch / Omarchy:
+    sudo pacman -S --needed wayland libxkbcommon vulkan-icd-loader fontconfig freetype2 libxcb libx11 libxcursor libxrandr libxi libglvnd
+  Ubuntu / Debian:
+    sudo apt-get install -y libwayland-client0 libxkbcommon0 libxkbcommon-x11-0 libvulkan1 libfontconfig1 libfreetype6 libxcb1
+EOF
+            exit 1
+        fi
+    done
+}
+
+# Encode an executable path for the Desktop Entry Spec `Exec` key.
+# Two layers apply: (1) Exec argument quoting for reserved chars, then
+# (2) Desktop Entry `string` escaping (\ -> \\). Literal `%` is escaped as `%%`.
+encode_desktop_exec_arg() {
+    local raw="$1"
+    local escaped="$raw"
+    # Escape % -> %% for field-code safety.
+    escaped="${escaped//%/%%}"
+    # Quote whenever the path contains any character outside the safe unquoted set.
+    if [[ "$raw" == *[^A-Za-z0-9_./:-]* ]]; then
+        # Inside double quotes, spec requires escaping \, ", $, ` at the Exec layer,
+        # then escaping every \ again at the Desktop Entry string layer:
+        #   \ -> \\  (Exec) -> \\\\ (string)
+        #   " -> \"  (Exec) -> \\"  (string)
+        #   $ -> \$  (Exec) -> \\$  (string)
+        #   ` -> \`  (Exec) -> \\`  (string)
+        escaped="${escaped//\\/\\\\\\\\}"
+        escaped="${escaped//\"/\\\\\"}"
+        escaped="${escaped//\$/\\\\\$}"
+        escaped="${escaped//\`/\\\\\`}"
+        printf '"%s"' "$escaped"
+    else
+        printf '%s' "$escaped"
+    fi
+}
+
+encode_desktop_string() {
+    local raw="$1"
+    printf '%s' "${raw//\\/\\\\}"
+}
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --prefix)
             [[ $# -ge 2 ]] || fail "--prefix requires a directory argument"
-            PREFIX="$2"
+            EXPLICIT_PREFIX="$2"
             shift 2
             ;;
         -h|--help)
@@ -39,14 +121,33 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-[[ -n "$PREFIX" ]] || fail "--prefix must not be empty"
-mkdir -p "$PREFIX"
-PREFIX="$(cd "$PREFIX" && pwd)"
+if [[ -n "$EXPLICIT_PREFIX" ]]; then
+    mkdir -p "$EXPLICIT_PREFIX"
+    PREFIX="$(cd "$EXPLICIT_PREFIX" && pwd)"
+    BIN_DIR="$PREFIX/bin"
+    DATA_DIR="$PREFIX/share"
+else
+    BIN_DIR="${HOME}/.local/bin"
+    DATA_DIR="${XDG_DATA_HOME:-${HOME}/.local/share}"
+    mkdir -p "$BIN_DIR" "$DATA_DIR"
+    BIN_DIR="$(cd "$BIN_DIR" && pwd)"
+    DATA_DIR="$(cd "$DATA_DIR" && pwd)"
+fi
 
-BIN_DIR="$PREFIX/bin"
-APPS_DIR="$PREFIX/share/applications"
-ICON_512_DIR="$PREFIX/share/icons/hicolor/512x512/apps"
-DOC_DIR="$PREFIX/share/doc/quarry"
+QUARRY_BIN="$BIN_DIR/quarry-gpui"
+# Reject control characters or '=' in paths (unrepresentable in XDG Desktop Entry or line manifests).
+if [[ "$QUARRY_BIN" == *$'\n'* || "$QUARRY_BIN" == *$'\r'* || "$QUARRY_BIN" == *=* ]]; then
+    fail "installation path contains unsupported characters (newline or '='): $QUARRY_BIN"
+fi
+if [[ "$DATA_DIR" == *$'\n'* || "$DATA_DIR" == *$'\r'* ]]; then
+    fail "data directory path contains unsupported newline characters: $DATA_DIR"
+fi
+
+APPS_DIR="$DATA_DIR/applications"
+ICON_512_DIR="$DATA_DIR/icons/hicolor/512x512/apps"
+ICON_256_DIR="$DATA_DIR/icons/hicolor/256x256/apps"
+DOC_DIR="$DATA_DIR/doc/quarry"
+MANIFEST_FILE="$DOC_DIR/installed-files.txt"
 DESKTOP_SRC="$BUNDLE_DIR/share/applications/dev.quarry.gpui.desktop"
 ICON_512_SRC="$BUNDLE_DIR/share/icons/hicolor/512x512/apps/dev.quarry.gpui.png"
 
@@ -62,6 +163,61 @@ for required in \
     [[ -e "$required" ]] || fail "missing bundle file: $required"
 done
 
+validate_bundle_arch
+validate_linux_binaries
+
+# Build exact list of target files before writing anything.
+NEW_FILES=(
+    "$BIN_DIR/quarry-gpui"
+    "$BIN_DIR/quarry"
+    "$APPS_DIR/dev.quarry.gpui.desktop"
+    "$ICON_512_DIR/dev.quarry.gpui.png"
+    "$DOC_DIR/LICENSE-MIT"
+    "$DOC_DIR/LICENSE-APACHE"
+    "$DOC_DIR/THIRD_PARTY_NOTICES.html"
+    "$DOC_DIR/uninstall.sh"
+    "$MANIFEST_FILE"
+)
+if [[ -f "$BUNDLE_DIR/share/icons/hicolor/256x256/apps/dev.quarry.gpui.png" ]]; then
+    NEW_FILES+=("$ICON_256_DIR/dev.quarry.gpui.png")
+fi
+if [[ -f "$BUNDLE_DIR/share/doc/quarry/RELEASE_METADATA.json" ]]; then
+    NEW_FILES+=("$DOC_DIR/RELEASE_METADATA.json")
+fi
+if [[ -d "$BUNDLE_DIR/share/doc/quarry/Rust" ]]; then
+    for rust_doc in "$BUNDLE_DIR/share/doc/quarry/Rust/"*; do
+        [[ -f "$rust_doc" ]] || continue
+        NEW_FILES+=("$DOC_DIR/Rust/$(basename "$rust_doc")")
+    done
+fi
+
+# Load previously Quarry-owned files (if upgrading an existing Quarry install).
+OLD_FILES=()
+if [[ -f "$MANIFEST_FILE" ]]; then
+    while IFS= read -r line; do
+        [[ -n "$line" ]] && OLD_FILES+=("$line")
+    done < "$MANIFEST_FILE"
+fi
+
+is_in_list() {
+    local needle="$1"
+    shift
+    local item
+    for item in "$@"; do
+        [[ "$item" == "$needle" ]] && return 0
+    done
+    return 1
+}
+
+# Refuse to overwrite any pre-existing file that Quarry does not own.
+for dest in "${NEW_FILES[@]}"; do
+    if [[ -e "$dest" || -L "$dest" ]]; then
+        if [[ ${#OLD_FILES[@]} -eq 0 ]] || ! is_in_list "$dest" "${OLD_FILES[@]}"; then
+            fail "refusing to overwrite existing unowned file: $dest (remove or move it, or pass a different --prefix)"
+        fi
+    fi
+done
+
 mkdir -p "$BIN_DIR" "$APPS_DIR" "$ICON_512_DIR" "$DOC_DIR"
 
 install -m 755 "$BUNDLE_DIR/bin/quarry-gpui" "$BIN_DIR/quarry-gpui"
@@ -69,13 +225,12 @@ install -m 755 "$BUNDLE_DIR/bin/quarry" "$BIN_DIR/quarry"
 install -m 644 "$ICON_512_SRC" "$ICON_512_DIR/dev.quarry.gpui.png"
 
 if [[ -f "$BUNDLE_DIR/share/icons/hicolor/256x256/apps/dev.quarry.gpui.png" ]]; then
-    mkdir -p "$PREFIX/share/icons/hicolor/256x256/apps"
+    mkdir -p "$ICON_256_DIR"
     install -m 644 \
         "$BUNDLE_DIR/share/icons/hicolor/256x256/apps/dev.quarry.gpui.png" \
-        "$PREFIX/share/icons/hicolor/256x256/apps/dev.quarry.gpui.png"
+        "$ICON_256_DIR/dev.quarry.gpui.png"
 fi
 
-rm -rf "$DOC_DIR/Rust"
 for doc in LICENSE-MIT LICENSE-APACHE THIRD_PARTY_NOTICES.html RELEASE_METADATA.json; do
     if [[ -f "$BUNDLE_DIR/share/doc/quarry/$doc" ]]; then
         install -m 644 "$BUNDLE_DIR/share/doc/quarry/$doc" "$DOC_DIR/$doc"
@@ -90,21 +245,10 @@ if [[ -d "$BUNDLE_DIR/share/doc/quarry/Rust" ]]; then
 fi
 install -m 755 "$BUNDLE_DIR/uninstall.sh" "$DOC_DIR/uninstall.sh"
 
-# Write installed .desktop entry with exact binary path so Wayland launchers
-# (Omarchy Walker, Hyprland, GNOME, KDE) find Quarry even when ~/.local/bin is
-# not in the compositor's login PATH.
-QUARRY_BIN="$BIN_DIR/quarry-gpui"
-# Escape backslashes and double quotes for XDG Desktop Entry Exec quoting.
-ESCAPED_EXEC="$QUARRY_BIN"
-ESCAPED_EXEC="${ESCAPED_EXEC//\\/\\\\}"
-ESCAPED_EXEC="${ESCAPED_EXEC//\"/\\\"}"
-ESCAPED_EXEC="${ESCAPED_EXEC//\$/\\\$}"
-ESCAPED_EXEC="${ESCAPED_EXEC//\`/\\\`}"
-if [[ "$QUARRY_BIN" == *[[:space:]]* ]]; then
-    EXEC_VALUE="\"$ESCAPED_EXEC\" %F"
-else
-    EXEC_VALUE="$ESCAPED_EXEC %F"
-fi
+# Write installed .desktop entry with exact spec-encoded binary path so Wayland
+# launchers (Omarchy Walker, Hyprland, GNOME, KDE) find Quarry regardless of PATH.
+EXEC_VALUE="$(encode_desktop_exec_arg "$QUARRY_BIN") %F"
+TRY_EXEC_VALUE="$(encode_desktop_string "$QUARRY_BIN")"
 
 DESKTOP_TMP="$(mktemp "$APPS_DIR/.dev.quarry.gpui.desktop.XXXXXX")"
 trap 'rm -f "$DESKTOP_TMP"' EXIT
@@ -114,7 +258,7 @@ while IFS= read -r line || [[ -n "$line" ]]; do
             printf 'Exec=%s\n' "$EXEC_VALUE"
             ;;
         TryExec=*)
-            printf 'TryExec=%s\n' "$QUARRY_BIN"
+            printf 'TryExec=%s\n' "$TRY_EXEC_VALUE"
             ;;
         *)
             printf '%s\n' "$line"
@@ -125,28 +269,32 @@ chmod 644 "$DESKTOP_TMP"
 mv -f "$DESKTOP_TMP" "$APPS_DIR/dev.quarry.gpui.desktop"
 trap - EXIT
 
+# Remove only previously Quarry-owned files that are no longer part of this install.
+if [[ ${#OLD_FILES[@]} -gt 0 ]]; then
+    for old in "${OLD_FILES[@]}"; do
+        if ! is_in_list "$old" "${NEW_FILES[@]}"; then
+            rm -f -- "$old"
+        fi
+    done
+    rmdir "$DOC_DIR/Rust" 2>/dev/null || true
+fi
+
+# Atomically write ownership manifest.
+MANIFEST_TMP="$(mktemp "$DOC_DIR/.installed-files.XXXXXX")"
+trap 'rm -f "$MANIFEST_TMP"' EXIT
+printf '%s\n' "${NEW_FILES[@]}" > "$MANIFEST_TMP"
+chmod 644 "$MANIFEST_TMP"
+mv -f "$MANIFEST_TMP" "$MANIFEST_FILE"
+trap - EXIT
+
 if command -v update-desktop-database >/dev/null 2>&1; then
     update-desktop-database -q "$APPS_DIR" 2>/dev/null || true
 fi
 if command -v gtk-update-icon-cache >/dev/null 2>&1; then
-    gtk-update-icon-cache -q -t -f "$PREFIX/share/icons/hicolor" 2>/dev/null || true
+    gtk-update-icon-cache -q -t -f "$DATA_DIR/icons/hicolor" 2>/dev/null || true
 fi
 
-if [[ "$(uname -s)" == "Linux" ]] && command -v ldd >/dev/null 2>&1; then
-    missing_libs="$(ldd "$BIN_DIR/quarry-gpui" 2>/dev/null | grep '=> not found' || true)"
-    if [[ -n "$missing_libs" ]]; then
-        printf '\nwarning: missing runtime shared libraries detected for quarry-gpui:\n%s\n' "$missing_libs" >&2
-        cat >&2 <<'EOF'
-Install the required system libraries for your distribution:
-  Arch / Omarchy:
-    sudo pacman -S --needed wayland libxkbcommon vulkan-icd-loader fontconfig freetype2 libxcb libx11 libxcursor libxrandr libxi libglvnd
-  Ubuntu / Debian:
-    sudo apt-get install -y libwayland-client0 libxkbcommon0 libxkbcommon-x11-0 libvulkan1 libfontconfig1 libfreetype6 libxcb1
-EOF
-    fi
-fi
-
-printf 'Installed Quarry into %s\n' "$PREFIX"
+printf 'Installed Quarry:\n'
 printf '  Desktop app:  %s\n' "$BIN_DIR/quarry-gpui"
 printf '  CLI:          %s\n' "$BIN_DIR/quarry"
 printf '  Launcher:     %s\n' "$APPS_DIR/dev.quarry.gpui.desktop"
@@ -161,3 +309,11 @@ case ":${PATH:-}:" in
         printf '  export PATH="%s:$PATH"\n' "$BIN_DIR"
         ;;
 esac
+
+if [[ -n "$EXPLICIT_PREFIX" ]]; then
+    default_data="${XDG_DATA_HOME:-${HOME}/.local/share}"
+    if [[ "$DATA_DIR" != "$default_data" && "$DATA_DIR" != "/usr/share" && "$DATA_DIR" != "/usr/local/share" ]]; then
+        printf '\nNote: installed desktop entry under custom data dir %s.\n' "$DATA_DIR"
+        printf 'Ensure %s is in XDG_DATA_DIRS so your application launcher discovers Quarry.\n' "$DATA_DIR"
+    fi
+fi

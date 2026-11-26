@@ -18,6 +18,17 @@ SUPPORTED_TARGETS = (
     "x86_64-unknown-linux-gnu",
     "aarch64-unknown-linux-gnu",
 )
+SHIPPING_MANIFESTS = {
+    "aarch64-apple-darwin": ("apps/quarry-gpui/Cargo.toml",),
+    "x86_64-unknown-linux-gnu": (
+        "apps/quarry-gpui/Cargo.toml",
+        "apps/quarry-cli/Cargo.toml",
+    ),
+    "aarch64-unknown-linux-gnu": (
+        "apps/quarry-gpui/Cargo.toml",
+        "apps/quarry-cli/Cargo.toml",
+    ),
+}
 VERSION = "0.9.2"
 RUST_RELEASE = "1.100.0"
 STATUS = "collected"
@@ -121,6 +132,35 @@ def record_applies(record, target):
     return targets is None or target in targets
 
 
+def merge_cargo_about_outputs(raw_list):
+    """Merge multiple cargo-about JSON graphs (e.g., GUI + CLI) into one deduplicated graph."""
+    crates_by_id = {}
+    licenses_by_key = {}
+    for raw in raw_list:
+        for crate_entry in raw["crates"]:
+            crates_by_id.setdefault(package_id(crate_entry["package"]), crate_entry)
+        for lic in raw["licenses"]:
+            key = (lic["id"], lic["source_path"])
+            merged = licenses_by_key.get(key)
+            if merged is None:
+                licenses_by_key[key] = {
+                    "id": lic["id"],
+                    "source_path": lic["source_path"],
+                    "used_by": list(lic["used_by"]),
+                }
+            else:
+                seen = {package_id(u["crate"]) for u in merged["used_by"]}
+                for u in lic["used_by"]:
+                    pid = package_id(u["crate"])
+                    if pid not in seen:
+                        merged["used_by"].append(u)
+                        seen.add(pid)
+    return {
+        "crates": list(crates_by_id.values()),
+        "licenses": list(licenses_by_key.values()),
+    }
+
+
 def render(raw, target=TARGET):
     packages = {package_id(c["package"]): c["package"] for c in raw["crates"]}
     extra = supplemental()
@@ -146,6 +186,9 @@ def render(raw, target=TARGET):
                 raise ValueError("Locked crate supplement size mismatch: " + str(source))
 
     sections, gaps = [], []
+    supplemented_packages = {
+        pkg for notice in notices for pkg in notice.get("packages", [])
+    }
     for license in raw["licenses"]:
         users = sorted(package_id(c["crate"]) for c in license["used_by"]
                        if c["crate"]["source"] is not None
@@ -154,11 +197,23 @@ def render(raw, target=TARGET):
             continue
         source = license["source_path"]
         if source is None:
+            uncovered = [u for u in users if u not in supplemented_packages]
+            if uncovered:
+                raise ValueError(
+                    f"Fallback package(s) missing supplemental notice for {target}: "
+                    + ", ".join(uncovered)
+                )
             gaps.append((license["id"], users, "No source notice file supplied by cargo-about"))
             continue
         source = Path(source)
         original = source.read_bytes().decode("utf-8")
         if "<copyright holders>" in original:
+            uncovered = [u for u in users if u not in supplemented_packages]
+            if uncovered:
+                raise ValueError(
+                    f"Placeholder notice package(s) missing supplemental notice for {target}: "
+                    + ", ".join(uncovered)
+                )
             gaps.append((license["id"], users, "Source file contains a generic copyright placeholder"))
             continue
         origin = None
@@ -210,14 +265,17 @@ def generate(binary, target=TARGET):
     artifact_path, manifest_path, _ = target_paths(target)
     before = inputs()
     with tempfile.TemporaryDirectory(prefix="quarry-notices-") as directory:
-        output = Path(directory) / "notices.json"
-        subprocess.run([
-            binary, "generate", "--locked", "--target", target,
-            "-m", str(ROOT / "apps/quarry-gpui/Cargo.toml"),
-            "-c", str(HERE / "about.toml"), "--fail", "--format", "json",
-            "-o", str(output),
-        ], cwd=ROOT, check=True)
-        rendered = render(json.loads(output.read_text()), target=target)
+        raw_graphs = []
+        for idx, manifest_rel in enumerate(SHIPPING_MANIFESTS[target]):
+            output = Path(directory) / f"notices-{idx}.json"
+            subprocess.run([
+                binary, "generate", "--locked", "--target", target,
+                "-m", str(ROOT / manifest_rel),
+                "-c", str(HERE / "about.toml"), "--fail", "--format", "json",
+                "-o", str(output),
+            ], cwd=ROOT, check=True)
+            raw_graphs.append(json.loads(output.read_text()))
+        rendered = render(merge_cargo_about_outputs(raw_graphs), target=target)
     if inputs() != before:
         raise ValueError("Notice inputs changed during generation; run again.")
     manifest = {"cargo_about_version": VERSION, "target": target, "status": STATUS,

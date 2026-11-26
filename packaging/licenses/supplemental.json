@@ -413,6 +413,19 @@
     },
     {
       "packages": [
+        "sha1_smol@1.0.1"
+      ],
+      "source": "sha1_smol@1.0.1/AUTHORS",
+      "crate_file": "AUTHORS",
+      "sha256": "613ce6df827bdbab4f498700a141548396b6ff26488f263654159ada4b04f78e",
+      "text": "- Armin Ronacher\n- Koka El Kiwi\n",
+      "targets": [
+        "x86_64-unknown-linux-gnu",
+        "aarch64-unknown-linux-gnu"
+      ]
+    },
+    {
+      "packages": [
         "wayland-protocols-plasma@0.3.12"
       ],
       "source": "wayland-protocols-plasma@0.3.12/LICENSE.txt",

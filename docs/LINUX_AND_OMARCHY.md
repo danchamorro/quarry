@@ -17,30 +17,31 @@ Quarry runs natively on Linux (`x86_64` and `arm64`) and [Omarchy](https://omarc
 
 ## Installing a Prebuilt Release (Recommended)
 
-Prebuilt Linux tarballs for **`x86_64`** (most desktops and laptops) and **`arm64`** (`aarch64`) are published on [GitHub Releases](https://github.com/danchamorro/quarry/releases) starting with `v0.2.0-beta.2`—no Rust toolchain or compiler required.
+Prebuilt Linux tarballs for **`x86_64`** (most desktops and laptops) and **`arm64`** (`aarch64`) are built in CI for [GitHub Releases](https://github.com/danchamorro/quarry/releases) starting with the `v0.2.0-beta.2` pre-release—no Rust toolchain or compiler required. (Until a Linux archive is attached to the latest release, use `./scripts/linux-app.sh install` under [Building from Source](#building-from-source).)
 
 1. Download `Quarry-<tag>-linux-x86_64.tar.gz` (or `arm64`) and `SHA256SUMS-linux-<arch>.txt`.
 2. Verify the checksum and run the included user installer:
 
 ```bash
-sha256sum -c SHA256SUMS-linux-*.txt
-tar -xzf Quarry-*-linux-*.tar.gz
-cd Quarry-*-linux-*
+ARCHIVE="Quarry-<tag>-linux-x86_64.tar.gz"
+sha256sum -c SHA256SUMS-linux-x86_64.txt
+tar -xzf "$ARCHIVE"
+cd "${ARCHIVE%.tar.gz}"
 ./install.sh
 ```
 
-By default `./install.sh` installs cleanly into `~/.local` (no `sudo` needed; pass `--prefix /usr/local` for a system-wide install):
+By default `./install.sh` installs cleanly into `~/.local/bin` and `${XDG_DATA_HOME:-~/.local/share}` (no `sudo` needed; pass `--prefix /usr/local` for a system-wide install, ensuring `<prefix>/share` is in `XDG_DATA_DIRS` for custom prefixes):
 
 - Desktop app: `~/.local/bin/quarry-gpui`
 - Headless CLI: `~/.local/bin/quarry`
-- App launcher entry: `~/.local/share/applications/dev.quarry.gpui.desktop` (appears as **Quarry** in Omarchy's app launcher / Walker and *"Open With"* for `.csv`/`.tsv`)
-- App icon: `~/.local/share/icons/hicolor/512x512/apps/dev.quarry.gpui.png`
-- Licenses & third-party notices: `~/.local/share/doc/quarry/`
+- App launcher entry: `${XDG_DATA_HOME:-~/.local/share}/applications/dev.quarry.gpui.desktop` (appears as **Quarry** in Omarchy's app launcher / Walker and *"Open With"* for `.csv`/`.tsv`)
+- App icon: `${XDG_DATA_HOME:-~/.local/share}/icons/hicolor/512x512/apps/dev.quarry.gpui.png`
+- Licenses, third-party notices, and ownership manifest: `${XDG_DATA_HOME:-~/.local/share}/doc/quarry/`
 
-`install.sh` also checks `ldd` for missing runtime shared libraries and warns with the exact `pacman`/`apt` command if anything is absent on a minimal system. To uninstall cleanly (preserving `~/.config/quarry`), run:
+Before writing any files, `install.sh` verifies bundle architecture parity, runs `ldd` on both binaries (reporting the exact `pacman`/`apt` command if runtime shared libraries are missing), and refuses to overwrite unrelated pre-existing files. To uninstall cleanly (removing only Quarry-owned files and preserving `~/.config/quarry`), run:
 
 ```bash
-~/.local/share/doc/quarry/uninstall.sh
+"${XDG_DATA_HOME:-$HOME/.local/share}/doc/quarry/uninstall.sh"
 ```
 
 ---

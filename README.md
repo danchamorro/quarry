@@ -121,16 +121,19 @@ shasum -a 256 -c SHA256SUMS-macos-arm64.txt
 
 ### Linux & Omarchy (`x86_64` & `arm64`)
 
-1. Download **`Quarry-<tag>-linux-x86_64.tar.gz`** (most desktops/laptops) or **`Quarry-<tag>-linux-arm64.tar.gz`** from the [latest GitHub Release](https://github.com/danchamorro/quarry/releases).
+Prebuilt Linux tarballs (`Quarry-<tag>-linux-x86_64.tar.gz` and `Quarry-<tag>-linux-arm64.tar.gz`) are built in CI for upcoming releases starting with `v0.2.0-beta.2` (use `./scripts/linux-app.sh install` under [Build from Source](#linux--omarchy-from-source) if no Linux archive is attached to the latest release yet):
+
+1. Download **`Quarry-<tag>-linux-x86_64.tar.gz`** (most desktops/laptops) or **`Quarry-<tag>-linux-arm64.tar.gz`** from [GitHub Releases](https://github.com/danchamorro/quarry/releases).
 2. Extract and run the included user installer (no `sudo` required):
 
 ```bash
-tar -xzf Quarry-*-linux-*.tar.gz
-cd Quarry-*-linux-*
+ARCHIVE="Quarry-<tag>-linux-x86_64.tar.gz"
+tar -xzf "$ARCHIVE"
+cd "${ARCHIVE%.tar.gz}"
 ./install.sh
 ```
 
-This installs the GPU-rendered desktop app (`~/.local/bin/quarry-gpui`), the headless CLI (`~/.local/bin/quarry`), an XDG launcher entry (`Quarry` in Omarchy's app launcher / Walker and *"Open With"* for `.csv`/`.tsv`), the app icon, and third-party notices. On Omarchy, choose **View → Theme → Omarchy** to follow your active theme live. To uninstall cleanly (keeping `~/.config/quarry`), run `~/.local/share/doc/quarry/uninstall.sh`.
+This installs the GPU-rendered desktop app (`~/.local/bin/quarry-gpui`), the headless CLI (`~/.local/bin/quarry`), an XDG launcher entry (`Quarry` in Omarchy's app launcher / Walker and *"Open With"* for `.csv`/`.tsv`), the app icon, and third-party notices into `~/.local/bin` and `${XDG_DATA_HOME:-~/.local/share}`. On Omarchy, choose **View → Theme → Omarchy** to follow your active theme live. To uninstall cleanly (keeping `~/.config/quarry`), run `${XDG_DATA_HOME:-~/.local/share}/doc/quarry/uninstall.sh`.
 
 See the [Linux & Omarchy Guide](docs/LINUX_AND_OMARCHY.md) for Wayland/Hyprland, theme sync, runtime library notes, and AT-SPI accessibility.
 
