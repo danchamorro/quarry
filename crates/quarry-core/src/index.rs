@@ -362,6 +362,36 @@ impl StructuralIndex {
         self.complete = true;
     }
 
+    /// Rolls back the final unterminated EOF row when entering Live Watch Mode so that
+    /// trailing bytes remain provisional until a newline terminates the record.
+    pub(crate) fn rollback_last_unterminated_row(&mut self, last_row_start: u64) {
+        if self.indexed_rows == 0 {
+            return;
+        }
+        self.indexed_rows -= 1;
+        self.last_record_end = last_row_start;
+        self.indexed_bytes = last_row_start.saturating_sub(self.section_base);
+        while self
+            .checkpoints
+            .last()
+            .is_some_and(|cp| cp.row > self.indexed_rows || cp.offset > last_row_start)
+        {
+            if self.checkpoints.len() <= 1 {
+                break;
+            }
+            self.checkpoints.pop();
+        }
+        self.complete = false;
+    }
+
+    pub(crate) fn set_complete(&mut self, complete: bool) {
+        self.complete = complete;
+    }
+
+    pub(crate) fn set_maximum_width(&mut self, maximum_width: usize) {
+        self.maximum_width = self.maximum_width.max(maximum_width);
+    }
+
     /// True only when this index reached validated EOF (complete scan, verified output, or sidecar).
     pub fn is_complete(&self) -> bool {
         self.complete

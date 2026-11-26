@@ -518,6 +518,86 @@ fn windows_extended_identity(file: &File) -> io::Result<WindowsExtendedIdentity>
     }
 }
 
+/// Returns `true` when `file` appears to live on a network or FUSE filesystem where native
+/// OS vnode/inotify notifications are unreliable and bounded polling should be used instead.
+pub(crate) fn is_network_filesystem(file: &File) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::fd::AsRawFd;
+        let mut stat = std::mem::MaybeUninit::<libc::statfs>::zeroed();
+        // SAFETY: `file` is a live file descriptor and `stat` is a valid writable `statfs`.
+        let rc = unsafe { libc::fstatfs(file.as_raw_fd(), stat.as_mut_ptr()) };
+        if rc != 0 {
+            return true;
+        }
+        // SAFETY: `fstatfs` returned 0, initializing `stat`.
+        let stat = unsafe { stat.assume_init() };
+        if (stat.f_flags & (libc::MNT_LOCAL as u32)) == 0 {
+            return true;
+        }
+        let fstype_bytes: Vec<u8> = stat
+            .f_fstypename
+            .iter()
+            .take_while(|&&c| c != 0)
+            .map(|&c| c as u8)
+            .collect();
+        let Ok(fstype) = std::str::from_utf8(&fstype_bytes) else {
+            return true;
+        };
+        let lower = fstype.to_ascii_lowercase();
+        matches!(
+            lower.as_str(),
+            "" | "smbfs"
+                | "nfs"
+                | "afpfs"
+                | "webdav"
+                | "cifs"
+                | "fuse"
+                | "osxfuse"
+                | "macfuse"
+                | "fusefs"
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        const NFS_SUPER_MAGIC: u64 = 0x6969;
+        const SMB_SUPER_MAGIC: u64 = 0x517b;
+        const SMB2_SUPER_MAGIC: u64 = 0xfe53_4d42;
+        const CIFS_SUPER_MAGIC: u64 = 0xff53_4d42;
+        const FUSE_SUPER_MAGIC: u64 = 0x6573_5546;
+        const CEPH_SUPER_MAGIC: u64 = 0x00c3_6400;
+        const NINEP_MAGIC: u64 = 0x0102_1997;
+        const AFS_SUPER_MAGIC: u64 = 0x5346_414f;
+        const KAFS_SUPER_MAGIC: u64 = 0x6b41_4653;
+        const CODA_SUPER_MAGIC: u64 = 0x7375_7245;
+        const NCP_SUPER_MAGIC: u64 = 0x564c;
+
+        let Ok(stat) = rustix::fs::fstatfs(file) else {
+            return true;
+        };
+        matches!(
+            stat.f_type as u64,
+            NFS_SUPER_MAGIC
+                | SMB_SUPER_MAGIC
+                | SMB2_SUPER_MAGIC
+                | CIFS_SUPER_MAGIC
+                | FUSE_SUPER_MAGIC
+                | CEPH_SUPER_MAGIC
+                | NINEP_MAGIC
+                | AFS_SUPER_MAGIC
+                | KAFS_SUPER_MAGIC
+                | CODA_SUPER_MAGIC
+                | NCP_SUPER_MAGIC
+        )
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        !is_eligible_local_filesystem(file)
+    }
+}
+
 /// Returns `true` only when `file` resides on a local, non-FAT/exFAT filesystem suitable
 /// for persistent sidecar identity guarantees. Automatically disables sidecars on network
 /// volumes (NFS, SMB/CIFS, AFP, WebDAV, FUSE, 9P, Ceph, remote drives) and FAT/exFAT.

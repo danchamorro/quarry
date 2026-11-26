@@ -4881,3 +4881,123 @@ fn adaptive_word_wrap_resets_frame_budget_on_single_row_and_bounds_wide_csvs(
         "wide CSV frame budget must remain <= 128 KiB; got {wide_used}"
     );
 }
+
+#[gpui_kit::test]
+fn live_watch_streams_appended_rows_pauses_scroll_and_handles_rotation(cx: &mut TestAppContext) {
+    use std::io::Write;
+
+    let dir = tempfile::tempdir().unwrap();
+    let csv_path = dir.path().join("live_feed.csv");
+    let mut initial = String::from("id,event\n");
+    for i in 1..=50 {
+        initial.push_str(&format!("{i},seed-{i:03}\n"));
+    }
+    std::fs::write(&csv_path, &initial).unwrap();
+
+    let controller = cx.update(|cx| {
+        gpui_kit::init(cx);
+        crate::apply_light_theme(cx);
+        bind_shortcuts(cx);
+        install_menus(cx);
+        cx.new(|_| {
+            WorkbenchController::new(WorkbenchSchedulerConfig {
+                index_cache_enabled: false,
+                ..WorkbenchSchedulerConfig::default()
+            })
+        })
+    });
+    let (handle, view) = open_test_window(cx, &controller);
+    let win_id = cx.update(|cx| view.read(cx).window_id);
+
+    cx.update(|cx| {
+        controller
+            .update(cx, |c, cx| {
+                c.open_paths(
+                    win_id,
+                    vec![csv_path.clone()],
+                    OpenOptions::default(),
+                    None,
+                    cx,
+                )
+            })
+            .unwrap();
+    });
+    wait_for_ui(cx, handle, &controller, &view, |q, _, cx| {
+        q.snapshot(cx).is_some_and(|s| s.index_done)
+    });
+
+    // Toggle Live Watch ON via the GPUI action.
+    cx.update_window(handle.into(), |_, window, cx| {
+        view.update(cx, |q, cx| {
+            q.toggle_live_watch_action(&crate::menus::ToggleLiveWatch, window, cx);
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    let snap_on = cx.update(|cx| view.read(cx).snapshot(cx).unwrap());
+    assert!(snap_on.live_watch.active);
+    assert!(snap_on.live_watch.tail_follow);
+    assert!(
+        cx.update(|cx| controller.read(cx).hud_announcement(win_id).cloned())
+            .is_some_and(|a| !a.is_alert && a.text.contains("Live Watch started")),
+        "starting Live Watch must emit a quiet transition announcement"
+    );
+
+    // Pause tail-follow by jumping up to row 1, then append 20 new rows.
+    cx.update_window(handle.into(), |_, window, cx| {
+        view.update(cx, |q, cx| {
+            let _ = q.controller.update(cx, |c, cx| {
+                c.set_live_watch_tail_follow_active(win_id, false, cx)
+            });
+            q.row_input
+                .update(cx, |input, cx| input.set_value("1", window, cx));
+            q.go_to_row(cx);
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    let mut writer = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&csv_path)
+        .unwrap();
+    for i in 51..=70 {
+        writeln!(writer, "{i},stream-{i:03}").unwrap();
+    }
+    writer.flush().unwrap();
+
+    wait_for_ui(cx, handle, &controller, &view, |q, _, cx| {
+        q.snapshot(cx).is_some_and(|s| s.total_rows == 70)
+    });
+    let snap_paused = cx.update(|cx| view.read(cx).snapshot(cx).unwrap());
+    assert!(snap_paused.live_watch.active);
+    assert!(!snap_paused.live_watch.tail_follow);
+    assert_eq!(snap_paused.live_watch.appended_rows, 20);
+
+    // Rename-rotate the file and verify the UI surfaces the Rotated alert and emits Role::Alert.
+    std::fs::rename(&csv_path, dir.path().join("live_feed.csv.1")).unwrap();
+    std::fs::write(&csv_path, b"id,event\n100,rotated-row\n").unwrap();
+
+    wait_for_ui(cx, handle, &controller, &view, |q, _, cx| {
+        q.snapshot(cx)
+            .is_some_and(|s| s.live_watch.alert == Some(quarry_core::WatchAlert::Rotated))
+    });
+    assert!(
+        cx.update(|cx| controller.read(cx).hud_announcement(win_id).cloned())
+            .is_some_and(|a| a.is_alert && a.text.contains("rotated")),
+        "rotation alert must emit a Role::Alert announcement"
+    );
+
+    // Clicking "Open New File" (ReloadFromDisk) loads the rotated replacement cleanly.
+    cx.update_window(handle.into(), |_, window, cx| {
+        view.update(cx, |q, cx| {
+            q.reload_action(&crate::menus::ReloadFromDisk, window, cx);
+        });
+    })
+    .unwrap();
+    wait_for_ui(cx, handle, &controller, &view, |q, _, cx| {
+        q.snapshot(cx)
+            .is_some_and(|s| s.index_done && s.total_rows == 1 && !s.source_changed)
+    });
+}

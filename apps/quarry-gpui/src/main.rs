@@ -32,7 +32,9 @@ use gpui_kit::{
     prelude::*,
     *,
 };
-use quarry_core::{BoundaryTrust, CaseSensitivity, Encoding, OpenOptions, ProcessMemorySample};
+use quarry_core::{
+    BoundaryTrust, CaseSensitivity, Encoding, OpenOptions, ProcessMemorySample, WatchAlert,
+};
 use quarry_workbench::{
     AppMessage, CommandId, DocumentId, EffectiveWordWrap, FailedOpen, GridSelection,
     MessageSeverity, ResidencyState, ResolvedTheme, SINGLE_LINE_ROW_HEIGHT_PX, ThemeAppearance,
@@ -52,12 +54,13 @@ use menus::{
     QUARRY_KEY_CONTEXT, QuitApp, RedoEdit, ReloadFromDisk, RenameHeader, ReplaceText, SaveAsFile,
     SaveAsUtf8, SaveFile, ShowAllWhitespace, SortRows, SplitColumn, TemporaryStorage, ThemeDark,
     ThemeLight, ThemeOmarchy, ThemeSystem, ToggleBookmark, ToggleBookmarks, ToggleColumns,
-    ToggleFilters, ToggleWordWrap, UndoEdit, VerifySectionBoundary, bind_shortcuts, encoding_label,
-    install_menus,
+    ToggleFilters, ToggleLiveWatch, ToggleWordWrap, UndoEdit, VerifySectionBoundary,
+    bind_shortcuts, encoding_label, install_menus,
 };
 use panels::{PanelEvent, Panels, Tool};
 use workbench::{
-    CloseReviewAction, DocumentSnapshot, MAX_EDIT_BYTES, WorkbenchController, WorkflowDialogKind,
+    CloseReviewAction, DocumentSnapshot, LiveWatchUiSnapshot, MAX_EDIT_BYTES, WorkbenchController,
+    WorkflowDialogKind,
 };
 
 pub struct QuarryWindow {
@@ -76,6 +79,8 @@ pub struct QuarryWindow {
     last_row_gutter_anchor: Option<u64>,
     last_word_wrap_active: bool,
     last_word_wrap_auto_disabled_doc: Option<(DocumentId, u64)>,
+    last_live_watch_rows: Option<(DocumentId, u64)>,
+    last_live_watch_tail_follow: bool,
     confirming: bool,
     editing: bool,
     editor_status: Option<Entity<CellEditStatus>>,
@@ -370,6 +375,8 @@ impl QuarryWindow {
             last_row_gutter_anchor: None,
             last_word_wrap_active: false,
             last_word_wrap_auto_disabled_doc: None,
+            last_live_watch_rows: None,
+            last_live_watch_tail_follow: false,
             confirming: false,
             editing: false,
             editor_status: None,
@@ -491,6 +498,28 @@ impl QuarryWindow {
                 } else {
                     self.table.update(cx, |_, cx| cx.notify());
                 }
+            }
+            if info.live_watch.active {
+                let row_key = (info.document_id, info.available_rows);
+                let rows_changed = self.last_live_watch_rows != Some(row_key);
+                let follow_resumed =
+                    info.live_watch.tail_follow && !self.last_live_watch_tail_follow;
+                self.last_live_watch_rows = Some(row_key);
+                self.last_live_watch_tail_follow = info.live_watch.tail_follow;
+                if rows_changed || follow_resumed {
+                    let tail_row = info.available_rows.saturating_sub(1) as usize;
+                    let follow = info.live_watch.tail_follow;
+                    self.table.update(cx, |table, cx| {
+                        table.refresh(cx);
+                        if follow && info.available_rows > 0 {
+                            table.scroll_to_row(tail_row, cx);
+                        }
+                        cx.notify();
+                    });
+                }
+            } else {
+                self.last_live_watch_rows = None;
+                self.last_live_watch_tail_follow = false;
             }
             if info.word_wrap.is_auto_disabled() {
                 if self.last_word_wrap_auto_disabled_doc != Some(doc_key) {
@@ -2392,6 +2421,30 @@ impl QuarryWindow {
         }
     }
 
+    fn toggle_live_watch_action(
+        &mut self,
+        _: &ToggleLiveWatch,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.command_enabled(CommandId::ToggleLiveWatch, cx) {
+            if let Some(reason) = self
+                .snapshot(cx)
+                .and_then(|snap| snap.live_watch.unavailable_reason)
+            {
+                self.set_message(AppMessage::warning(reason), cx);
+            }
+            return;
+        }
+        let result = self.controller.update(cx, |controller, cx| {
+            controller.toggle_live_watch_active(self.window_id, cx)
+        });
+        match result {
+            Ok(status) => self.set_message(AppMessage::status(status), cx),
+            Err(message) => self.set_message(message, cx),
+        }
+    }
+
     fn open_section_dialog_now(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.editing || self.confirming {
             return;
@@ -3439,6 +3492,155 @@ impl QuarryWindow {
     }
 
     #[inline(never)]
+    fn render_live_watch_banner(
+        &self,
+        snap: &DocumentSnapshot,
+        tokens: &quarry_workbench::theme::Palette,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let lw = &snap.live_watch;
+        if let Some(alert) = lw.alert.as_ref() {
+            let summary = alert.summary();
+            let is_rotated = matches!(alert, WatchAlert::Rotated);
+            let show_reload = matches!(alert, WatchAlert::Truncated { .. } | WatchAlert::Rewritten);
+            let mut bar = div()
+                .id("live-watch-alert-banner")
+                .role(Role::Alert)
+                .aria_label(summary.clone())
+                .min_h(px(34.))
+                .flex_shrink_0()
+                .flex()
+                .items_center()
+                .gap_2()
+                .px_3()
+                .py_1()
+                .border_b_1()
+                .border_color(cx.theme().border)
+                .bg(rgb(tokens.warning_fill.to_rgb_hex()))
+                .text_size(px(12.))
+                .text_color(rgb(tokens.warning_text.to_rgb_hex()))
+                .child(div().font_weight(FontWeight::SEMIBOLD).child("Live Watch"))
+                .child(div().flex_1().min_w_0().child(summary));
+
+            if is_rotated {
+                bar = bar.child(
+                    Button::new("live-watch-open-new-file")
+                        .label("Open New File")
+                        .accessibility_label("Open new rotated file")
+                        .ghost()
+                        .xsmall()
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.reload_action(&ReloadFromDisk, window, cx);
+                        })),
+                );
+            } else if show_reload {
+                bar = bar.child(
+                    Button::new("live-watch-reload")
+                        .label("Reload from Disk")
+                        .accessibility_label("Reload changed file from disk")
+                        .ghost()
+                        .xsmall()
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.reload_action(&ReloadFromDisk, window, cx);
+                        })),
+                );
+            }
+            bar = bar.child(
+                Button::new("live-watch-dismiss-alert")
+                    .label("Dismiss")
+                    .accessibility_label("Dismiss Live Watch alert")
+                    .ghost()
+                    .xsmall()
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.controller.update(cx, |controller, cx| {
+                            controller.dismiss_live_watch_alert_active(this.window_id, cx);
+                        });
+                    })),
+            );
+            return Some(bar.into_any_element());
+        }
+
+        if !lw.active {
+            return None;
+        }
+
+        let mode_label = if lw.following_unlinked {
+            "Following unlinked file"
+        } else if lw.tail_follow {
+            "Following tail"
+        } else {
+            "Scroll paused (still reading)"
+        };
+        let backend = lw.backend_label.unwrap_or("poll");
+        let tail_note = lw
+            .provisional_tail_bytes
+            .map(|b| format!(" · +1 incomplete tail ({})", format_bytes(b)))
+            .unwrap_or_default();
+        let summary = format!(
+            "Live Watch · {mode_label} · +{} rows ({backend}){tail_note} · Read-only while watching",
+            number(lw.appended_rows),
+        );
+
+        let mut bar = div()
+            .id("live-watch-banner")
+            .role(Role::Group)
+            .aria_label(summary.clone())
+            .min_h(px(32.))
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_3()
+            .py_1()
+            .border_b_1()
+            .border_color(cx.theme().border)
+            .bg(rgb(tokens.chrome.to_rgb_hex()))
+            .text_size(px(12.))
+            .font_features(grid::tabular_font_features())
+            .text_color(rgb(tokens.text.to_rgb_hex()))
+            .child(
+                div()
+                    .w(px(7.))
+                    .h(px(7.))
+                    .rounded_full()
+                    .bg(if lw.tail_follow {
+                        cx.theme().primary
+                    } else {
+                        rgb(tokens.warning_text.to_rgb_hex()).into()
+                    }),
+            )
+            .child(div().flex_1().min_w_0().child(summary));
+
+        if !lw.tail_follow {
+            bar = bar.child(
+                Button::new("live-watch-follow-tail")
+                    .label("Follow Tail")
+                    .accessibility_label("Resume following live tail")
+                    .ghost()
+                    .xsmall()
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        let _ = this.controller.update(cx, |controller, cx| {
+                            controller.set_live_watch_tail_follow_active(this.window_id, true, cx)
+                        });
+                    })),
+            );
+        }
+
+        bar = bar.child(
+            Button::new("live-watch-stop")
+                .label("Stop Watch")
+                .accessibility_label("Stop Live Watch")
+                .ghost()
+                .xsmall()
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.toggle_live_watch_action(&ToggleLiveWatch, window, cx);
+                })),
+        );
+
+        Some(bar.into_any_element())
+    }
+
+    #[inline(never)]
     fn render_section_banner(
         &self,
         snap: &DocumentSnapshot,
@@ -3919,6 +4121,7 @@ impl QuarryWindow {
         busy: bool,
         show_whitespace: bool,
         word_wrap: EffectiveWordWrap,
+        live_watch: &LiveWatchUiSnapshot,
         can_undo: bool,
         can_redo: bool,
         can_save: bool,
@@ -4066,6 +4269,32 @@ impl QuarryWindow {
                     .small()
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.toggle_word_wrap_action(&ToggleWordWrap, window, cx);
+                    })),
+            )
+            .child(
+                Button::new("toggle-live-watch")
+                    .label(if live_watch.active {
+                        "Watching"
+                    } else {
+                        "Watch"
+                    })
+                    .accessibility_label(if live_watch.active {
+                        "Stop Live Watch"
+                    } else {
+                        "Start Live Watch"
+                    })
+                    .tooltip(if live_watch.active {
+                        "Live Watch active — click to stop watching".to_owned()
+                    } else if let Some(reason) = live_watch.unavailable_reason {
+                        reason.to_owned()
+                    } else {
+                        "Live Watch Mode — stream newly appended rows live".to_owned()
+                    })
+                    .ghost()
+                    .small()
+                    .disabled(!loaded || (!live_watch.active && !live_watch.can_start))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.toggle_live_watch_action(&ToggleLiveWatch, window, cx);
                     })),
             )
             .child(div().flex_1())
@@ -4365,6 +4594,19 @@ impl QuarryWindow {
                             None
                         };
                     (label, control, None, info.can_cancel_indexing)
+                } else if info.live_watch.active {
+                    let label = if info.live_watch.tail_follow {
+                        format!(
+                            "Live Watch (+{} rows)",
+                            number(info.live_watch.appended_rows)
+                        )
+                    } else {
+                        format!(
+                            "Live Watch · scroll paused (+{} rows)",
+                            number(info.live_watch.appended_rows)
+                        )
+                    };
+                    (label, None, None, false)
                 } else if info.index_done {
                     ("Index complete".into(), None, None, false)
                 } else if info.index_cancelled {
@@ -4651,6 +4893,7 @@ impl Render for QuarryWindow {
             .on_action(cx.listener(Self::combine_columns_action))
             .on_action(cx.listener(Self::pause_resume_indexing_action))
             .on_action(cx.listener(Self::verify_section_boundary_action))
+            .on_action(cx.listener(Self::toggle_live_watch_action))
             .on_action(cx.listener(Self::toggle_whitespace_action))
             .on_action(cx.listener(Self::toggle_word_wrap_action))
             .on_action(cx.listener(Self::theme_system_action))
@@ -4687,12 +4930,17 @@ impl Render for QuarryWindow {
             body = body.child(self.render_tab_bar(&tabs, loaded, &tokens, cx));
         }
 
+        let live_watch_snapshot = info
+            .as_ref()
+            .map(|snap| snap.live_watch.clone())
+            .unwrap_or_default();
         body = body.child(self.render_toolbar(
             filename.clone(),
             loaded,
             busy,
             show_whitespace,
             word_wrap,
+            &live_watch_snapshot,
             can_undo,
             can_redo,
             can_save,
@@ -4707,6 +4955,9 @@ impl Render for QuarryWindow {
         }
 
         if let Some(ref snap) = info {
+            if let Some(banner) = self.render_live_watch_banner(snap, &tokens, cx) {
+                body = body.child(banner);
+            }
             if let Some(banner) = self.render_section_banner(snap, &tokens, cx) {
                 body = body.child(banner);
             }

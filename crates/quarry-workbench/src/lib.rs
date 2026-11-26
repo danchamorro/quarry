@@ -42,9 +42,9 @@ pub use workflows::{
 
 pub use document::{
     ActiveFilterRead, CapturedDocument, CellEdit, Document, DocumentLease, DocumentProbe,
-    FilterReadWindow, HeaderEdit, MaterializationPreparation, MaterializedWorkingCopy,
-    StructuralJob, StructuralProgressDisplay, ViewportReadPlan, footer_range_text,
-    materialization_progress, sort_progress,
+    FilterReadWindow, HeaderEdit, LIVE_WATCH_READ_ONLY_REASON, MaterializationPreparation,
+    MaterializedWorkingCopy, StructuralJob, StructuralProgressDisplay, ViewportReadPlan,
+    WATCH_REPAINT_THROTTLE, footer_range_text, materialization_progress, sort_progress,
 };
 pub use history::{
     EditHistory, EditTarget, MAX_EDIT_HISTORY_BYTES, MAX_EDIT_HISTORY_ENTRIES, SharedCellEdits,

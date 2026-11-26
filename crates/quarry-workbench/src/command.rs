@@ -97,6 +97,7 @@ pub enum CommandId {
     Filters,
     PauseResumeIndexing,
     VerifySectionBoundary,
+    ToggleLiveWatch,
     NextTab,
     PreviousTab,
     Quit,
@@ -147,10 +148,11 @@ impl FileCommands {
                 || document.structural_job.is_some()
         });
         let join_reserved = document.is_some_and(Document::join_reserved);
+        let live_watching = document.is_some_and(Document::is_live_watching);
         Self {
             // Combining writes a new file, so it needs only a free write slot.
             combine: write_slot_available,
-            reload: open && !file_operation_active && !dirty && !join_reserved,
+            reload: open && !file_operation_active && !dirty && !join_reserved && !live_watching,
             save: document.is_some_and(Document::is_save_ready),
             save_as: document.is_some_and(Document::is_save_as_ready),
             save_as_utf8: document.is_some_and(|document| {
@@ -239,7 +241,8 @@ pub fn evaluate_command(command: CommandId, ctx: &CommandContext<'_>) -> Command
         | CommandId::Columns
         | CommandId::Filters
         | CommandId::PauseResumeIndexing
-        | CommandId::VerifySectionBoundary => doc_target,
+        | CommandId::VerifySectionBoundary
+        | CommandId::ToggleLiveWatch => doc_target,
     };
 
     // Close-review actions are explicitly active during the close confirmation/wait modal.
@@ -338,6 +341,9 @@ pub fn evaluate_command(command: CommandId, ctx: &CommandContext<'_>) -> Command
         }
         CommandId::VerifySectionBoundary => {
             document.is_some_and(Document::can_verify_section_boundary)
+        }
+        CommandId::ToggleLiveWatch => {
+            document.is_some_and(|doc| doc.is_live_watching() || doc.can_start_live_watch())
         }
         CommandId::NextTab | CommandId::PreviousTab => ctx.open_document_count > 1,
         CommandId::KeepEditing | CommandId::DiscardAndClose => unreachable!(),

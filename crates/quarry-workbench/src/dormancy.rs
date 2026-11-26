@@ -226,6 +226,7 @@ pub enum PinReason {
     CompressedPendingStorage,
     IndexingPaused,
     SectionVerifying,
+    LiveWatching,
     JoinReserved,
     CloseFlowPending,
 }
@@ -969,6 +970,9 @@ impl WorkbenchScheduler {
         if doc.section_verify_job.is_some() || doc.pending_verified_reopen.is_some() {
             return Some(PinReason::SectionVerifying);
         }
+        if doc.is_live_watching() {
+            return Some(PinReason::LiveWatching);
+        }
         if slot.tab.document_writing() {
             return Some(PinReason::ActiveWriteJob);
         }
@@ -1027,6 +1031,76 @@ impl WorkbenchScheduler {
             .and_then(|tab| tab.document.as_mut())
             .ok_or_else(|| "Document is not hydrated.".to_owned())?;
         doc.resume_indexing()
+    }
+
+    /// Start opt-in append-only Live Watch Mode on hydrated tab `id`, reserving its OS descriptors
+    /// in the code-counted FD budget and pinning the tab against dormancy.
+    pub fn start_live_watch(&mut self, id: DocumentId) -> Result<(), AppMessage> {
+        self.start_live_watch_with_config(id, quarry_core::WatchConfig::default())
+    }
+
+    /// Start opt-in append-only Live Watch Mode with an explicit [`quarry_core::WatchConfig`].
+    pub fn start_live_watch_with_config(
+        &mut self,
+        id: DocumentId,
+        config: quarry_core::WatchConfig,
+    ) -> Result<(), AppMessage> {
+        let fd_budget = self.fd_budget.clone();
+        let slot = self
+            .tabs
+            .get_mut(&id)
+            .ok_or_else(|| AppMessage::error("Document was not found."))?;
+        let SlotResidency::Hydrated { job_fd_lease, .. } = &mut slot.residency else {
+            return Err(AppMessage::warning("Document is not hydrated."));
+        };
+        let doc = slot
+            .tab
+            .document
+            .as_mut()
+            .ok_or_else(|| AppMessage::warning("Document is not open."))?;
+        if let Some(reason) = doc.live_watch_unavailable_reason() {
+            return Err(AppMessage::warning(reason));
+        }
+        // Reserve worst-case watcher descriptors (1 open FD + 3 kqueue/inotify/pipe FDs) up front.
+        let worst_case = doc_active_job_fds(doc) + 4;
+        try_sync_optional_lease(
+            &fd_budget,
+            job_fd_lease,
+            FdCategory::BackgroundJob,
+            worst_case,
+        )
+        .map_err(|err| AppMessage::warning(err.to_string()))?;
+        let result = doc.start_live_watch_with_config(config);
+        let actual = doc_active_job_fds(doc);
+        let _ =
+            try_sync_optional_lease(&fd_budget, job_fd_lease, FdCategory::BackgroundJob, actual);
+        result
+    }
+
+    /// Stop Live Watch Mode on hydrated tab `id`, returning any terminal watch alert and releasing
+    /// watcher descriptors from the FD ledger.
+    pub fn stop_live_watch(
+        &mut self,
+        id: DocumentId,
+    ) -> Result<Option<quarry_core::WatchAlert>, AppMessage> {
+        let fd_budget = self.fd_budget.clone();
+        let slot = self
+            .tabs
+            .get_mut(&id)
+            .ok_or_else(|| AppMessage::error("Document was not found."))?;
+        let SlotResidency::Hydrated { job_fd_lease, .. } = &mut slot.residency else {
+            return Err(AppMessage::warning("Document is not hydrated."));
+        };
+        let doc = slot
+            .tab
+            .document
+            .as_mut()
+            .ok_or_else(|| AppMessage::warning("Document is not open."))?;
+        let outcome = doc.stop_live_watch();
+        let actual = doc_active_job_fds(doc);
+        let _ =
+            try_sync_optional_lease(&fd_budget, job_fd_lease, FdCategory::BackgroundJob, actual);
+        outcome
     }
 
     /// Cancel an active or paused background indexing job on `id`.
@@ -1933,6 +2007,9 @@ impl WorkbenchScheduler {
                 continue;
             };
             if let Err(err) = doc.poll() {
+                errors.push((id, err));
+            }
+            if let Err(err) = doc.poll_live_watch() {
                 errors.push((id, err));
             }
             if doc.bookmark_offset_refresh_pending
@@ -4194,6 +4271,7 @@ fn doc_non_filter_job_fds(doc: &Document) -> usize {
     usize::from(doc.job.is_some())
         + usize::from(doc.bookmark_offset_job.is_some())
         + usize::from(doc.section_verify_job.is_some())
+        + doc.live_watch_fd_count()
         + usize::from(doc.search_job.is_some()) * 2
         + usize::from(doc.export_job.is_some()) * 2
         + save_fds

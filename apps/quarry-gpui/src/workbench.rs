@@ -72,6 +72,20 @@ pub struct BookmarkListEntry {
     pub global_ordinal: Option<u64>,
 }
 
+/// Read-only snapshot of Live Watch Mode state for the active tab.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LiveWatchUiSnapshot {
+    pub active: bool,
+    pub tail_follow: bool,
+    pub can_start: bool,
+    pub unavailable_reason: Option<&'static str>,
+    pub backend_label: Option<&'static str>,
+    pub following_unlinked: bool,
+    pub appended_rows: u64,
+    pub provisional_tail_bytes: Option<u64>,
+    pub alert: Option<quarry_core::WatchAlert>,
+}
+
 /// Read-only snapshot of an active hydrated document for toolbar, panels, and status bar rendering.
 #[derive(Clone, Debug, PartialEq)]
 pub struct DocumentSnapshot {
@@ -84,6 +98,7 @@ pub struct DocumentSnapshot {
     pub word_wrap: EffectiveWordWrap,
     pub word_wrap_threshold_bytes: u64,
     pub section: Option<Box<SectionSnapshot>>,
+    pub live_watch: LiveWatchUiSnapshot,
     pub bookmark_count: usize,
     pub bookmarks: Vec<BookmarkListEntry>,
     pub split_at_bookmarks_disabled_reason: Option<String>,
@@ -1148,6 +1163,30 @@ impl WorkbenchController {
                 speculative_save_warning: doc.speculative_save_warning(),
             })
         });
+        let live_watch = LiveWatchUiSnapshot {
+            active: doc.is_live_watching(),
+            tail_follow: doc.live_watch_tail_follow,
+            can_start: doc.can_start_live_watch(),
+            unavailable_reason: doc.live_watch_unavailable_reason(),
+            backend_label: doc
+                .live_watch
+                .as_ref()
+                .map(|w| w.backend().label())
+                .or_else(|| doc.live_watch_snapshot.as_ref().map(|s| s.backend.label())),
+            following_unlinked: doc
+                .live_watch_snapshot
+                .as_ref()
+                .is_some_and(|s| s.status == quarry_core::WatchStatus::FollowingUnlinked),
+            appended_rows: doc
+                .live_watch_snapshot
+                .as_ref()
+                .map_or(0, |s| s.appended_rows),
+            provisional_tail_bytes: doc
+                .live_watch_snapshot
+                .as_ref()
+                .and_then(|s| s.provisional_tail.as_ref().map(|tail| tail.byte_len)),
+            alert: doc.live_watch_alert.clone(),
+        };
         let bookmark_count = doc.bookmarks.len();
         let bookmarks = doc
             .bookmarks
@@ -1170,6 +1209,7 @@ impl WorkbenchController {
             word_wrap,
             word_wrap_threshold_bytes,
             section,
+            live_watch,
             bookmark_count,
             bookmarks,
             split_at_bookmarks_disabled_reason,
@@ -1312,6 +1352,117 @@ impl WorkbenchController {
     ) {
         if let Some(id) = self.scheduler.active_document(window) {
             self.scheduler.cancel_verify_section_boundary(id);
+            cx.notify();
+        }
+    }
+
+    pub fn toggle_live_watch_active(
+        &mut self,
+        window: WindowId,
+        cx: &mut Context<Self>,
+    ) -> Result<String, AppMessage> {
+        let Some(id) = self.scheduler.active_document(window) else {
+            return Err(AppMessage::warning("Open a file first."));
+        };
+        let watching = self
+            .scheduler
+            .tab(id)
+            .and_then(|t| t.document.as_ref())
+            .is_some_and(quarry_workbench::Document::is_live_watching);
+        if watching {
+            self.stop_live_watch_active(window, cx)
+        } else {
+            self.start_live_watch_active_with_config(
+                window,
+                quarry_core::WatchConfig {
+                    cache_config: if self.scheduler.index_cache_enabled() {
+                        quarry_core::IndexCacheConfig::default()
+                    } else {
+                        quarry_core::IndexCacheConfig::disabled()
+                    },
+                    ..Default::default()
+                },
+                cx,
+            )
+        }
+    }
+
+    pub fn start_live_watch_active_with_config(
+        &mut self,
+        window: WindowId,
+        config: quarry_core::WatchConfig,
+        cx: &mut Context<Self>,
+    ) -> Result<String, AppMessage> {
+        let Some(id) = self.scheduler.active_document(window) else {
+            return Err(AppMessage::warning("Open a file first."));
+        };
+        self.scheduler.start_live_watch_with_config(id, config)?;
+        let backend = self
+            .scheduler
+            .tab(id)
+            .and_then(|t| t.document.as_ref())
+            .and_then(|d| d.live_watch.as_ref())
+            .map_or("poll", |w| w.backend().label());
+        let msg = format!("Live Watch started ({backend}).");
+        self.push_hud_announcement(window, msg.clone(), false, cx);
+        cx.notify();
+        Ok(msg)
+    }
+
+    pub fn stop_live_watch_active(
+        &mut self,
+        window: WindowId,
+        cx: &mut Context<Self>,
+    ) -> Result<String, AppMessage> {
+        let Some(id) = self.scheduler.active_document(window) else {
+            return Err(AppMessage::warning("Open a file first."));
+        };
+        let alert = self.scheduler.stop_live_watch(id)?;
+        let (msg, is_alert) = match alert {
+            Some(alert) => (alert.summary(), true),
+            None => ("Live Watch stopped.".to_owned(), false),
+        };
+        self.push_hud_announcement(window, msg.clone(), is_alert, cx);
+        cx.notify();
+        Ok(msg)
+    }
+
+    pub fn set_live_watch_tail_follow_active(
+        &mut self,
+        window: WindowId,
+        follow: bool,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let Some(id) = self.scheduler.active_document(window) else {
+            return Ok(());
+        };
+        let changed = {
+            let Some(doc) = self.scheduler.tab_mut(id).and_then(|t| t.document.as_mut()) else {
+                return Ok(());
+            };
+            if !doc.is_live_watching() || doc.live_watch_tail_follow == follow {
+                return Ok(());
+            }
+            doc.set_live_watch_tail_follow(follow)?;
+            true
+        };
+        if changed {
+            let text = if follow {
+                "Following live tail.".to_owned()
+            } else {
+                "Tail follow paused; still reading new rows.".to_owned()
+            };
+            self.push_hud_announcement(window, text, false, cx);
+            cx.notify();
+        }
+        Ok(())
+    }
+
+    pub fn dismiss_live_watch_alert_active(&mut self, window: WindowId, cx: &mut Context<Self>) {
+        if let Some(id) = self.scheduler.active_document(window)
+            && let Some(doc) = self.scheduler.tab_mut(id).and_then(|t| t.document.as_mut())
+        {
+            doc.dismiss_live_watch_alert();
             cx.notify();
         }
     }
@@ -4381,7 +4532,36 @@ impl WorkbenchController {
                 self.start_storage_inspection(cx);
             }
         }
+        let pre_watch_states: Vec<(WindowId, DocumentId, u64, bool)> = self
+            .scheduler
+            .windows()
+            .into_iter()
+            .filter_map(|win| {
+                let doc_id = self.scheduler.active_document(win)?;
+                let doc = self.scheduler.tab(doc_id)?.document.as_ref()?;
+                let watch_gen = doc.live_watch_snapshot.as_ref().map_or(0, |s| s.generation);
+                Some((win, doc_id, watch_gen, doc.live_watch_alert.is_some()))
+            })
+            .collect();
         let poll_errors = self.scheduler.poll_all();
+        for (win, doc_id, prev_gen, had_alert) in pre_watch_states {
+            if let Some(doc) = self.scheduler.tab(doc_id).and_then(|t| t.document.as_ref()) {
+                let cur_gen = doc.live_watch_snapshot.as_ref().map_or(0, |s| s.generation);
+                if cur_gen != prev_gen {
+                    changed = true;
+                }
+                if !had_alert && let Some(alert) = &doc.live_watch_alert {
+                    self.last_hud_announcement.insert(
+                        win,
+                        HudAnnouncement {
+                            text: alert.summary(),
+                            is_alert: true,
+                        },
+                    );
+                    changed = true;
+                }
+            }
+        }
         if !poll_errors.is_empty() {
             for (doc_id, error) in poll_errors {
                 if let Some(tab) = self.scheduler.tab_mut(doc_id) {
