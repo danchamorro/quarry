@@ -124,6 +124,46 @@ class ExtractReleaseNotesTests(unittest.TestCase):
             self.assertEqual(MOD.previous_tag_for(repo, "v0.3.0"), "v0.2.0")
             self.assertIsNone(MOD.previous_tag_for(repo, "v0.1.0"))
 
+    def test_missing_changelog_at_previous_tag_includes_same_day_entries(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="quarry-missing-cl-") as tmp:
+            repo = Path(tmp)
+            env = {
+                "GIT_AUTHOR_NAME": "Test",
+                "GIT_AUTHOR_EMAIL": "test@example.com",
+                "GIT_COMMITTER_NAME": "Test",
+                "GIT_COMMITTER_EMAIL": "test@example.com",
+                "GIT_AUTHOR_DATE": "2026-11-26T10:00:00Z",
+                "GIT_COMMITTER_DATE": "2026-11-26T10:00:00Z",
+            }
+            subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+            (repo / "README.md").write_text("init\n", encoding="utf-8")
+            subprocess.run(["git", "add", "README.md"], cwd=repo, check=True)
+            subprocess.run(["git", "commit", "-q", "-m", "v0.1.0"], cwd=repo, env=env, check=True)
+            subprocess.run(["git", "tag", "v0.1.0"], cwd=repo, env=env, check=True)
+
+            changelog_text = """# Changelog
+
+## [2026-11-26]
+
+### Added
+
+- Same-day feature added after v0.1.0. (#225)
+"""
+            (repo / "CHANGELOG.md").write_text(changelog_text, encoding="utf-8")
+            subprocess.run(["git", "add", "CHANGELOG.md"], cwd=repo, check=True)
+            subprocess.run(["git", "commit", "-q", "-m", "v0.2.0"], cwd=repo, env=env, check=True)
+            subprocess.run(["git", "tag", "v0.2.0"], cwd=repo, env=env, check=True)
+
+            prev_changelog = MOD.read_changelog_at_ref(repo, "v0.1.0")
+            self.assertEqual(prev_changelog, "")
+            notes = MOD.format_release_notes(
+                changelog_text,
+                tag="v0.2.0",
+                previous_tag="v0.1.0",
+                previous_changelog_text=prev_changelog,
+            )
+            self.assertIn("- Same-day feature added after v0.1.0. (#225)", notes)
+
     def test_format_release_notes_includes_compare_link_and_groups(self) -> None:
         notes = MOD.format_release_notes(
             SAMPLE_CHANGELOG,

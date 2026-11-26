@@ -81,14 +81,39 @@ def tag_commit_date(repo_root: Path, tag: str) -> str | None:
 
 
 def read_changelog_at_ref(repo_root: Path, ref: str, rel_path: str = "CHANGELOG.md") -> str | None:
-    """Read `CHANGELOG.md` from a Git ref, or None if unavailable."""
-    result = subprocess.run(
+    """Read `CHANGELOG.md` from a Git ref.
+
+    Returns file contents if present at `ref`, `""` if `ref` exists and `rel_path`
+    is confirmed absent at `ref`, or `None` if `ref` itself does not exist.
+    Raises `RuntimeError` if Git fails while inspecting an existing ref.
+    """
+    if not ref_exists(repo_root, ref):
+        return None
+
+    ls_tree = subprocess.run(
+        ["git", "-C", str(repo_root), "ls-tree", "--name-only", ref, "--", rel_path],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if ls_tree.returncode != 0:
+        raise RuntimeError(
+            f"git ls-tree failed for {ref}:{rel_path}: {ls_tree.stderr.strip()}"
+        )
+    if not ls_tree.stdout.strip():
+        return ""
+
+    show = subprocess.run(
         ["git", "-C", str(repo_root), "show", f"{ref}:{rel_path}"],
         text=True,
         capture_output=True,
         check=False,
     )
-    return result.stdout if result.returncode == 0 else None
+    if show.returncode != 0:
+        raise RuntimeError(
+            f"git show failed for {ref}:{rel_path}: {show.stderr.strip()}"
+        )
+    return show.stdout
 
 
 def extract_sections(
