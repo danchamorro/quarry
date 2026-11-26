@@ -29,16 +29,16 @@ Because Quarry preserves O(1) row-based scrolling (`DataTable` / `uniform_list`,
 
 ## 2. Hostile Single-Line Cell Budget Scaling (`40 × 12` Microbenchmark)
 
-| Cell Size | Per-Cell Wrap Measure | `40 × 12` Measurement Pass | Raw Bytes Decoded per Cell | Cells Degraded by 128 KiB Cap |
+| Cell Size | Per-Cell Wrap Measure | `40 × 12` Measurement Pass | Raw Bytes Validated per Cell | Cells Degraded by 128 KiB Cap |
 |---|---:|---:|---:|---:|
-| `64 B` | `0.07 µs` | `34.6 µs` | `39 B` | `0` |
-| `4 KiB` | `1.22 µs` | `39.3 µs` | `39 B` | `448` |
-| `64 KiB` | `1.22 µs` | `50.0 µs` | `39 B` | `448` |
-| `1 MiB` | `1.47 µs` | `39.4 µs` | `39 B` | `448` |
-| `10 MiB` | `1.22 µs` | `39.3 µs` | `39 B` | `448` |
+| `64 B` | `0.07 µs` | `34.6 µs` | `64 B` | `0` |
+| `4 KiB` | `1.22 µs` | `39.3 µs` | `4,096 B` | `448` |
+| `64 KiB` | `1.22 µs` | `50.0 µs` | `4,096 B` | `448` |
+| `1 MiB` | `1.47 µs` | `39.4 µs` | `4,096 B` | `448` |
+| `10 MiB` | `1.22 µs` | `39.3 µs` | `4,096 B` | `448` |
 
 ### Finding 2 (Flat O(1) Worst-Case Measurement Microbenchmark)
-Even when every cell in a `40 × 12` viewport contains a `10 MiB` single-line string, `MAX_WRAP_CELL_BYTES` (`4 KiB`), zero-allocation `utf8_chunks` early exit at `MAX_WRAPPED_LINES` (`2` lines, decoding `39 B`), and `MAX_WRAP_FRAME_BUDGET_BYTES` (`128 KiB`) hold the measurement pass flat at **`39.3–50.0 µs`**.
+Even when every cell in a `40 × 12` viewport contains a `10 MiB` single-line string, `MAX_WRAP_CELL_BYTES` (`4 KiB`), zero-allocation `utf8_chunks` early exit at `MAX_WRAPPED_LINES` (`2` lines), and `MAX_WRAP_FRAME_BUDGET_BYTES` (`128 KiB`) hold the measurement pass flat at **`39.3–50.0 µs`**.
 
 > **Measured boundary:** Section 2 times only `WrapFrameBudget::try_consume` and `measure_wrapped_cell` calls in the headless microbenchmark. It does **not** measure GPUI text shaping, whitespace rendering, row-cache overhead, or end-to-end 120 Hz presentation deadlines (which are tracked separately under `C07`/`T18`).
 

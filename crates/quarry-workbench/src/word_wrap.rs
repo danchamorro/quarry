@@ -357,17 +357,13 @@ impl WordWrapPreferences {
                         status_notice: None,
                     }
                 } else {
-                    // Clearing the override would leave the tab Active (e.g. threshold was
-                    // raised or set to 0), so invert the visible state by turning wrap off.
-                    let persist_warning = self
-                        .set_enabled(false)
-                        .err()
-                        .map(|e| format!("Could not save word wrap preference: {e}"));
-                    let effective = resolve_word_wrap(self, None, active_byte_len);
+                    // Clearing the override would still inherit Active (e.g. threshold was
+                    // raised or set to 0), so store a per-tab Off override instead of mutating
+                    // the global default for other tabs.
                     WordWrapToggleOutcome {
-                        effective,
-                        next_tab_override: None,
-                        persist_warning,
+                        effective: EffectiveWordWrap::Off,
+                        next_tab_override: Some(false),
+                        persist_warning: None,
                         status_notice: None,
                     }
                 }
@@ -391,6 +387,21 @@ impl WordWrapPreferences {
                 let exceeds = active_byte_len.is_some_and(|len| {
                     self.auto_disable_bytes > 0 && len > self.auto_disable_bytes
                 });
+                if current_tab_override == Some(false) && self.enabled {
+                    let next_tab_override = if exceeds { Some(true) } else { None };
+                    let effective = resolve_word_wrap(self, next_tab_override, active_byte_len);
+                    return WordWrapToggleOutcome {
+                        effective,
+                        next_tab_override,
+                        persist_warning: None,
+                        status_notice: exceeds.then(|| {
+                            format!(
+                                "Word wrap enabled for this tab (exceeds {}; {MAX_WRAPPED_LINES}-line and 4 KiB per-cell budgets remain active).",
+                                format_decimal_mb(self.auto_disable_bytes)
+                            )
+                        }),
+                    };
+                }
                 let persist_warning = self
                     .set_enabled(true)
                     .err()
@@ -529,13 +540,17 @@ pub fn measure_wrapped_cell(
     let mut line_chars: usize = 0;
     let mut word_chars: usize = 0;
     let mut truncated = byte_clamped;
-    let mut inspected = 0usize;
+    let mut validated_bytes = 0usize;
 
-    // Stream UTF-8 chunks without allocating so we stop scanning at the exact break point
-    // and `inspected_bytes` matches the exact number of raw input bytes decoded.
+    // Stream UTF-8 chunks without allocating. Because `Utf8Chunks::next` validates each
+    // yielded chunk upfront, count `chunk.valid().len() + chunk.invalid().len()` so
+    // `inspected_bytes` accurately reports every raw byte validated (never undercounting
+    // a validated 4 KiB ASCII prefix).
     'scan: for chunk in slice.utf8_chunks() {
+        validated_bytes = validated_bytes
+            .saturating_add(chunk.valid().len())
+            .saturating_add(chunk.invalid().len());
         for ch in chunk.valid().chars() {
-            inspected = inspected.saturating_add(ch.len_utf8());
             if advance_wrap_char(
                 ch,
                 chars_per_line,
@@ -548,26 +563,25 @@ pub fn measure_wrapped_cell(
                 break 'scan;
             }
         }
-        if !chunk.invalid().is_empty() {
-            inspected = inspected.saturating_add(chunk.invalid().len());
-            if advance_wrap_char(
+        if !chunk.invalid().is_empty()
+            && advance_wrap_char(
                 '\u{FFFD}',
                 chars_per_line,
                 max_lines,
                 &mut lines,
                 &mut line_chars,
                 &mut word_chars,
-            ) {
-                truncated = true;
-                break 'scan;
-            }
+            )
+        {
+            truncated = true;
+            break 'scan;
         }
     }
 
     WrapCellMetrics {
         lines: lines.min(max_lines) as u8,
         truncated,
-        inspected_bytes: inspected.min(prefix_len),
+        inspected_bytes: validated_bytes.min(prefix_len),
         display_char_budget,
     }
 }
@@ -984,15 +998,29 @@ mod tests {
         assert!(prefs.enabled);
 
         // If a tab had a manual override and the threshold is later raised (or set to 0)
-        // so the inherited state is Active, clicking Wrap: On must turn wrap off in one click.
+        // so the inherited state is Active, clicking Wrap: On must turn wrap off in one click
+        // using a per-tab `Some(false)` override without disabling global wrap for other tabs.
         let override_again = prefs.toggle_for_tab(None, Some(301_000_000));
         assert_eq!(override_again.next_tab_override, Some(true));
         prefs.set_auto_disable_bytes(0).unwrap();
         let single_click_off =
             prefs.toggle_for_tab(override_again.next_tab_override, Some(301_000_000));
         assert_eq!(single_click_off.effective, EffectiveWordWrap::Off);
-        assert_eq!(single_click_off.next_tab_override, None);
-        assert!(!prefs.enabled);
+        assert_eq!(single_click_off.next_tab_override, Some(false));
+        assert!(
+            prefs.enabled,
+            "turning off a tab override must not disable global wrap for other tabs"
+        );
+        // Clicking Wrap again clears the per-tab Off override and returns to inherited Active.
+        let restored = prefs.toggle_for_tab(single_click_off.next_tab_override, Some(301_000_000));
+        assert_eq!(
+            restored.effective,
+            EffectiveWordWrap::Active {
+                manual_override: false
+            }
+        );
+        assert_eq!(restored.next_tab_override, None);
+        assert!(prefs.enabled);
     }
 
     #[test]
@@ -1167,7 +1195,24 @@ mod tests {
             measure_wrapped_cell(&huge, 140.0, 13.0, MAX_WRAPPED_LINES, MAX_WRAP_CELL_BYTES);
         assert_eq!(bounded.lines, 2);
         assert!(bounded.truncated);
-        assert!(bounded.inspected_bytes <= MAX_WRAP_CELL_BYTES);
+        assert_eq!(
+            bounded.inspected_bytes, MAX_WRAP_CELL_BYTES,
+            "valid 4 KiB ASCII prefix validated by utf8_chunks must report the full 4 KiB bound"
+        );
+
+        let mut invalid_utf8 = b"short valid text ".to_vec();
+        invalid_utf8.extend_from_slice(&[0xFF, 0xFE]);
+        invalid_utf8.extend_from_slice(b" tail");
+        let invalid_metrics = measure_wrapped_cell(
+            &invalid_utf8,
+            240.0,
+            13.0,
+            MAX_WRAPPED_LINES,
+            MAX_WRAP_CELL_BYTES,
+        );
+        assert_eq!(invalid_metrics.lines, 1);
+        assert!(!invalid_metrics.truncated);
+        assert_eq!(invalid_metrics.inspected_bytes, invalid_utf8.len());
     }
 
     #[test]
