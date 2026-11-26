@@ -800,3 +800,42 @@ fn live_watch_refreshes_headers_when_unterminated_header_row_commits_and_after_s
         vec!["id", "status"]
     );
 }
+
+#[test]
+fn live_watch_prepare_async_buffer_read_returns_background_plan() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("async_viewport.csv");
+    let mut content = String::from("id,msg\n");
+    for i in 1..=300 {
+        content.push_str(&format!("{i},row-{i:04}\n"));
+    }
+    std::fs::write(&path, content.as_bytes()).unwrap();
+
+    let (mut scheduler, doc_id) = open_completed_scheduler(&path);
+    scheduler
+        .start_live_watch_with_config(
+            doc_id,
+            WatchConfig {
+                poll_interval: Duration::from_millis(50),
+                cache_config: quarry_core::IndexCacheConfig::disabled(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    // Request an uncached page near row 0 while watching (buffer currently sits at tail).
+    let plan = scheduler
+        .tab_mut(doc_id)
+        .unwrap()
+        .document
+        .as_mut()
+        .unwrap()
+        .prepare_async_buffer_read(0, 20)
+        .unwrap()
+        .expect("live watch uncached viewport must return an off-UI-thread ViewportReadPlan");
+    assert!(plan.live_watch_reader.is_some());
+    let rows = plan.execute().unwrap();
+    assert!(!rows.is_empty());
+    assert_eq!(rows[0].fields[0], b"1");
+    let _ = scheduler.stop_live_watch(doc_id).unwrap();
+}

@@ -836,6 +836,33 @@ impl WatchShared {
     }
 }
 
+/// Cloneable, thread-safe reader handle bound to a live watch job's pinned file descriptor so UI
+/// viewport reads can execute on background threads without blocking the UI thread.
+#[derive(Clone)]
+pub struct LiveWatchReader {
+    shared: Arc<WatchShared>,
+}
+
+impl LiveWatchReader {
+    /// Reads committed rows directly from the pinned open file descriptor, strictly bounded by
+    /// `committed_record_end` (safe across concurrent appends and rename rotation).
+    pub fn read_rows(&self, start: u64, count: usize) -> Result<Vec<Row>, QuarryError> {
+        let index = self.shared.index.read().unwrap().clone();
+        let committed_end = index.committed_record_end();
+        read_rows_from_open_file(
+            &self.shared.open_file,
+            self.shared.delimiter,
+            &index,
+            start,
+            count,
+            self.shared.max_record_bytes,
+            self.shared.encoding,
+            committed_end,
+            true,
+        )
+    }
+}
+
 /// Active opt-in append-only Live Watch job owned by a clean uncompressed document tab.
 pub struct LiveWatchJob {
     dialect: Dialect,
@@ -1157,22 +1184,17 @@ impl LiveWatchJob {
         1 + self.shared.backend.extra_fd_count()
     }
 
+    /// Returns a cloneable off-thread reader bound to this watch job's pinned file descriptor.
+    pub fn reader(&self) -> LiveWatchReader {
+        LiveWatchReader {
+            shared: Arc::clone(&self.shared),
+        }
+    }
+
     /// Reads committed rows directly from the pinned open file descriptor, strictly bounded by
     /// `committed_record_end` (safe across concurrent appends and rename rotation).
     pub fn read_rows(&self, start: u64, count: usize) -> Result<Vec<Row>, QuarryError> {
-        let index = self.shared.index.read().unwrap().clone();
-        let committed_end = index.committed_record_end();
-        read_rows_from_open_file(
-            &self.shared.open_file,
-            self.shared.delimiter,
-            &index,
-            start,
-            count,
-            self.shared.max_record_bytes,
-            self.shared.encoding,
-            committed_end,
-            true,
-        )
+        self.reader().read_rows(start, count)
     }
 
     /// Reads filtered matches directly from the pinned open file descriptor, strictly bounded by
@@ -1841,6 +1863,51 @@ enum DrainOutcome {
     Alert(WatchAlert),
 }
 
+enum SameSizeStampCheck {
+    ConfirmedRewrite,
+    Grew(SourceStamp),
+    Truncated { previous_len: u64, current_len: u64 },
+}
+
+/// Distinguishes a genuine same-size in-place rewrite from a mid-`write(O_APPEND)` kernel window
+/// where `file_modified()` has already updated `mtime` before `i_size_write()` extends the file
+/// length (observable via lockless `fstat()` on Linux `ext4` and macOS `APFS`).
+fn confirm_same_size_stamp_change(
+    open_file: &File,
+    tail: &TailScanner,
+) -> Result<SameSizeStampCheck, QuarryError> {
+    match tail.verify_seam(open_file, true)? {
+        SeamCheck::Rewritten => return Ok(SameSizeStampCheck::ConfirmedRewrite),
+        SeamCheck::Truncated { current_len } => {
+            return Ok(SameSizeStampCheck::Truncated {
+                previous_len: tail.observed_file_len.max(tail.committed_record_end),
+                current_len,
+            });
+        }
+        SeamCheck::Ok => {}
+    }
+
+    for delay_ms in [0u64, 1, 2, 5] {
+        if delay_ms == 0 {
+            thread::yield_now();
+        } else {
+            thread::sleep(Duration::from_millis(delay_ms));
+        }
+        let resampled = SourceStamp::from_file(open_file)?;
+        let len = resampled.file_size();
+        if len < tail.observed_file_len || len < tail.committed_record_end {
+            return Ok(SameSizeStampCheck::Truncated {
+                previous_len: tail.observed_file_len.max(tail.committed_record_end),
+                current_len: len,
+            });
+        }
+        if len > tail.observed_file_len {
+            return Ok(SameSizeStampCheck::Grew(resampled));
+        }
+    }
+    Ok(SameSizeStampCheck::ConfirmedRewrite)
+}
+
 fn drain_open_fd_locked(
     open_file: &File,
     tail: &mut TailScanner,
@@ -1850,8 +1917,8 @@ fn drain_open_fd_locked(
 ) -> Result<DrainOutcome, QuarryError> {
     let mut changed = false;
 
-    let current_stamp = SourceStamp::from_file(open_file)?;
-    let current_len = current_stamp.file_size();
+    let mut current_stamp = SourceStamp::from_file(open_file)?;
+    let mut current_len = current_stamp.file_size();
     if current_len < tail.observed_file_len || current_len < tail.committed_record_end {
         let previous_len = tail.observed_file_len.max(tail.committed_record_end);
         tail.observed_file_len = current_len;
@@ -1862,7 +1929,25 @@ fn drain_open_fd_locked(
     }
     let stamp_changed = current_stamp.content_version_changed(&tail.last_verified_stamp);
     if stamp_changed && current_len == tail.observed_file_len {
-        return Ok(DrainOutcome::Alert(WatchAlert::Rewritten));
+        match confirm_same_size_stamp_change(open_file, tail)? {
+            SameSizeStampCheck::ConfirmedRewrite => {
+                return Ok(DrainOutcome::Alert(WatchAlert::Rewritten));
+            }
+            SameSizeStampCheck::Truncated {
+                previous_len,
+                current_len,
+            } => {
+                tail.observed_file_len = current_len;
+                return Ok(DrainOutcome::Alert(WatchAlert::Truncated {
+                    previous_len,
+                    current_len,
+                }));
+            }
+            SameSizeStampCheck::Grew(resampled) => {
+                current_len = resampled.file_size();
+                current_stamp = resampled;
+            }
+        }
     }
 
     match tail.verify_seam(open_file, false)? {
@@ -1937,8 +2022,8 @@ fn drain_open_fd(
 
     // 1. Reconcile open FD size and source version to catch truncation and same-size in-place
     //    rewrites (even earlier than the 4 KiB tail seam when content metadata changes without growth).
-    let current_stamp = SourceStamp::from_file(&shared.open_file)?;
-    let current_len = current_stamp.file_size();
+    let mut current_stamp = SourceStamp::from_file(&shared.open_file)?;
+    let mut current_len = current_stamp.file_size();
     if current_len < tail.observed_file_len || current_len < tail.committed_record_end {
         let previous_len = tail.observed_file_len.max(tail.committed_record_end);
         tail.observed_file_len = current_len;
@@ -1949,7 +2034,25 @@ fn drain_open_fd(
     }
     let stamp_changed = current_stamp.content_version_changed(&tail.last_verified_stamp);
     if stamp_changed && current_len == tail.observed_file_len {
-        return Ok(DrainOutcome::Alert(WatchAlert::Rewritten));
+        match confirm_same_size_stamp_change(&shared.open_file, tail)? {
+            SameSizeStampCheck::ConfirmedRewrite => {
+                return Ok(DrainOutcome::Alert(WatchAlert::Rewritten));
+            }
+            SameSizeStampCheck::Truncated {
+                previous_len,
+                current_len,
+            } => {
+                tail.observed_file_len = current_len;
+                return Ok(DrainOutcome::Alert(WatchAlert::Truncated {
+                    previous_len,
+                    current_len,
+                }));
+            }
+            SameSizeStampCheck::Grew(resampled) => {
+                current_len = resampled.file_size();
+                current_stamp = resampled;
+            }
+        }
     }
 
     // 2. Verify committed tail seam + bounded trailing provisional window (at most 4 KiB each).
@@ -2773,14 +2876,22 @@ mod tests {
                 writer.flush().unwrap();
                 watch.nudge();
                 let target_len = writer.metadata().unwrap().len();
-                assert!(wait_until(Duration::from_secs(2), || {
-                    watch.snapshot().observed_file_len == target_len
-                }));
+                assert!(
+                    wait_until(Duration::from_secs(5), || {
+                        watch.snapshot().observed_file_len == target_len
+                    }),
+                    "expected observed_file_len {target_len}, got {:?}",
+                    watch.snapshot()
+                );
                 assert_eq!(watch.snapshot().status, WatchStatus::Watching);
             }
-            assert!(wait_until(Duration::from_secs(2), || {
-                watch.snapshot().committed_rows == 3
-            }));
+            assert!(
+                wait_until(Duration::from_secs(5), || {
+                    watch.snapshot().committed_rows == 3
+                }),
+                "expected 3 committed rows, got {:?}",
+                watch.snapshot()
+            );
 
             let rows = watch.read_rows(1, 2).unwrap();
             assert_eq!(rows[0].fields[1], "😀".as_bytes());

@@ -726,15 +726,13 @@ impl WorkbenchController {
             return;
         };
         let session = Arc::clone(&plan.session);
-        let index = plan.index;
         let start = plan.start;
-        let count = plan.count;
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
                 .spawn(async move {
                     let began = Instant::now();
-                    let read = session.read_rows(&index, start, count);
+                    let read = plan.execute();
                     (session, read, began.elapsed())
                 })
                 .await;

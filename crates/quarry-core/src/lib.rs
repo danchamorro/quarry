@@ -138,9 +138,9 @@ pub use storage::{
     validate_scratch_directory,
 };
 pub use watch::{
-    DEFAULT_WATCH_POLL_INTERVAL, LiveWatchFilterJob, LiveWatchJob, NETWORK_WATCH_POLL_INTERVAL,
-    WatchAlert, WatchBackend, WatchConfig, WatchProvisionalTail, WatchSnapshot, WatchStatus,
-    WatchStopOutcome,
+    DEFAULT_WATCH_POLL_INTERVAL, LiveWatchFilterJob, LiveWatchJob, LiveWatchReader,
+    NETWORK_WATCH_POLL_INTERVAL, WatchAlert, WatchBackend, WatchConfig, WatchProvisionalTail,
+    WatchSnapshot, WatchStatus, WatchStopOutcome,
 };
 
 const DEFAULT_SAMPLE_BYTES: usize = 1024 * 1024;

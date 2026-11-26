@@ -235,8 +235,21 @@ pub fn sort_progress(
 pub struct ViewportReadPlan {
     pub session: Arc<Session>,
     pub index: StructuralIndex,
+    pub live_watch_reader: Option<quarry_core::LiveWatchReader>,
     pub start: u64,
     pub count: usize,
+}
+
+impl ViewportReadPlan {
+    /// Executes the planned viewport read (off the UI thread), routing live-watched documents
+    /// through the watcher's pinned descriptor and static documents through `Session::read_rows`.
+    pub fn execute(&self) -> Result<Vec<Row>, QuarryError> {
+        if let Some(reader) = &self.live_watch_reader {
+            reader.read_rows(self.start, self.count)
+        } else {
+            self.session.read_rows(&self.index, self.start, self.count)
+        }
+    }
 }
 
 static NEXT_DOCUMENT_INSTANCE_ID: std::sync::atomic::AtomicU64 =
@@ -5556,12 +5569,13 @@ impl Document {
         let count = available.saturating_sub(start).min(capacity) as usize;
         let end = start.saturating_add(count as u64);
         if let Some(watch) = &self.live_watch {
-            let began = Instant::now();
-            let rows = watch
-                .read_rows(start, count)
-                .map_err(|error| self.diagnostic_error(error))?;
-            self.install_buffer_rows(start, rows, began.elapsed());
-            return Ok(None);
+            return Ok(Some(ViewportReadPlan {
+                session: Arc::clone(&self.session),
+                index: watch.index_snapshot(),
+                live_watch_reader: Some(watch.reader()),
+                start,
+                count,
+            }));
         }
         if end <= self.session.first_rows.len() as u64 {
             let began = Instant::now();
@@ -5573,6 +5587,7 @@ impl Document {
             return Ok(Some(ViewportReadPlan {
                 session: Arc::clone(&self.session),
                 index: index.clone(),
+                live_watch_reader: None,
                 start,
                 count,
             }));
@@ -5587,6 +5602,7 @@ impl Document {
             return Ok(Some(ViewportReadPlan {
                 session: Arc::clone(&self.session),
                 index: job.snapshot(),
+                live_watch_reader: None,
                 start,
                 count,
             }));
