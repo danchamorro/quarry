@@ -23,8 +23,9 @@ Prebuilt Linux tarballs for **`x86_64`** (most desktops and laptops) and **`arm6
 2. Verify the checksum and run the included user installer:
 
 ```bash
-ARCHIVE="Quarry-v0.2.0-beta.2-linux-x86_64.tar.gz"
-sha256sum -c SHA256SUMS-linux-x86_64.txt &&
+ARCH="x86_64" # or "arm64"
+ARCHIVE="Quarry-v0.2.0-beta.2-linux-${ARCH}.tar.gz"
+sha256sum -c "SHA256SUMS-linux-${ARCH}.txt" &&
   tar -xzf "$ARCHIVE" &&
   cd "${ARCHIVE%.tar.gz}" &&
   ./install.sh

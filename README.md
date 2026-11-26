@@ -31,16 +31,17 @@ Prebuilt releases for **macOS (Apple Silicon)** and **Linux / Omarchy (`x86_64` 
 2. Open the `.dmg` and drag **Quarry** into **Applications**.
 3. Launch **Quarry**—official releases are Developer ID signed, Apple-notarized, and stapled.
 
-Optionally verify the checksum with `shasum -a 256 -c SHA256SUMS-macos-arm64.txt`.
+Optionally download `SHA256SUMS-macos-arm64.txt` and verify your `.dmg` with `grep '\.dmg$' SHA256SUMS-macos-arm64.txt | shasum -a 256 -c -` (or `\.zip$` for the ZIP).
 
 ### Linux & Omarchy (`x86_64` & `arm64`)
 
-1. Download **`Quarry-v0.2.0-beta.2-linux-x86_64.tar.gz`** (most desktops/laptops) or **`Quarry-v0.2.0-beta.2-linux-arm64.tar.gz`** along with its `SHA256SUMS-linux-*.txt` from [GitHub Releases](https://github.com/danchamorro/quarry/releases/tag/v0.2.0-beta.2).
+1. Download **`Quarry-v0.2.0-beta.2-linux-x86_64.tar.gz`** (most desktops/laptops) or **`Quarry-v0.2.0-beta.2-linux-arm64.tar.gz`** along with its matching `SHA256SUMS-linux-*.txt` from [GitHub Releases](https://github.com/danchamorro/quarry/releases/tag/v0.2.0-beta.2).
 2. Verify, extract, and run the included user installer (no `sudo` required):
 
 ```bash
-ARCHIVE="Quarry-v0.2.0-beta.2-linux-x86_64.tar.gz"
-sha256sum -c SHA256SUMS-linux-x86_64.txt &&
+ARCH="x86_64" # or "arm64"
+ARCHIVE="Quarry-v0.2.0-beta.2-linux-${ARCH}.tar.gz"
+sha256sum -c "SHA256SUMS-linux-${ARCH}.txt" &&
   tar -xzf "$ARCHIVE" &&
   cd "${ARCHIVE%.tar.gz}" &&
   ./install.sh
