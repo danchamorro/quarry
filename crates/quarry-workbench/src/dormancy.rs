@@ -343,6 +343,8 @@ pub enum SchedulerError {
     },
     UnapprovedDirtyTabs(Vec<DocumentId>),
     OpenFailed(String),
+    /// An open failure that Inspect File cannot inspect (for example damaged gzip or a tar archive).
+    OpenFailedUninspectable(String),
 }
 
 impl fmt::Display for SchedulerError {
@@ -384,7 +386,9 @@ impl fmt::Display for SchedulerError {
                 "{} modified document(s) have not been approved for quit. Save, discard, or approve each modified tab before finalizing quit.",
                 ids.len()
             ),
-            Self::OpenFailed(message) => write!(f, "{message}"),
+            Self::OpenFailed(message) | Self::OpenFailedUninspectable(message) => {
+                write!(f, "{message}")
+            }
         }
     }
 }
@@ -1023,6 +1027,30 @@ impl WorkbenchScheduler {
             .and_then(|tab| tab.document.as_mut())
             .ok_or_else(|| "Document is not hydrated.".to_owned())?;
         doc.resume_indexing()
+    }
+
+    /// Cancel an active or paused background indexing job on `id`.
+    pub fn cancel_indexing(&mut self, id: DocumentId) -> bool {
+        let Some(doc) = self.tab_mut(id).and_then(|tab| tab.document.as_mut()) else {
+            return false;
+        };
+        if doc.job.is_none() || doc.progress.done {
+            return false;
+        }
+        doc.cancel();
+        true
+    }
+
+    /// Cancel an active Save or Save As job on `id`.
+    pub fn cancel_save(&mut self, id: DocumentId) -> bool {
+        let Some(doc) = self.tab_mut(id).and_then(|tab| tab.document.as_mut()) else {
+            return false;
+        };
+        if doc.save_job.is_none() || doc.save_cancel_requested {
+            return false;
+        }
+        doc.cancel_save();
+        true
     }
 
     /// Lazily registers a batch of paths (e.g. 200 files) as lightweight stubs without
@@ -2326,8 +2354,8 @@ impl WorkbenchScheduler {
             }
         } else {
             (
-                Document::prepare_with_encoding(&path, options, encoding)
-                    .map_err(SchedulerError::OpenFailed)?,
+                Document::prepare_checked(&path, options, encoding)
+                    .map_err(open_failure_to_scheduler_error)?,
                 false,
             )
         };
@@ -2977,10 +3005,19 @@ impl WorkbenchScheduler {
                 }
                 Ok(None) => {
                     if doc.save_job.is_none() {
-                        // Save was cancelled cleanly.
+                        // Save was cancelled cleanly; report a terminal outcome so any
+                        // in-flight close/quit review cancels cleanly while keeping edits.
                         any_finished = true;
                         slot.tab.write_destination = None;
                         slot.tab.close_after_save = false;
+                        let notice = doc
+                            .save_status
+                            .take()
+                            .unwrap_or_else(|| "Save cancelled.".into());
+                        results.push(SaveCompletion {
+                            document_id: id,
+                            result: Err(AppMessage::status(notice)),
+                        });
                     }
                 }
                 Err(error) => {
@@ -4550,6 +4587,14 @@ fn demote_document(
     })
 }
 
+fn open_failure_to_scheduler_error(failure: compressed::OpenFailure) -> SchedulerError {
+    if failure.inspectable {
+        SchedulerError::OpenFailed(failure.message)
+    } else {
+        SchedulerError::OpenFailedUninspectable(failure.message)
+    }
+}
+
 fn hydrate_from_stub(
     stub: &LazyDocumentStub,
     config: &WorkbenchSchedulerConfig,
@@ -4558,9 +4603,8 @@ fn hydrate_from_stub(
     fd_budget: &FdBudgetLedger,
     write_slot_available: bool,
 ) -> Result<(Document, Option<FdLease>, Option<FdLease>), SchedulerError> {
-    let mut doc =
-        Document::prepare_with_encoding(&stub.logical_path, stub.open_options, stub.encoding)
-            .map_err(SchedulerError::OpenFailed)?;
+    let mut doc = Document::prepare_checked(&stub.logical_path, stub.open_options, stub.encoding)
+        .map_err(open_failure_to_scheduler_error)?;
     doc.working_directory = config.working_directory.clone();
     doc.custom_working_directory = config.custom_working_directory;
     doc.index_cache_enabled = config.index_cache_enabled;

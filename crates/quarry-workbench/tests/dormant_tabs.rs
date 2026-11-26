@@ -2668,3 +2668,36 @@ fn paused_indexing_pins_tab_supports_partial_find_and_filter_and_resumes_cleanly
         Some(ResidencyState::DormantClean)
     );
 }
+
+#[test]
+fn damaged_gzip_returns_uninspectable_open_error_while_malformed_csv_is_inspectable() {
+    let dir = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let bad_gz = dir.path().join("corrupt.csv.gz");
+    std::fs::write(&bad_gz, b"not valid gzip bytes at all").unwrap();
+    let bad_csv = dir.path().join("malformed.csv");
+    std::fs::write(&bad_csv, "a,b\n\"unterminated,2\n").unwrap();
+
+    let mut scheduler = WorkbenchScheduler::new(WorkbenchSchedulerConfig {
+        max_hydrated_tabs: 4,
+        working_directory: scratch.path().to_path_buf(),
+        index_cache_enabled: false,
+        ..Default::default()
+    });
+
+    let gz_err = scheduler
+        .open_path(WindowId::PRIMARY, bad_gz, open_options(), None)
+        .unwrap_err();
+    assert!(
+        matches!(gz_err, SchedulerError::OpenFailedUninspectable(_)),
+        "expected OpenFailedUninspectable for damaged .gz, got {gz_err:?}"
+    );
+
+    let csv_err = scheduler
+        .open_path(WindowId::PRIMARY, bad_csv, open_options(), None)
+        .unwrap_err();
+    assert!(
+        matches!(csv_err, SchedulerError::OpenFailed(_)),
+        "expected inspectable OpenFailed for malformed .csv, got {csv_err:?}"
+    );
+}

@@ -305,6 +305,9 @@ pub struct Document {
     pub selection: Option<GridSelection>,
     pub cursor: GridCursor,
     pub selected_rows: RowSelection,
+    /// Selected filtered-result ordinals (`0..matches_found`) while a filter is active so
+    /// Shift-range selection works across viewport buffer boundaries in O(1) memory.
+    pub selected_filtered_rows: RowSelection,
     pub selected_columns: BTreeSet<usize>,
     pub column_selection_anchor: Option<usize>,
     pub headers: Vec<String>,
@@ -420,9 +423,11 @@ impl Document {
             return Self::prepare_compressed(path, options, encoding);
         }
         let session = Session::open_with_encoding(path, options, encoding).map_err(|error| {
+            let inspectable = !matches!(error, QuarryError::CompressedFile { .. })
+                && !compressed::compressed_source(path);
             compressed::OpenFailure {
                 message: error.to_string(),
-                inspectable: true,
+                inspectable,
             }
         })?;
         Ok(Self::from_session(session, path))
@@ -596,6 +601,7 @@ impl Document {
             selection: None,
             cursor: GridCursor::default(),
             selected_rows: RowSelection::default(),
+            selected_filtered_rows: RowSelection::default(),
             selected_columns: BTreeSet::new(),
             column_selection_anchor: None,
             headers,
@@ -2563,7 +2569,7 @@ impl Document {
             row: found.row,
             column: found.column,
         });
-        self.selected_rows.clear();
+        self.clear_row_selection();
         if let Some(index) = self.search_history_index.take() {
             self.search_history.truncate(index);
             self.search_history_limits.truncate(index);
@@ -2586,7 +2592,7 @@ impl Document {
         self.center_column(column);
         self.reveal_cell = Some((row, column));
         self.selection = Some(GridSelection::Cell { row, column });
-        self.selected_rows.clear();
+        self.clear_row_selection();
         self.selected_columns.clear();
         self.column_selection_anchor = None;
         let data_row = row.saturating_sub(self.data_start).saturating_add(1);
@@ -2733,7 +2739,7 @@ impl Document {
         self.whitespace.invalidate_rows();
         self.filtered_rows.clear();
         self.selection = None;
-        self.selected_rows.clear();
+        self.clear_row_selection();
         self.reveal_cell = None;
         self.scroll_points = 0.0;
         Ok(())
@@ -2753,7 +2759,7 @@ impl Document {
         self.filtered_rows.clear();
         self.whitespace.invalidate_rows();
         self.selection = None;
-        self.selected_rows.clear();
+        self.clear_row_selection();
         self.reveal_cell = None;
         self.filter_refresh_pending = true;
         self.filter_status = Some("Refreshing matches after edits…".into());
@@ -3924,7 +3930,7 @@ impl Document {
         self.whitespace.invalidate_rows();
         self.filtered_rows.clear();
         self.selection = None;
-        self.selected_rows.clear();
+        self.clear_row_selection();
         self.reveal_cell = None;
         self.save_status = Some(SOURCE_CHANGED_NOTICE.into());
     }
@@ -3980,7 +3986,7 @@ impl Document {
         self.whitespace.invalidate_rows();
         self.filtered_rows.clear();
         self.selection = None;
-        self.selected_rows.clear();
+        self.clear_row_selection();
         self.reveal_cell = None;
         self.scroll_points = 0.0;
     }
@@ -4320,7 +4326,7 @@ impl Document {
             .expect("editable cell text was checked as UTF-8")
             .to_owned();
         self.selection = Some(GridSelection::Cell { row, column });
-        self.selected_rows.clear();
+        self.clear_row_selection();
         self.cell_edit = Some(CellEdit {
             row,
             column,
@@ -4460,7 +4466,7 @@ impl Document {
         self.cell_edits = Arc::default();
         self.edit_history = EditHistory::default();
         self.selection = None;
-        self.selected_rows.clear();
+        self.clear_row_selection();
         self.reveal_cell = None;
         self.search_query.clear();
         self.last_match = None;
@@ -5166,8 +5172,8 @@ impl Document {
             return Some(name.as_bytes());
         }
         self.session
-            .first_rows
-            .first()?
+            .section_header_row()
+            .or_else(|| self.session.first_rows.first())?
             .fields
             .get(column)
             .map(|value| value.as_slice())
@@ -5199,6 +5205,57 @@ impl Document {
         )
     }
 
+    /// Queries the bounded async whitespace cache for a loaded cell without cloning on cache hits.
+    pub fn inspect_cell_whitespace(
+        &mut self,
+        row: u64,
+        column: usize,
+        raw_len: usize,
+    ) -> Option<whitespace::Summary> {
+        let id = whitespace::CellId {
+            row: Some(row),
+            column,
+        };
+        let cell_edits = &self.cell_edits;
+        let filter_active = self.filter_active();
+        let filtered_rows = &self.filtered_rows;
+        let buffered_rows = &self.buffered_rows;
+        let buffer_start = self.buffer_start;
+        self.whitespace.get(id, raw_len, || {
+            if let Some(value) = cell_edits.get(&(row, column)) {
+                return whitespace::Input::Owned(value.clone());
+            }
+            if filter_active {
+                let found = filtered_rows
+                    .iter()
+                    .find(|value| value.row == row)
+                    .expect("inspected filtered row is loaded");
+                whitespace::Input::Filtered(found.clone(), column)
+            } else {
+                let index = usize::try_from(row.saturating_sub(buffer_start))
+                    .expect("loaded row offset fits usize");
+                whitespace::Input::Row(buffered_rows[index].clone(), column)
+            }
+        })
+    }
+
+    /// Queries the bounded async whitespace cache for a column header without cloning on cache hits.
+    pub fn inspect_header_whitespace(
+        &mut self,
+        column: usize,
+        raw_len: usize,
+    ) -> Option<whitespace::Summary> {
+        let id = whitespace::CellId { row: None, column };
+        let header_renames = &self.header_renames;
+        let session = &self.session;
+        self.whitespace.get(id, raw_len, || {
+            header_renames.get(&column).map_or_else(
+                || whitespace::Input::Header(session.clone(), column),
+                |name| whitespace::Input::Text(name.clone()),
+            )
+        })
+    }
+
     /// Core jobs own their snapshots; copying is deferred until starting a data operation.
     pub fn owned_cell_edits(&self) -> BTreeMap<(u64, usize), Vec<u8>> {
         self.cell_edits
@@ -5219,6 +5276,39 @@ impl Document {
             .enumerate()
             .map(|(column, source)| self.cell_value(row, column, source).to_vec())
             .collect()
+    }
+
+    /// Clears both unfiltered physical row selections and filtered result-ordinal selections.
+    pub fn clear_row_selection(&mut self) {
+        self.selected_rows.clear();
+        self.selected_filtered_rows.clear();
+    }
+
+    /// Returns the number of selected rows in the active view (matching result ordinals while
+    /// filtered, or physical source rows when unfiltered).
+    pub fn selected_row_count(&self) -> u64 {
+        if self.filter_active() {
+            self.selected_filtered_rows.count()
+        } else {
+            self.selected_rows.count()
+        }
+    }
+
+    /// Reports whether rendered `(table_row, source_row)` is highlighted as a selected row.
+    pub fn is_table_row_selected(&self, table_row: usize, source_row: u64) -> bool {
+        if self.filter_active() {
+            self.selected_filtered_rows.contains(table_row as u64)
+        } else {
+            self.selected_rows.contains(source_row)
+        }
+    }
+
+    /// Resolves a loaded filtered `source_row` to its result ordinal (`0..matches_found`).
+    pub fn filtered_ordinal_for_source_row(&self, source_row: u64) -> Option<u64> {
+        self.filtered_rows
+            .iter()
+            .position(|r| r.row == source_row)
+            .map(|rel| self.filter_buffer_start.saturating_add(rel as u64))
     }
 
     pub fn current_source_row(&self) -> u64 {

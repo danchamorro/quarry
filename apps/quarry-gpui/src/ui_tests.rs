@@ -3986,3 +3986,549 @@ fn row_bookmarks_filtered_stepping_advances_and_wraps_cleanly(cx: &mut TestAppCo
     });
     assert_eq!((p1, p2), (2, 1));
 }
+
+#[gpui_kit::test]
+fn row_copy_works_after_cell_selection_and_under_active_filter(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("row_copy_parity.csv");
+    std::fs::write(&path, "id,name,group\n1,alpha,a\n2,beta,b\n3,gamma,a\n").unwrap();
+
+    let controller = cx.update(|cx| {
+        gpui_kit::init(cx);
+        crate::apply_light_theme(cx);
+        bind_shortcuts(cx);
+        install_menus(cx);
+        WorkbenchController::reset_for_test(
+            cx,
+            WorkbenchSchedulerConfig {
+                index_cache_enabled: false,
+                ..WorkbenchSchedulerConfig::default()
+            },
+        )
+    });
+    let (handle, view) = open_test_window(cx, &controller);
+    let win_id = cx.update(|cx| view.read(cx).window_id);
+
+    cx.update_window(handle.into(), |_, window, cx| {
+        view.update(cx, |q, cx| {
+            q.open_paths_direct(
+                vec![path.clone()],
+                OpenOptions {
+                    header_mode: HeaderMode::FirstRow,
+                    ..OpenOptions::default()
+                },
+                None,
+                window,
+                cx,
+            );
+        });
+    })
+    .unwrap();
+    wait_for_ui(cx, handle, &controller, &view, |q, _, cx| {
+        q.snapshot(cx).is_some_and(|s| s.index_done)
+    });
+
+    // Select a cell first, then select a row via gutter click; Cmd+C must copy the full row TSV.
+    cx.update_window(handle.into(), |_, window, cx| {
+        view.update(cx, |q, cx| {
+            q.table.update(cx, |t, cx| t.set_selected_cell(0, 1, cx));
+            controller.update(cx, |c, cx| {
+                c.select_cell_active(win_id, Some((1, 0)), cx);
+                c.select_row_active(win_id, 2, false, false, cx);
+            });
+            q.copy_action(&crate::CopySelection, window, cx);
+        });
+    })
+    .unwrap();
+
+    let copied = cx.update(|cx| {
+        cx.read_from_clipboard()
+            .and_then(|item| item.text())
+            .unwrap_or_default()
+    });
+    assert_eq!(copied, "2\tbeta\tb");
+
+    // Apply a filter and confirm row gutter selection & row copy still work while filtered.
+    cx.update(|cx| {
+        controller
+            .update(cx, |c, cx| {
+                c.start_filter_active(
+                    win_id,
+                    quarry_core::FilterQuery::single(
+                        2,
+                        quarry_core::FilterOperator::Equals,
+                        b"a".to_vec(),
+                    ),
+                    cx,
+                )
+            })
+            .unwrap();
+    });
+    wait_for_ui(cx, handle, &controller, &view, |q, _, cx| {
+        q.snapshot(cx)
+            .is_some_and(|s| s.filter_active && s.filter_done && s.available_rows == 2)
+    });
+
+    cx.update_window(handle.into(), |_, window, cx| {
+        view.update(cx, |q, cx| {
+            controller.update(cx, |c, cx| {
+                c.select_row_active(win_id, 3, false, false, cx);
+            });
+            q.open_context_menu_action(&crate::OpenContextMenu, window, cx);
+            assert!(q.grid_context_menu.is_some());
+            assert_eq!(
+                q.table.read(cx).selected_cell(),
+                Some((1, 0)),
+                "Shift+F10 on filtered source row 3 (match index 1) must select table row 1, not source offset 2"
+            );
+            q.close_grid_context_menu(cx);
+            q.copy_action(&crate::CopySelection, window, cx);
+        });
+    })
+    .unwrap();
+    let copied_filtered = cx.update(|cx| {
+        cx.read_from_clipboard()
+            .and_then(|item| item.text())
+            .unwrap_or_default()
+    });
+    assert_eq!(copied_filtered, "3\tgamma\ta");
+
+    // Keyboard navigation within column 0 (row gutter) must synchronize document row selection
+    // so Cmd/Ctrl+C copies the newly navigated row rather than the old clicked row.
+    cx.update_window(handle.into(), |_, _, cx| {
+        view.update(cx, |q, cx| {
+            q.table.update(cx, |t, cx| t.set_selected_cell(0, 0, cx));
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle.into(), |_, window, cx| {
+        view.update(cx, |q, cx| {
+            q.copy_action(&crate::CopySelection, window, cx);
+        });
+    })
+    .unwrap();
+    let copied_navigated = cx.update(|cx| {
+        cx.read_from_clipboard()
+            .and_then(|item| item.text())
+            .unwrap_or_default()
+    });
+    assert_eq!(copied_navigated, "1\talpha\ta");
+
+    // Shift-selecting across filtered rows (source rows 1 and 3 match; row 2 does not) must
+    // select only the 2 matching rows rather than physical range 1..=3 (count 3).
+    cx.update(|cx| {
+        controller.update(cx, |c, cx| {
+            c.select_row_active(win_id, 3, true, false, cx);
+        });
+    });
+    let filtered_shift_count = cx.update(|cx| {
+        controller
+            .read(cx)
+            .active_snapshot(win_id)
+            .expect("active snapshot")
+            .selected_rows_count
+    });
+    assert_eq!(
+        filtered_shift_count, 2,
+        "Shift-selection under a filter must select only matching rows, not hidden rows between them"
+    );
+}
+
+#[gpui_kit::test]
+fn filtered_bookmark_jump_updates_filtered_row_selection_anchor(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("filtered_bookmark_anchor.csv");
+    std::fs::write(
+        &path,
+        "id,name,tag\n1,row1,a\n2,row2,b\n3,row3,a\n4,row4,b\n5,row5,a\n",
+    )
+    .unwrap();
+
+    let controller = cx.update(|cx| {
+        gpui_kit::init(cx);
+        crate::apply_light_theme(cx);
+        bind_shortcuts(cx);
+        install_menus(cx);
+        WorkbenchController::reset_for_test(
+            cx,
+            WorkbenchSchedulerConfig {
+                index_cache_enabled: false,
+                ..WorkbenchSchedulerConfig::default()
+            },
+        )
+    });
+    let (handle, view) = open_test_window(cx, &controller);
+    let win_id = cx.update(|cx| view.read(cx).window_id);
+
+    cx.update_window(handle.into(), |_, window, cx| {
+        view.update(cx, |q, cx| {
+            q.open_paths_direct(
+                vec![path.clone()],
+                OpenOptions {
+                    header_mode: HeaderMode::FirstRow,
+                    ..OpenOptions::default()
+                },
+                None,
+                window,
+                cx,
+            );
+        });
+    })
+    .unwrap();
+    wait_for_ui(cx, handle, &controller, &view, |q, _, cx| {
+        q.snapshot(cx).is_some_and(|s| s.index_done)
+    });
+
+    // Bookmark source row 3 before filtering to tag == "a" (matches source rows 1, 3, 5).
+    cx.update(|cx| {
+        controller.update(cx, |c, cx| {
+            c.select_row_active(win_id, 3, false, false, cx);
+            c.toggle_bookmark_active(win_id, cx).unwrap();
+            c.filter_by_cell_value_active(
+                win_id,
+                2,
+                b"a".to_vec(),
+                true,
+                quarry_core::CaseSensitivity::Sensitive,
+                cx,
+            )
+            .unwrap();
+        });
+    });
+    wait_for_ui(cx, handle, &controller, &view, |q, _, cx| {
+        q.snapshot(cx)
+            .is_some_and(|s| s.filter_active && s.filter_done && s.available_rows == 3)
+    });
+
+    // Select source row 1 (filtered ordinal 0), jump to bookmarked source row 3 (filtered ordinal 1),
+    // then Shift-click source row 5 (filtered ordinal 2). Only rows 3 and 5 must be selected.
+    cx.update(|cx| {
+        controller.update(cx, |c, cx| {
+            c.select_row_active(win_id, 1, false, false, cx);
+            let (table_row, _) = c.jump_to_bookmark_active(win_id, 3, cx).unwrap();
+            assert_eq!(table_row, 1);
+            c.select_row_active(win_id, 5, true, false, cx);
+        });
+    });
+
+    cx.update(|cx| {
+        let controller_ref = controller.read(cx);
+        let snap = controller_ref
+            .active_snapshot(win_id)
+            .expect("active snapshot");
+        assert_eq!(
+            snap.selected_rows_count, 2,
+            "Shift-clicking row 5 after filtered bookmark jump to row 3 must select only 2 rows"
+        );
+        let doc = controller_ref
+            .active_document(win_id)
+            .expect("active document");
+        assert!(
+            !doc.is_table_row_selected(0, 1),
+            "source row 1 (ordinal 0) must not remain selected"
+        );
+        assert!(
+            doc.is_table_row_selected(1, 3),
+            "bookmarked source row 3 (ordinal 1) must be selected"
+        );
+        assert!(
+            doc.is_table_row_selected(2, 5),
+            "Shift-clicked source row 5 (ordinal 2) must be selected"
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn rename_header_targets_selected_column_and_context_menus_work(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("context_menu_parity.csv");
+    std::fs::write(
+        &path,
+        "id,name,city\n1,Alice,Boston\n2,Bob,Denver\n3,Cara,Boston\n",
+    )
+    .unwrap();
+
+    let controller = cx.update(|cx| {
+        gpui_kit::init(cx);
+        crate::apply_light_theme(cx);
+        bind_shortcuts(cx);
+        install_menus(cx);
+        WorkbenchController::reset_for_test(
+            cx,
+            WorkbenchSchedulerConfig {
+                index_cache_enabled: false,
+                ..WorkbenchSchedulerConfig::default()
+            },
+        )
+    });
+    let (handle, view) = open_test_window(cx, &controller);
+    let win_id = cx.update(|cx| view.read(cx).window_id);
+
+    cx.update_window(handle.into(), |_, window, cx| {
+        view.update(cx, |q, cx| {
+            q.open_paths_direct(
+                vec![path.clone()],
+                OpenOptions {
+                    header_mode: HeaderMode::FirstRow,
+                    ..OpenOptions::default()
+                },
+                None,
+                window,
+                cx,
+            );
+        });
+    })
+    .unwrap();
+    wait_for_ui(cx, handle, &controller, &view, |q, _, cx| {
+        q.snapshot(cx).is_some_and(|s| s.index_done)
+    });
+
+    // Cell is at column 0 (`id`), but user selects column 2 (`city`). Rename must target column 2.
+    cx.update_window(handle.into(), |_, window, cx| {
+        view.update(cx, |q, cx| {
+            q.table.update(cx, |t, cx| t.set_selected_cell(0, 1, cx));
+            controller.update(cx, |c, cx| {
+                c.select_column_active(win_id, 2, false, false, cx);
+            });
+            q.open_context_menu_action(&crate::OpenContextMenu, window, cx);
+            assert!(
+                q.grid_context_menu.is_some(),
+                "Shift+F10 on selected column must open column context menu"
+            );
+            q.close_grid_context_menu(cx);
+
+            // Invoke Rename Selected Column Header… with no explicit column: must target selected
+            // column 2 (`city`) rather than focused cell column 0 (`id`).
+            q.show_header_rename_dialog(None, window, cx);
+            assert!(q.editing, "header rename dialog must open");
+        });
+    })
+    .unwrap();
+    wait_for_ui(cx, handle, &controller, &view, |q, window, _| {
+        q.editing && window.try_find("apply-header-rename").is_some()
+    });
+    cx.update_window(handle.into(), |_, window, cx| {
+        let input = snapshots(window)
+            .into_iter()
+            .find(|element| element.label() == Some("Column header name"))
+            .expect("the dialog must render its accessible header input");
+        assert_eq!(
+            input.value(),
+            Some("city"),
+            "rename dialog must pre-fill selected column 2 (`city`), not focused column 0 (`id`)"
+        );
+        window
+            .within("dialog")
+            .click(input.path().last().unwrap().clone(), cx);
+        window.press(&format!("{PRIMARY_MOD}-a"), cx);
+        cx.write_to_clipboard(ClipboardItem::new_string("metro_area".to_string()));
+        window.press(&format!("{PRIMARY_MOD}-v"), cx);
+        window.click("apply-header-rename", cx);
+    })
+    .unwrap();
+    wait_for_ui(cx, handle, &controller, &view, |q, window, _| {
+        !q.editing && window.try_find("apply-header-rename").is_none()
+    });
+    let headers_after_rename = cx.update(|cx| {
+        controller
+            .read(cx)
+            .active_snapshot(win_id)
+            .expect("active snapshot")
+            .headers
+    });
+    assert_eq!(
+        headers_after_rename[0], "id",
+        "focused cell column 0 must remain unchanged"
+    );
+    assert_eq!(
+        headers_after_rename[2], "metro_area",
+        "selected column 2 must receive the submitted rename"
+    );
+
+    // Open row gutter context menu via GridAction and verify row gets auto-selected.
+    cx.update_window(handle.into(), |_, window, cx| {
+        view.update(cx, |q, cx| {
+            q.handle_grid_action(
+                crate::GridAction::RowContextMenu {
+                    table_row: 1,
+                    source_row: 2,
+                    position: gpui_kit::Point::new(px(24.), px(120.)),
+                },
+                window,
+                cx,
+            );
+            assert!(q.grid_context_menu.is_some());
+            q.close_grid_context_menu(cx);
+        });
+    })
+    .unwrap();
+    let row_sel = cx.update(|cx| controller.read(cx).active_selection(win_id));
+    assert_eq!(
+        row_sel,
+        Some(quarry_workbench::GridSelection::Row { row: 2 })
+    );
+
+    // Open cell context menu and verify table selection syncs to the right-clicked cell before
+    // invoking quick Filter to This Value (`city == Boston` -> 2 rows).
+    cx.update_window(handle.into(), |_, window, cx| {
+        view.update(cx, |q, cx| {
+            q.handle_grid_action(
+                crate::GridAction::CellContextMenu {
+                    table_row: 0,
+                    table_col: 3,
+                    source_row: 1,
+                    source_col: 2,
+                    position: gpui_kit::Point::new(px(260.), px(100.)),
+                },
+                window,
+                cx,
+            );
+            assert!(q.grid_context_menu.is_some());
+            assert_eq!(
+                q.table.read(cx).selected_cell(),
+                Some((0, 3)),
+                "right-clicking a cell must sync TableState::selected_cell()"
+            );
+            q.close_grid_context_menu(cx);
+            q.apply_quick_cell_filter(
+                2,
+                b"Boston".to_vec(),
+                true,
+                quarry_core::CaseSensitivity::Insensitive,
+                window,
+                cx,
+            );
+        });
+    })
+    .unwrap();
+    wait_for_ui(cx, handle, &controller, &view, |q, _, cx| {
+        q.snapshot(cx)
+            .is_some_and(|s| s.filter_active && s.filter_done && s.available_rows == 2)
+    });
+
+    // Quick Filter Out This Value (`city != Boston` -> 1 row).
+    cx.update_window(handle.into(), |_, window, cx| {
+        view.update(cx, |q, cx| {
+            q.apply_quick_cell_filter(
+                2,
+                b"Boston".to_vec(),
+                false,
+                quarry_core::CaseSensitivity::Insensitive,
+                window,
+                cx,
+            );
+        });
+    })
+    .unwrap();
+    wait_for_ui(cx, handle, &controller, &view, |q, _, cx| {
+        q.snapshot(cx)
+            .is_some_and(|s| s.filter_active && s.filter_done && s.available_rows == 1)
+    });
+}
+
+#[gpui_kit::test]
+fn whitespace_persists_damaged_gzip_uninspectable_and_drag_drop_opens_files(
+    cx: &mut TestAppContext,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let pref_path = dir.path().join("view-preferences");
+    let valid_csv = dir.path().join("ws_ragged.csv");
+    std::fs::write(
+        &valid_csv,
+        "id,name,extra\n1,alpha,10\n\"  hi\tthere\n\",x\n",
+    )
+    .unwrap();
+    let bad_gz = dir.path().join("broken.csv.gz");
+    std::fs::write(&bad_gz, b"corrupt gzip payload").unwrap();
+    let subfolder = dir.path().join("folder");
+    std::fs::create_dir_all(&subfolder).unwrap();
+
+    let controller = cx.update(|cx| {
+        gpui_kit::init(cx);
+        crate::apply_light_theme(cx);
+        bind_shortcuts(cx);
+        install_menus(cx);
+        let prefs = quarry_workbench::whitespace::Preferences::load(Some(pref_path.clone()));
+        cx.new(|_| {
+            WorkbenchController::new(WorkbenchSchedulerConfig {
+                index_cache_enabled: false,
+                ..WorkbenchSchedulerConfig::default()
+            })
+            .with_whitespace_prefs(prefs)
+        })
+    });
+    let (handle, view) = open_test_window(cx, &controller);
+    let win_id = cx.update(|cx| view.read(cx).window_id);
+
+    // Toggle whitespace and verify persistence to disk.
+    cx.update_window(handle.into(), |_, window, cx| {
+        view.update(cx, |q, cx| {
+            q.toggle_whitespace_action(&crate::ShowAllWhitespace, window, cx);
+        });
+    })
+    .unwrap();
+    assert!(cx.update(|cx| controller.read(cx).show_all_whitespace()));
+    assert!(quarry_workbench::whitespace::Preferences::load(Some(pref_path)).show_all);
+
+    // Dropping only a folder warns cleanly without opening a tab.
+    cx.update_window(handle.into(), |_, _, cx| {
+        view.update(cx, |q, cx| {
+            q.handle_dropped_paths(vec![subfolder.clone()], cx);
+        });
+    })
+    .unwrap();
+    assert!(cx.update(|cx| view.read(cx).snapshot(cx).is_none()));
+    assert!(cx.update(|cx| {
+        controller
+            .read(cx)
+            .window_message(win_id)
+            .is_some_and(|m| m.text.contains("folders cannot be opened"))
+    }));
+
+    // Dropping a real CSV file opens it and exposes raw whitespace + absent ragged column 2.
+    cx.update_window(handle.into(), |_, _, cx| {
+        view.update(cx, |q, cx| {
+            q.handle_dropped_paths(vec![valid_csv.clone()], cx);
+        });
+    })
+    .unwrap();
+    wait_for_ui(cx, handle, &controller, &view, |q, _, cx| {
+        q.snapshot(cx).is_some_and(|s| s.index_done)
+    });
+
+    let (raw_cell_0, absent_cell_2, absent_label) = cx.update(|cx| {
+        let table = view.read(cx).table.read(cx);
+        let c0 = table.delegate().cell_raw_value(1, 1, cx);
+        let c2 = table.delegate().cell_raw_value(1, 3, cx);
+        let lbl = table.delegate().cell_label(1, 3, cx);
+        (c0, c2, lbl)
+    });
+    assert_eq!(
+        raw_cell_0.and_then(|(_, _, v)| v),
+        Some(b"  hi\tthere\n".to_vec())
+    );
+    assert_eq!(absent_cell_2.and_then(|(_, _, v)| v), None);
+    assert_eq!(
+        absent_label.as_deref(),
+        Some("extra: Field is absent from this row.")
+    );
+
+    // Opening a damaged .gz file returns an error WITHOUT an inspection target.
+    let gz_err = cx.update(|cx| {
+        controller.update(cx, |c, cx| {
+            c.open_paths(
+                win_id,
+                vec![bad_gz.clone()],
+                OpenOptions::default(),
+                None,
+                cx,
+            )
+        })
+    });
+    let err_msg = gz_err.expect_err("damaged .gz must fail");
+    assert!(
+        err_msg.inspection_target.is_none(),
+        "damaged .gz open failure must not offer Inspect… button"
+    );
+}
