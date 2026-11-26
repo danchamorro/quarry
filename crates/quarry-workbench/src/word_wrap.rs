@@ -302,14 +302,12 @@ impl WordWrapPreferences {
     }
 
     /// Sets the global default word-wrap flag and persists it atomically.
+    ///
+    /// Preserves the in-memory toggle if persistence fails (matching `whitespace::Preferences::set`)
+    /// so users can still toggle Word Wrap during the session while seeing the persistence warning.
     pub fn set_enabled(&mut self, enabled: bool) -> io::Result<()> {
-        let previous = self.enabled;
         self.enabled = enabled;
-        if let Err(err) = self.persist_current() {
-            self.enabled = previous;
-            return Err(err);
-        }
-        Ok(())
+        self.persist_current()
     }
 
     /// Sets the adaptive auto-disable file-size threshold in bytes and persists it atomically.
@@ -365,15 +363,10 @@ impl WordWrapPreferences {
                         .set_enabled(false)
                         .err()
                         .map(|e| format!("Could not save word wrap preference: {e}"));
-                    let next_tab_override = if persist_warning.is_some() {
-                        current_tab_override
-                    } else {
-                        None
-                    };
-                    let effective = resolve_word_wrap(self, next_tab_override, active_byte_len);
+                    let effective = resolve_word_wrap(self, None, active_byte_len);
                     WordWrapToggleOutcome {
                         effective,
-                        next_tab_override,
+                        next_tab_override: None,
                         persist_warning,
                         status_notice: None,
                     }
@@ -386,15 +379,10 @@ impl WordWrapPreferences {
                     .set_enabled(false)
                     .err()
                     .map(|e| format!("Could not save word wrap preference: {e}"));
-                let next_tab_override = if persist_warning.is_some() {
-                    current_tab_override
-                } else {
-                    None
-                };
-                let effective = resolve_word_wrap(self, next_tab_override, active_byte_len);
+                let effective = resolve_word_wrap(self, None, active_byte_len);
                 WordWrapToggleOutcome {
                     effective,
-                    next_tab_override,
+                    next_tab_override: None,
                     persist_warning,
                     status_notice: None,
                 }
@@ -420,15 +408,10 @@ impl WordWrapPreferences {
                         )),
                     }
                 } else {
-                    let next_tab_override = if persist_warning.is_some() {
-                        current_tab_override
-                    } else {
-                        None
-                    };
-                    let effective = resolve_word_wrap(self, next_tab_override, active_byte_len);
+                    let effective = resolve_word_wrap(self, None, active_byte_len);
                     WordWrapToggleOutcome {
                         effective,
-                        next_tab_override,
+                        next_tab_override: None,
                         persist_warning,
                         status_notice: None,
                     }
@@ -1013,16 +996,30 @@ mod tests {
     }
 
     #[test]
-    fn toggle_for_tab_keeps_effective_state_aligned_when_save_fails() {
+    fn toggle_for_tab_preserves_runtime_toggle_when_save_fails() {
         let dir = tempfile::tempdir().unwrap();
         // Passing a directory as the preference file path forces `persist` to fail on all OSes.
         let mut prefs = WordWrapPreferences::load(Some(dir.path().to_path_buf()));
         assert!(!prefs.enabled);
 
-        let failed_on = prefs.toggle_for_tab(None, Some(10_000_000));
-        assert!(failed_on.persist_warning.is_some());
-        assert_eq!(failed_on.effective, EffectiveWordWrap::Off);
-        assert_eq!(failed_on.next_tab_override, None);
+        let toggled_on = prefs.toggle_for_tab(None, Some(10_000_000));
+        assert!(toggled_on.persist_warning.is_some());
+        assert_eq!(
+            toggled_on.effective,
+            EffectiveWordWrap::Active {
+                manual_override: false
+            }
+        );
+        assert_eq!(toggled_on.next_tab_override, None);
+        assert!(prefs.enabled);
+        assert_eq!(
+            resolve_word_wrap(&prefs, toggled_on.next_tab_override, Some(10_000_000)),
+            toggled_on.effective
+        );
+
+        let toggled_off = prefs.toggle_for_tab(None, Some(10_000_000));
+        assert!(toggled_off.persist_warning.is_some());
+        assert_eq!(toggled_off.effective, EffectiveWordWrap::Off);
         assert!(!prefs.enabled);
 
         // Over-threshold tab override still activates for the current tab even if saving fails.
