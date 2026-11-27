@@ -7,18 +7,18 @@ pub enum CaseSensitivity {
     Sensitive,
 }
 
-pub(crate) struct ByteMatcher<'a> {
-    needle: &'a [u8],
+pub(crate) struct ByteMatcher {
+    needle: Vec<u8>,
     case_sensitivity: CaseSensitivity,
-    finder: Finder<'a>,
+    finder: Finder<'static>,
 }
 
-impl<'a> ByteMatcher<'a> {
-    pub(crate) fn new(needle: &'a [u8], case_sensitivity: CaseSensitivity) -> Self {
+impl ByteMatcher {
+    pub(crate) fn new(needle: &[u8], case_sensitivity: CaseSensitivity) -> Self {
         Self {
-            needle,
+            needle: needle.to_vec(),
             case_sensitivity,
-            finder: Finder::new(needle),
+            finder: Finder::new(needle).into_owned(),
         }
     }
 
@@ -48,15 +48,15 @@ impl<'a> ByteMatcher<'a> {
 
     pub(crate) fn equals(&self, value: &[u8]) -> bool {
         match self.case_sensitivity {
-            CaseSensitivity::Insensitive => value.eq_ignore_ascii_case(self.needle),
-            CaseSensitivity::Sensitive => value == self.needle,
+            CaseSensitivity::Insensitive => value.eq_ignore_ascii_case(&self.needle),
+            CaseSensitivity::Sensitive => value == self.needle.as_slice(),
         }
     }
 
     fn matches_at(&self, haystack: &[u8], position: usize) -> bool {
         haystack
             .get(position..position.saturating_add(self.needle.len()))
-            .is_some_and(|value| value.eq_ignore_ascii_case(self.needle))
+            .is_some_and(|value| value.eq_ignore_ascii_case(&self.needle))
     }
 }
 

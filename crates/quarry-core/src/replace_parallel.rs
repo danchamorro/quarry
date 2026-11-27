@@ -568,7 +568,7 @@ fn estimate_replace_memory(
     has_header: bool,
     header_renames: &BTreeMap<usize, Vec<u8>>,
     cell_edits: &BTreeMap<(u64, usize), Vec<u8>>,
-    matcher: &ByteMatcher<'_>,
+    matcher: &ByteMatcher,
     needle_contains_quote: bool,
     expansion_ratio: usize,
     max_record_bytes: usize,

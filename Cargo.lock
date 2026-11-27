@@ -5513,6 +5513,7 @@ dependencies = [
  "libc",
  "memchr",
  "quarry-delimited",
+ "regex",
  "rustix",
  "tempfile",
  "windows-sys 0.61.2",

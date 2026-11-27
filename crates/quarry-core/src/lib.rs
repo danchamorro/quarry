@@ -15,6 +15,7 @@ mod join;
 mod join_faults;
 mod pool;
 mod positional_io;
+mod regex_match;
 mod search;
 mod section;
 mod sidecar;
@@ -105,8 +106,13 @@ use quarry_delimited::ParseError;
 pub use quarry_delimited::{
     ByteEncodingClass, EscapeRule, ScannerDialect, SimdBackend, active_simd_backend,
 };
+pub use regex_match::{
+    MAX_FILTER_REGEX_PREDICATES, MAX_REGEX_COMPILED_SIZE_BYTES, MAX_REGEX_DFA_SIZE_BYTES,
+    MAX_REGEX_NEST_LIMIT, MAX_REGEX_PATTERN_BYTES, validate_regex,
+};
 pub use search::{
-    SearchJob, SearchMatch, SearchOutcome, SearchPosition, SearchProgress, SearchTelemetry,
+    SearchJob, SearchMatch, SearchMode, SearchOutcome, SearchPosition, SearchProgress,
+    SearchTelemetry,
 };
 pub use section::{
     BoundaryProof, BoundaryTrust, ByteUnit, ByteWindow, MAX_SPECULATIVE_SEARCH_BYTES,
@@ -296,8 +302,9 @@ pub enum QuarryError {
     },
     InvalidFilter {
         rule: usize,
-        reason: &'static str,
+        reason: Cow<'static, str>,
     },
+    InvalidRegex(String),
     InvalidOption(&'static str),
     ExportDestinationIsSource,
     ExportDestinationExists,
@@ -432,6 +439,7 @@ impl fmt::Display for QuarryError {
             Self::InvalidFilter { rule, reason } => {
                 write!(f, "invalid filter rule {rule}: {reason}")
             }
+            Self::InvalidRegex(reason) => f.write_str(reason),
             Self::InvalidOption(option) => write!(f, "invalid option: {option}"),
             Self::ExportDestinationIsSource => {
                 write!(f, "export destination must differ from the source file")

@@ -9,6 +9,7 @@ rust-version.workspace = true
 flate2 = { version = "1.1.9", default-features = false, features = ["rust_backend"] }
 memchr.workspace = true
 quarry-delimited = { path = "../quarry-delimited" }
+regex = "1.13.2"
 tempfile = "3.27.0"
 
 [target.'cfg(unix)'.dependencies]
