@@ -522,9 +522,7 @@ impl WorkbenchController {
         cx.spawn(async move |cx| {
             loop {
                 let action = cx.update(|cx| {
-                    if Self::try_global(cx).is_none() {
-                        return None;
-                    }
+                    Self::try_global(cx)?;
                     let (busy, omarchy_update) = poll_entity.update(cx, |this, cx| {
                         this.poll_background(cx);
                         let update = this.take_omarchy_theme_update(cx);
