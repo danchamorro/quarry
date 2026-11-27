@@ -20,8 +20,14 @@ GitHub pull requests.
 
 ### Changed
 
+- Retired the unused GitHub Project board links across `README.md`, `docs/ROADMAP.md`, `docs/README.md`, `docs/ROADMAP_HISTORY.md`, and the issue template, pointing contributors directly to `docs/ROADMAP.md` and GitHub Issues. (#235)
+- Replaced the outdated `v0.1`–`v0.5` log in `docs/PRD.md` with a current product requirements document and corrected stale temporary-storage, indexing, sorting, and tab-dormancy details in `docs/ARCHITECTURE.md`, `docs/USER_GUIDE.md`, and `README.md`. (#235)
 - Refreshed audited third-party license notice inventories across macOS Apple Silicon and Linux `x86_64` / `arm64` after adding `regex` to `quarry-core` (with no new third-party crates added to `Cargo.lock`). (#232)
 - Updated **Download & Install** links and asset filenames in `README.md` and `docs/LINUX_AND_OMARCHY.md` to point to the published `v0.2.0-beta.3` release. (#230)
+
+### Fixed
+
+- Corrected the documented `v0.2.0-beta.3` clean Git revision in `docs/BETA_TESTER_GUIDE.md`, `docs/BETA_RELEASE_CHECKLIST.md`, and `docs/MACOS_PACKAGING.md` from the annotated tag object (`d57dec9`) to the tagged commit (`c3febf3`) embedded in release bundles. (#235)
 
 ## [2026-11-26]
 
