@@ -8,6 +8,12 @@ Tagged beta releases are noted on the day they were published, with exact
 checksums and verification details under `docs/releases/`. Numbers in
 parentheses are GitHub pull requests.
 
+## [2026-11-27]
+
+### Changed
+
+- Updated **Download & Install** links and asset filenames in `README.md` and `docs/LINUX_AND_OMARCHY.md` to point to the published `v0.2.0-beta.3` release. (#230)
+
 ## [2026-11-26]
 
 ### Added
