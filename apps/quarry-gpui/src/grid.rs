@@ -878,6 +878,21 @@ impl TableDelegate for Grid {
                     let _ = controller.set_live_watch_tail_follow_active(window_id, false, cx);
                 }
             }
+            let skip_for_in_flight_tail = controller
+                .scheduler()
+                .active_document(window_id)
+                .is_some_and(|doc_id| {
+                    controller.has_live_watch_tail_read_in_flight(doc_id)
+                        && controller
+                            .active_document(window_id)
+                            .is_some_and(|doc| doc.is_live_watching() && doc.live_watch_tail_follow)
+                });
+            if skip_for_in_flight_tail {
+                if let Some(doc) = controller.active_document_mut(window_id) {
+                    doc.viewport_rows = range.len().max(1);
+                }
+                return;
+            }
             controller.request_viewport_rows(window_id, range.start as u64, range.len().max(1), cx);
         });
     }
