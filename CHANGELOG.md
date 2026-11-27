@@ -4,9 +4,10 @@ All notable changes to Quarry are documented here. This file is maintained by
 hand. The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 Changes are grouped by the day they merged into `main` (US Eastern time).
-Tagged beta releases are noted on the day they were published, with exact
-checksums and verification details under `docs/releases/`. Numbers in
-parentheses are GitHub pull requests.
+Tagged beta releases are noted on the day they were published; their GitHub
+Release bodies are generated from this file. Versioned notes under
+`docs/releases/` are reserved for major releases. Numbers in parentheses are
+GitHub pull requests.
 
 ## [2026-11-27]
 

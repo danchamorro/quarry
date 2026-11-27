@@ -1,5 +1,10 @@
 # GPUI frontend validation
 
+> **Status:** historical record. `apps/quarry-gpui` is the shipping desktop
+> application on macOS and Linux/Omarchy; `apps/quarry-egui` was retired on
+> 2026-11-24 at the Phase 4B-3 cutover. The sections below keep the evidence as
+> recorded on their dates ([current packaging and release status](../../docs/MACOS_PACKAGING.md)).
+
 ## Phase 4B-1 hardening and live VM verification (2026-11-23)
 
 `apps/quarry-gpui` is now a unified member of the root Cargo workspace on `gpui-kit = "=0.10.0"` and Rust `1.100.0` (PR `#191`), and [ADR 0013](../../docs/adr/0013-adopt-gpui-desktop-frontend.md) records the decision to adopt GPUI as Quarry's v1.0 desktop frontend while keeping `apps/quarry-egui` as the default packaged macOS app until Phase 4B-3 cutover.
@@ -15,7 +20,7 @@ Full Phase 4B-1 evidence is recorded in [docs/benchmarks/2026-11-23-phase4b1-gpu
 - **Live accessibility verification:**
   - **macOS (`macOS VM 1`, `accesskit_macos 0.26.3`):** Verified live toolbar, disabled states, editable fields, `DataTable` column headers, row numbers, per-cell `Column N: value` labels, status bar, `Format`/`Columns` popovers, and Cell Editor dialog-close focus restoration back to the grid.
   - **Linux / Omarchy (`Omarchy VM 4`, Hyprland `0.56.2`, `accesskit_unix 0.22.1`):** Verified native Wayland (`"xwayland": false`), Vulkan 1.4 surface creation (Mesa `26.2.5` Lavapipe), `cosmic-text` font resolution, `org.freedesktop.portal.FileChooser` v4 availability, and live AT-SPI tree exposure (`Application`, `Frame`, `ToolBar`, `Table`, `ColumnHeader`, `TableRow`, `TableCell`, `StatusBar`).
-- **Remaining work tracked for Phase 4B-2 / 4B-3 / 6 / 9B:** Full desktop feature parity with `apps/quarry-egui`, 200-tab / multi-window `WorkbenchScheduler` wiring, Dark and Omarchy themes, unlocked visual `1.25×`/`1.5×` fractional-scaling and hardware Vulkan / 120 Hz frame-pacing verification, and Phase 4B-3 packaging + `T19` shipping notice cutover.
+- **Work open at the time of this record:** desktop parity with `apps/quarry-egui`, 200-tab / multi-window `WorkbenchScheduler` wiring, Dark and Omarchy themes, unlocked visual `1.25×`/`1.5×` fractional scaling and hardware Vulkan / 120 Hz frame pacing, and Phase 4B-3 packaging + `T19` shipping notice cutover. Parity, the 200-tab/multi-window scheduler, Dark and Omarchy themes, and the packaging/notice cutover completed at the [Phase 4B-3 cutover](../../docs/benchmarks/2026-11-23-phase4b3-gpui-cutover-verification.md); bare-metal 120 Hz frame-deadline verification stays gated on owner-approved hardware.
 
 ---
 

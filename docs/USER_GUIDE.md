@@ -6,6 +6,7 @@ delimited files in the Quarry desktop app on **macOS** and **Linux / Omarchy**.
 ## Contents
 
 - [Getting started](#getting-started)
+- [Version and feedback](#version-and-feedback)
 - [How to](#how-to)
   - [Choose a theme](#choose-a-theme)
   - [Wrap long cells (Adaptive Word Wrap)](#wrap-long-cells-adaptive-word-wrap)
@@ -13,10 +14,12 @@ delimited files in the Quarry desktop app on **macOS** and **Linux / Omarchy**.
   - [Pause indexing and read the Live Resource HUD](#pause-indexing-and-read-the-live-resource-hud)
   - [Open a section of a huge file](#open-a-section-of-a-huge-file)
   - [Bookmark rows for quick navigation](#bookmark-rows-for-quick-navigation)
+  - [Watch a growing file with Live Watch Mode](#watch-a-growing-file-with-live-watch-mode)
   - [Open compressed files](#open-compressed-files)
   - [Combine files](#combine-files)
   - [Join files](#join-files)
   - [Navigate the grid](#navigate-the-grid)
+  - [Use grid context menus](#use-grid-context-menus)
   - [Inspect whitespace](#inspect-whitespace)
   - [Select and copy data](#select-and-copy-data)
   - [Add rows and columns](#add-rows-and-columns)
@@ -37,16 +40,17 @@ delimited files in the Quarry desktop app on **macOS** and **Linux / Omarchy**.
   - [Temporary storage, index cache, and free space](#temporary-storage-index-cache-and-free-space)
   - [Save, Save As, and discard](#save-save-as-and-discard)
 - [Case matching](#case-matching)
+  - [Bounded regular expressions (CLI & core)](#bounded-regular-expressions-cli--core)
 - [Mouse and keyboard reference](#mouse-and-keyboard-reference)
 - [Troubleshooting](#troubleshooting)
 - [Inspecting file issues and creating recovery copies](#inspecting-file-issues-and-creating-recovery-copies)
-- [Version and feedback](#version-and-feedback)
 
 ## Getting started
 
 ### 1. Install and open Quarry
 
-Follow [Install & Build from Source](../README.md#install--build-from-source) in the README.
+Follow [Build from Source](../README.md#build-from-source) in the README, or use
+[Download & Install](../README.md#download--install) for a prebuilt release.
 For macOS packaging, updates, and rollback, see the [macOS packaging guide](MACOS_PACKAGING.md).
 For Linux and Omarchy Wayland/Hyprland builds and theme sync, see the [Linux & Omarchy guide](LINUX_AND_OMARCHY.md).
 
@@ -518,6 +522,30 @@ The number of visible rows follows the available window height. When a filter
 is active, direct row jumping is disabled because the grid is showing matches
 rather than a continuous source-row range.
 
+### Use grid context menus
+
+Right-click a column header, a row number in the `#` gutter, or a data cell to
+open a menu for that part of the grid. **Shift+F10** opens the same menu from the
+keyboard, targeting the selected column first, then the selected row, then the
+selected cell.
+
+- **Column header:** **Insert Columns Before…**, **Insert Columns After…**,
+  **Rename Column Header…**, **Clean Up Columns…**, **Split Selected Column…**,
+  **Combine Selected Columns…**, **Move Selected Columns…**, **Delete Selected
+  Columns**, **Find Duplicates…**, and **Sort Rows…**. The clicked column becomes
+  the selection anchor for these actions.
+- **Row number (`#` gutter):** **Add Bookmark** or **Remove Bookmark**, **Insert
+  Rows Above…**, **Insert Rows Below…**, **Copy Row**, and **Delete Selected
+  Rows**.
+- **Data cell:** **Filter to This Value**, **Filter Out This Value**, **Copy
+  Cell**, and **Edit Cell…**. The two filter actions replace the current filter
+  with a single rule on the clicked cell's column.
+
+Actions stay disabled while a conflicting operation or a pending split is in
+progress, on empty files that cannot take the action, and on documents that
+cannot be edited (compressed files and `Speculative` sections), matching the
+equivalent menu and toolbar commands.
+
 ### Inspect whitespace
 
 Quarry marks leading and trailing whitespace, repeated spaces, tabs, line breaks,
@@ -606,12 +634,12 @@ deleting rows so every selected number identifies a physical data row.
 
 #### Edit a cell
 
-1. Double-click the cell, or select it and press Enter or F2 (or choose **Edit → Edit Selected Cell…**).
-2. Enter the new value. Use Shift+Enter to insert a newline.
-3. Press Enter to keep the edit, or press Escape to cancel it.
+1. Double-click the cell, or select it and press F2 (or choose **Edit → Edit Selected Cell…**).
+2. Enter the new value in the editor. Newlines typed here are kept in the value.
+3. Choose **Apply edit** to keep the edit, or **Cancel** to discard it.
 
-Clicking elsewhere also keeps the active edit. The source file is not changed
-until you choose **File → Save** (Command+S on macOS, Ctrl+S on Linux).
+The source file is not changed until you choose **File → Save** (Command+S on
+macOS, Ctrl+S on Linux).
 
 #### Rename a header
 
@@ -629,10 +657,10 @@ cell values and header names one at a time, including **Replace in Cell**.
 Repeated changes to the same cell remain separate steps. Keeping an unchanged
 value or cancelling an editor does not create a step or clear Redo.
 
-On macOS, press Command+Z to undo and Command+Shift+Z to redo. Other platforms
-use Ctrl+Z and Ctrl+Shift+Z, with Ctrl+Y also available for Redo. While typing
-in a text field, these shortcuts act on that field's text. Commit or cancel an
-inline cell or header editor before using document Undo or Redo. The commands
+On macOS, press Command+Z to undo and Command+Shift+Z to redo. Linux uses Ctrl+Z
+and Ctrl+Shift+Z. While typing in a text field, these shortcuts act on that
+field's text. Close the cell editor or header rename dialog before using
+document Undo or Redo. The commands
 are unavailable while a filter or conflicting operation is active, or after a
 source-file conflict.
 
@@ -1221,8 +1249,8 @@ setting.
 | Reload from Disk | `Command+R` | `Ctrl+R` |
 | Quit Quarry | `Command+Q` | `Ctrl+Q` |
 | Jump to a data row | Enter in **Row**, or click **Go** | Enter in **Row**, or click **Go** |
-| Edit selected cell | Double-click, `Enter`, or `F2` | Double-click, `Enter`, or `F2` |
-| Keep / Cancel cell edit | `Enter` / `Escape` (`Shift+Enter` for newline) | `Enter` / `Escape` (`Shift+Enter` for newline) |
+| Edit selected cell | Double-click, `F2`, or **Edit → Edit Selected Cell…** | Double-click, `F2`, or **Edit → Edit Selected Cell…** |
+| Keep / cancel a cell edit | **Apply edit** / **Cancel** in the editor dialog | **Apply edit** / **Cancel** in the editor dialog |
 | Rename selected column header | **Edit → Rename Selected Column Header…** | **Edit → Rename Selected Column Header…** |
 | Undo / Redo | `Command+Z` / `Command+Shift+Z` | `Ctrl+Z` / `Ctrl+Shift+Z` |
 | Copy selected cell or row | `Command+C` | `Ctrl+C` |
@@ -1230,6 +1258,8 @@ setting.
 | Replace… | `Command+Option+F` | `Ctrl+H` |
 | Toggle row bookmark | `Command+B` or right-click `#` gutter | `Ctrl+B` or right-click `#` gutter |
 | Next / Previous row bookmark | `Command+]` / `Command+[` | `Ctrl+]` / `Ctrl+[` |
+| Open the grid context menu | `Shift+F10` or right-click | `Shift+F10` or right-click |
+| Start / stop Live Watch Mode | `Command+Shift+L` | `Ctrl+Shift+L` |
 | Toggle adaptive word wrap | `Option+Z` (grid focused) | `Alt+Z` (grid focused) |
 | Move by one page | `Page Up` / `Page Down` | `Page Up` / `Page Down` |
 | Select a row or column range | `Shift+Click` row/column numbers | `Shift+Click` row/column numbers |

@@ -19,16 +19,18 @@ The production desktop application is built with Rust and **GPUI** (`apps/quarry
 - **Parallel out-of-core transforms:** Adaptive 300 MB in-RAM fast path with automatic bounded disk spilling, persisted scratch directory, multi-threaded stable Sort (1–16 columns including Natural and Date/time), parallel Find & Remove Duplicates (key columns or whole rows), parallel Replace All, and partitioned multi-threaded Hash-Join with sort-merge skew fallback.
 - **GPU-accelerated desktop workbench (`quarry-gpui`):** Native macOS and Linux/Omarchy Wayland/Hyprland UI, Light / WCAG AA Dark / System / live Omarchy theme sync, multi-window support for up to 200 open tabs with automatic dormant-tab eviction (`< 128` open FDs), AccessKit (macOS) and AT-SPI (Linux) accessibility, and zero network/telemetry dependencies.
 - **Large-file controls, sections & bookmarks:** Pause/Resume Indexing, Live Resource HUD (`phys_footprint` / `VmRSS` and free disk), **Open Section…** (`Bytes`–`TiB`, verified on a 20 TiB sparse file) with outward boundary snapping, `Verified` vs `Speculative` boundary verification, **Save Section As New File**, **Guarded Section Splice-Save** (APFS CoW / Linux `FICLONE` with streaming fallback), and **Session Row Bookmarks**.
+- **Live streaming & reading ergonomics:** Opt-in append-only **Live Watch Mode** (**Data → Live Watch**, `Cmd/Ctrl+Shift+L`) using native `kqueue` (macOS), `inotify` (Linux), or bounded polling on network volumes, with provisional tail handling, scroll-preserving tail follow, and rename-rotation / truncation recovery; plus adaptive two-line **Word Wrap** with a configurable `300 MB` auto-disable threshold ([ADR 0016](adr/0016-live-watch-mode.md)).
 
 ## Upcoming Toward v1.0
 
 Upcoming milestones are broken into issues just-in-time on the [GitHub Project](https://github.com/users/danchamorro/projects/1):
 
-1. **Large-file ergonomics & live streaming:** Adaptive word wrap with automatic scale-back on large files, and opt-in append-only **Live Watch Mode** for actively growing files.
-2. **Power-user UX & querying:** Interactive `/` regex & expression query bar, keyboard-first navigation (`hjkl`, `gg`, `G`), fuzzy Command Palette (`Cmd/Ctrl+K`), Cell Inspector Drawer (JSON, stack traces, Markdown), Smart Copy (`CSV`, `Markdown`, `JSON`, `SQL IN`), multi-row freeze & column pinning, async column summary headers, Focus Mode, and custom TOML themes.
-3. **Splitting, combining & format conversion:** Guided File Splitter (every N rows or at bookmarked rows with header/footer injection), Combine Files v2 (opt-in column alignment, schema-drift flagging, `_source_file` column), `.csv.zst` support, format converters (`CSV`/`TSV`/`PSV`/`JSON`/`NDJSON`/`Markdown`), and reusable custom CSV format profiles.
-4. **Analysis & data tools:** Out-of-core Pivot Tables (`SUM`, `AVG`, `COUNT`, `MIN`, `MAX`), Autofill (series/dates) & Flash Fill by example, Combine Lines rollup, Transpose, and Extract Frequent Strings.
-5. **Cross-platform packaging & release verification:** Signed/notarized macOS builds (Apple Silicon and Intel), Linux distribution packages, hardware-verified 120 Hz frame pacing and accessibility checks, and full [v1.0 Claim Contract Ledger](V1_CLAIM_LEDGER.md) reconciliation.
+1. **Power-user UX & querying:** Interactive `/` regex & expression query bar, keyboard-first navigation (`hjkl`, `gg`, `G`), fuzzy Command Palette (`Cmd/Ctrl+K`), Cell Inspector Drawer (JSON, stack traces, Markdown), Smart Copy (`CSV`, `Markdown`, `JSON`, `SQL IN`), multi-row freeze & column pinning, async column summary headers, Focus Mode, and custom TOML themes.
+2. **Splitting, combining & format conversion:** Guided File Splitter (every N rows or at bookmarked rows with header/footer injection), Combine Files v2 (opt-in column alignment, schema-drift flagging, `_source_file` column), `.csv.zst` support, format converters (`CSV`/`TSV`/`PSV`/`JSON`/`NDJSON`/`Markdown`), and reusable custom CSV format profiles.
+3. **Analysis & data tools:** Out-of-core Pivot Tables (`SUM`, `AVG`, `COUNT`, `MIN`, `MAX`), Autofill (series/dates) & Flash Fill by example, Combine Lines rollup, Transpose, and Extract Frequent Strings.
+4. **Cross-platform packaging & release verification:** Signed/notarized macOS builds for Apple Silicon and Intel, Linux distribution packages, hardware-verified 120 Hz frame pacing and accessibility checks, and full [v1.0 Claim Contract Ledger](V1_CLAIM_LEDGER.md) reconciliation.
+
+Adaptive word wrap and Live Watch Mode, previously listed here, shipped in the `v0.2.0` beta series and now appear under **Shipped Highlights** above.
 
 ## Governance
 

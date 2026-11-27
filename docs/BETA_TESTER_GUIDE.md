@@ -2,42 +2,55 @@
 
 **Public beta:** use disposable copies and report problems with reproducible examples.
 
-This beta targets Apple Silicon Macs on macOS 26 and 27 and is available free
-from GitHub Releases. Broader acceptance remains in progress; the evidence
-below identifies what has passed. Intel Macs, Linux desktop and Windows are outside scope.
+Quarry ships Apple Silicon macOS archives (`.dmg` and `.zip`) and Linux
+(`x86_64` and `arm64`) tarballs, all free from GitHub Releases. Broader
+acceptance remains in progress; the evidence below identifies what has passed.
+Intel Macs and Windows are out of scope.
 
 <a id="candidate-and-compatibility"></a>
 
 ## Release and compatibility
 
-- Current release: **0.1.0 beta 3, build 167**, clean revision
-  `f5402e41a1dd0397e43a074d739404906290a430`.
-- Tested: **macOS 27.2.1 (26B131), Apple Silicon**. In VMPal, the signed
-  archive passed SHA-256, strict signature/Gatekeeper (`Notarized Developer
-  ID`) checks, installation, launch, opening a synthetic CSV with unchanged
-  source hash, and opening the redesigned **Join Files** dialog.
-- macOS 26 validation remains outstanding for this archive. Browser download
-  with quarantine, clean-environment first launch, and offline first launch
-  are each unverified for build 167. Beta 1 and beta 2 results do not count as
-  beta 3 passes.
-- Complete connected workflows, wide-grid accessibility, large-file GUI, and
-  temporary-storage recovery remain open for this archive. The previous CJK
-  font-rendering limitation has not been retested.
-- Archive: `Quarry-0.1.0-beta.3-macos-arm64.zip`, **4,367,099 bytes**, signed,
-  notarized, and stapled.
-- SHA-256: `d5c2dc84b1da0900c4594e56217335e1202a64ed8a182cc912d1bedf56bb8677`.
-- Read the [release notes](releases/v0.1.0-beta.3.md) and
-  [build 167 verification report](benchmarks/2026-11-21-beta-build167.md).
+- Current release: **[v0.2.0-beta.3](https://github.com/danchamorro/quarry/releases/tag/v0.2.0-beta.3)**,
+  **0.2.0 beta 3**, build **215**, clean revision `d57dec9`.
+- Assets: `Quarry-v0.2.0-beta.3-macos-arm64.dmg` and `.zip`, plus
+  `Quarry-v0.2.0-beta.3-linux-x86_64.tar.gz` and
+  `Quarry-v0.2.0-beta.3-linux-arm64.tar.gz`. Each platform ships a matching
+  `SHA256SUMS-*` file, and the release page lists the published assets for that
+  tag.
+- The 0.2.0 series is the first GPU-accelerated GPUI release for both macOS and
+  Linux/Omarchy; it replaces the earlier egui build ([ADR
+  0013](adr/0013-adopt-gpui-desktop-frontend.md)).
+- Validation limits: the [release checklist](BETA_RELEASE_CHECKLIST.md) records
+  which per-archive checks passed, and packagers must keep
+  `QuarrySourceStatus` clean with `QuarryGitRevision` matching the tag.
+
+Historical reference: **0.1.0 beta 3, build 167** (clean `f5402e4`) was the
+final egui macOS snapshot. Its signed archive
+(`Quarry-0.1.0-beta.3-macos-arm64.zip`, 4,367,099 bytes,
+SHA-256 `d5c2dc84b1da0900c4594e56217335e1202a64ed8a182cc912d1bedf56bb8677`)
+passed VMPal checks on macOS 27.2.1 (26B131): SHA-256, strict
+signature/Gatekeeper, installation, launch, opening a synthetic CSV with an
+unchanged source hash, and opening the **Join Files** dialog. macOS 26,
+quarantine first launch, clean-environment first launch, offline first launch,
+connected workflows, wide-grid accessibility, large-file GUI, and
+temporary-storage recovery were open for that archive. See its
+[release notes](releases/v0.1.0-beta.3.md) and
+[build 167 verification report](benchmarks/2026-11-21-beta-build167.md).
 
 ## Install or update
 
 1. Save any open work and quit Quarry completely before replacing the app.
    Keep a copy of your previous app until the new copy works.
-2. Download the ZIP from
-   [GitHub Releases](https://github.com/danchamorro/quarry/releases/tag/v0.1.0-beta.3). To check a copy in Downloads, run
-   `shasum -a 256 ~/Downloads/Quarry-0.1.0-beta.3-macos-arm64.zip` in Terminal and compare the
-   result with the SHA-256 above. Report a mismatch before proceeding.
-3. Extract the ZIP and move `Quarry.app` into Applications.
+2. Download the macOS `.dmg`/`.zip` (or the Linux tarball) and its `SHA256SUMS-*`
+   file from the
+   [latest release](https://github.com/danchamorro/quarry/releases/latest). To
+   check a copy in Downloads, run
+   `grep '\.zip$' SHA256SUMS-macos-arm64.txt | shasum -a 256 -c -` in the folder
+   holding both files. Report a mismatch before proceeding.
+3. Extract the ZIP and move `Quarry.app` into Applications (or for Linux, follow
+   the [Linux & Omarchy guide](LINUX_AND_OMARCHY.md) and run the bundle's
+   `./install.sh`).
 4. Open Quarry normally from Applications. Record any macOS first-launch
    message. If macOS blocks launch, stop and report the exact message; do not
    bypass Gatekeeper or change security settings.
@@ -69,7 +82,7 @@ See the [user guide](USER_GUIDE.md) for each control's behavior.
 ## Feedback and limits
 
 Report failures with the [GitHub bug form](https://github.com/danchamorro/quarry/issues/new?template=bug_report.yml).
-Open **File menu → About & Feedback…** and choose **Copy build details**;
+Open **Quarry → About Quarry** and choose **Copy Build Details**;
 the same panel links to the feedback form and user guide.
 Include candidate version, macOS/model, steps, expected and actual results,
 file size, and whether the source or unsaved work was affected. For slow jobs,
@@ -82,12 +95,13 @@ refreshes completed results while preserving your page where possible. Clear
 filters before structural changes or Find/Replace.
 Undo history is bounded, and case-insensitive matching folds ASCII letters only.
 Read the [documented limits](USER_GUIDE.md#undo-and-redo-changes) and
-[filter rules](USER_GUIDE.md#filter-rows). Build 167 also includes
+[filter rules](USER_GUIDE.md#filter-rows). The current build also includes
 [document tabs](USER_GUIDE.md#work-with-tabs-and-multiple-windows),
 [Combine Files](USER_GUIDE.md#combine-files),
-[Join Files](USER_GUIDE.md#join-files), and
-[compressed `.gz` files](USER_GUIDE.md#open-compressed-files). A TUI remains
-[future work](ROADMAP.md). The
+[Join Files](USER_GUIDE.md#join-files),
+[compressed `.gz` files](USER_GUIDE.md#open-compressed-files),
+[Live Watch Mode](USER_GUIDE.md#watch-a-growing-file-with-live-watch-mode), and
+[adaptive word wrap](USER_GUIDE.md#wrap-long-cells-adaptive-word-wrap). The
 [beta checklist](BETA_RELEASE_CHECKLIST.md) tracks acceptance still outstanding.
 
 ## Character encoding checks

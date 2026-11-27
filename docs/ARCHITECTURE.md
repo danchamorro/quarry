@@ -27,6 +27,7 @@ quarry-core
    +-- Streaming edited Save and Save As worker
    +-- Split analysis worker
    +-- Streaming structural materialization worker
+   +-- Append-only live watch worker (kqueue / inotify / polling)
    +-- External merge sort worker
    |
 quarry-delimited
@@ -47,6 +48,11 @@ quarry/
     quarry-cli/
     quarry-gpui/     # active packaged desktop UI (ADR 0013)
     quarry-appkit/   # frozen comparator (no new features)
+  packaging/
+    linux/           # XDG installer, uninstaller, and .desktop launcher
+    macos/           # Info.plist
+    licenses/        # audited third-party notice inventories
+  scripts/           # macOS/Linux packaging, notices, benchmarks
   fixtures/
   docs/
 ```
@@ -137,7 +143,42 @@ every output name ending in `.gz` is refused. Join Files and Combine Files need
 an uncompressed copy first. The macOS bundle declares gzip archives
 (`org.gnu.gnu-zip-archive`) with the Viewer role.
 
+## Live Watch Mode
+
+Live Watch Mode streams rows appended to an active delimited file without
+re-indexing it; see [ADR 0016](adr/0016-live-watch-mode.md). It is opt-in and
+limited to clean, fully indexed whole files that are not compressed, are not
+reserved as a join input, and have no running operation; the tab stays read-only
+until watching stops.
+
+`crates/quarry-core/src/watch.rs` owns a `LiveWatchJob` built on a `WatchBackend`:
+native `kqueue` on macOS, `inotify` on Linux, and bounded polling for network
+filesystems and platforms without a native vnode watch. Local reconciliation
+runs on a 250 ms interval alongside native events; network polling uses 500 ms.
+The notification backend and its self-pipe pair add three descriptors on
+`kqueue`/`inotify` and none under polling, which is why watching counts against
+the workbench's open-descriptor budget instead of being free.
+
+The job keeps the pinned source descriptor and its `FileIdentity`, then scans
+only bytes past the last committed record boundary in the same encoding, dialect,
+and quote state as the index. Bytes past the final newline are held as a
+**provisional tail** (`WatchProvisionalTail`) and are never committed as a record
+until a newline terminates them; the pending tail is capped at 64 MiB. Commits
+advance the committed record end, row count, and a monotonic generation that the
+viewport uses to extend reads without repainting settled rows. When an active
+filter is set, the job maintains its filter index incrementally and reports
+matching-row counts while watching.
+
+Watching stops itself with a `WatchAlert` when the file identity changes after a
+rename rotation (`Rotated`), when the file shrinks (`Truncated`), when the
+committed tail seam is rewritten in place by an overwrite or `copytruncate`
+(`Rewritten`), or on a parse/encoding/I-O failure. The app turns `Rotated` into
+**Open New File** and `Truncated`/`Rewritten` into **Reload from Disk**;
+stopping cleanly hands back a reconciled `Session` and index so the tab returns
+to normal editing.
+
 ## Structural indexing and persistent sidecar cache
+
 Delimited files cannot be indexed correctly by blindly finding newline bytes because quoted fields may contain line breaks. The indexer tracks dialect and quote state across chunk boundaries.
 
 `crates/quarry-delimited/src/simd.rs` provides a runtime-dispatched 64-byte SIMD structural scanner (Apple Silicon NEON, x86_64 AVX2, and pure-scalar fallback) verified against a scalar oracle for byte-identical record boundaries. Multi-threaded parallel indexing splits large files across `EnginePool` workers using positional I/O, starting with one byte-offset checkpoint per 4,096 records under a 16 MiB default checkpoint budget (doubling the interval and compacting checkpoints if needed).
@@ -289,7 +330,7 @@ the allowance when both share a volume. See
 [priority 4 validation](benchmarks/2026-09-05-temporary-disk-handling.md).
 
 ## Concurrency
-Rust workers currently handle indexing, overlay-aware literal search,
+Rust workers currently handle indexing, overlay-aware literal and bounded regex search,
 filtering, filtered viewport reads, filtered export, Split analysis, structural
 materialization, external merge sorting, Replace All, and edited Save and Save
 As. Each long operation publishes progress and supports cancellation.
@@ -309,6 +350,18 @@ setting with their operation input. The unchecked default folds ASCII letters
 for comparison while leaving all other bytes unchanged. **Match case** selects
 raw byte comparison. This preserves byte offsets and invalid UTF-8 handling
 without claiming locale-aware or full Unicode case folding.
+
+Literal matching stays the default. `crates/quarry-core/src/regex_match.rs` adds
+opt-in bounded regular expressions for `quarry search --regex`,
+`quarry filter --operator regex`, and `quarry export --operator regex`. Patterns
+match decoded field values with unsaved cell overlays applied, so per-field `^`
+and `$` anchors do not span newlines inside a quoted multiline cell; regex
+matching uses Unicode simple case folding under `--ignore-case`, while literal
+matching keeps ASCII folding. Every pattern is validated before scanning against
+explicit bounds — 4,096-byte pattern length, 2 MiB compiled program, 2 MiB DFA
+cache, nesting limit 64, and at most 16 regex predicates per compound filter
+query — so a pathological pattern fails immediately instead of consuming worker
+memory or time.
 
 Literal Find Next uses the Find/Replace setting in a cancellable core worker
 after structural indexing. It
@@ -776,9 +829,39 @@ After success, the installer removes any legacy app and staged candidate so
 LaunchServices has one active application with the canonical identity.
 
 Build artifacts under `target` are not acceptance-test applications. Packaged
-interaction checks launch `/Applications/Quarry.app`. Developer ID signing,
-hardened runtime, notarization, stapling, and Gatekeeper assessment remain a
-later distribution boundary.
+interaction checks launch `/Applications/Quarry.app`.
+
+Official releases cross the distribution boundary: `./scripts/macos-app.sh
+release --tag <tag>` builds from a clean `main`, signs the app with a Developer
+ID identity (`--options runtime --timestamp`), submits it to Apple notarization
+through the Keychain `quarry-notary` profile (or CI Apple API key credentials),
+staples and Gatekeeper-validates the `.app`, and writes a verified `.zip`, a
+signed/notarized/stapled `.dmg`, `SHA256SUMS-macos-arm64.txt`, and
+`release-manifest.json` under `target/release-artifacts/<tag>/`. Pushing a `v*`
+tag runs `.github/workflows/release.yml`, which creates a Draft GitHub Release
+from `CHANGELOG.md` and attaches the signed macOS payloads when the `release`
+environment secrets are configured. Local source builds keep the ad-hoc
+signature and make no trusted-publisher claim.
+
+## Linux packaging and desktop integration
+
+Linux ships the same GPUI application as a versioned tarball per architecture
+(`x86_64`, `arm64`) plus a `SHA256SUMS-linux-<arch>.txt` file.
+`./scripts/linux-app.sh` provides `package`, `install [--prefix DIR]`,
+`uninstall [--prefix DIR]`, `release [--tag TAG]`, and `self-test`;
+`./scripts/linux-app.sh install` is the developer path that builds and installs
+into `~/.local`.
+
+`packaging/linux/install.sh` is the user-facing installer inside a bundle. It
+verifies bundle architecture parity, runs `ldd` on both binaries, and refuses to
+overwrite files it does not own before writing, with `--prefix` selecting a
+system-wide destination. It installs `bin/quarry-gpui`, `bin/quarry`,
+`applications/dev.quarry.gpui.desktop`, the hicolor app icon, and
+`doc/quarry/` (licenses, third-party notices, ownership manifest, and
+`uninstall.sh`). `packaging/linux/uninstall.sh` removes only manifest-listed
+files and preserves `~/.config/quarry`. `.github/workflows/release.yml` builds
+both architecture tarballs and self-tests extraction, installation, and
+uninstall before upload.
 
 ## UI selection
 [ADR 0013](adr/0013-adopt-gpui-desktop-frontend.md) adopts GPUI (`apps/quarry-gpui`)

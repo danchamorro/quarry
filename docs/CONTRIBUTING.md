@@ -21,8 +21,8 @@ Before making substantial changes, read:
 - `apps/quarry-cli` — headless CLI (`quarry-cli`) for scripting, validation, and benchmarking.
 - `apps/quarry-appkit` — frozen macOS AppKit comparator retained for historical reference.
 - `docs/` — architecture, design system, user guide, Linux/Omarchy and macOS packaging guides, ADRs, claim ledger, and benchmark reports.
-- `scripts/` — macOS app packaging/verification, third-party notice generation, and benchmark runners.
-- `packaging/` — macOS `Info.plist` and audited third-party license notices.
+- `scripts/` — macOS and Linux app packaging, signing, verification, and release commands, third-party notice generation, and benchmark runners.
+- `packaging/` — macOS `Info.plist`, the Linux XDG installer/uninstaller and `.desktop` launcher, and audited third-party license notices for macOS and both Linux architectures.
 
 ## Development Workflow
 
@@ -55,6 +55,12 @@ cargo test -p quarry-delimited -p quarry-core -p quarry-workbench -p quarry-gpui
 cargo build --release -p quarry-gpui --locked
 ```
 
+To build and install the desktop app, the `quarry` CLI, the `.desktop` launcher,
+the app icon, and the license notices into `~/.local`, run
+`./scripts/linux-app.sh install` (pass `--prefix DIR` for another destination).
+Run `./scripts/linux-app.sh uninstall` to remove only the files the installer
+recorded in its manifest.
+
 See [`docs/LINUX_AND_OMARCHY.md`](LINUX_AND_OMARCHY.md) for required Linux system libraries and Wayland/Hyprland testing details.
 
 ## Engineering & Design Rules
@@ -73,4 +79,9 @@ See [`docs/LINUX_AND_OMARCHY.md`](LINUX_AND_OMARCHY.md) for required Linux syste
 - Explain the problem and fix concisely in the PR description.
 - Include before/after screenshots (or a short clip for motion/timing) for UI changes, using synthetic data only.
 - Include unit or integration tests covering correctness, edge cases, cancellation, and error handling.
+- Run live end-to-end verification for the affected surface with the
+  `verify-quarry` skill (`.agents/skills/verify-quarry/`) inside the VMPal VMs,
+  and add or update a feature recipe when a change introduces a new dialog,
+  menu item, shortcut, or CLI command. Unit and headless tests do not replace
+  that check.
 - Keep `main` green: formatting, strict Clippy, tests, and notice checks must pass before merging.

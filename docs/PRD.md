@@ -274,9 +274,12 @@ and [supported formats](USER_GUIDE.md#date-and-time-formats).
 
 ## Version 0.4: desktop packaging and workflow polish (complete)
 
-Phase 7A packages the selected egui application as the user-facing
-`/Applications/Quarry.app`. Its stable bundle identifier is
-`io.github.danchamorro.quarry`, and the bundle executable is `Quarry`.
+Phase 7A packages the desktop application as the user-facing
+`/Applications/Quarry.app`. The GPU-rendered GPUI application
+(`apps/quarry-gpui`) replaced the earlier egui prototype at the Phase 4B-3
+cutover ([ADR 0013](adr/0013-adopt-gpui-desktop-frontend.md)). Its stable bundle
+identifier is `io.github.danchamorro.quarry`, and the bundle executable is
+`Quarry`.
 The checked-in icon, Cargo version, numeric build version, full Git commit,
 source-tree status, architecture, and declared minimum macOS version are
 recorded in the bundle metadata. The initial plist declares macOS 11.0 or later.
@@ -290,9 +293,10 @@ after any replacement failure, verifies the final payload, and removes the
 legacy and staging bundles. Acceptance testing uses only the canonical installed
 application.
 
-The local alpha uses ad-hoc signing until a Developer ID Application identity
-and notarization credentials are available. Ad-hoc verification is not a claim
-of trusted-publisher or Gatekeeper distribution readiness.
+Local source builds use ad-hoc signing. Official releases are Developer ID
+signed with a hardened runtime, notarized, stapled, and Gatekeeper-assessed
+([macOS packaging](MACOS_PACKAGING.md)); ad-hoc-signed local bundles make no
+trusted-publisher claim.
 
 Phase 7B completed owner-reviewed connected-workflow dogfooding and a focused
 interface pass. The accepted toolbar keeps the grid primary, moves status and
@@ -300,11 +304,12 @@ progress into the footer, exposes secondary controls contextually, and preserves
 keyboard and accessibility behavior. The current workflow is documented in the
 [user guide](USER_GUIDE.md).
 
-## Version 0.5: row operations (planned)
+## Version 0.5: row and column operations (complete)
 
-The first row-operation slice is **Delete Selected Rows**. Users select one or
-more data rows through the numbered row gutter, then explicitly remove those
-rows from the working document. The header is never a deletable data row.
+The first row-operation slice, **Delete Selected Rows**, is implemented. Users
+select one or more data rows through the numbered row gutter, then explicitly
+remove those rows from the working document. The header is never a deletable
+data row.
 
 Deletion must stream the current document and sparse edits into a bounded
 private working CSV, preserve every unselected row, reopen the result as the
@@ -313,10 +318,12 @@ and one-level structural Undo and Redo lifecycle. Cancellation, failure, or a
 source conflict must leave both the current document and source unchanged and
 remove unpublished output.
 
-Filtered-view deletion semantics must be chosen before implementation. A visible
-filtered position must not be treated as a physical data row unless Quarry can
-identify that row unambiguously. Row insertion is tracked separately in
-[issue #73](https://github.com/danchamorro/quarry/issues/73).
+Filtered-view deletion resolves to "clear the filter first": **Delete Selected
+Rows** stays unavailable while a filter is active, so a visible filtered
+position is never treated as a physical data row. Row and column insertion are
+implemented in [ADR 0009](adr/0009-row-column-insertion.md) (**Insert Rows
+Above…** / **Insert Rows Below…**, **Insert Columns Before…** / **Insert
+Columns After…**).
 
 ## Combining matching files
 
@@ -383,7 +390,7 @@ Initial targets:
 - No RAM growth proportional to file size during read-only viewing.
 - Responsive UI during indexing, search, filtering, filtered navigation,
   export, editing, Find/Replace, Split, Combine, Move, Delete Selected Columns,
-  and planned Delete Selected Rows.
+  and Delete Selected Rows.
 - Streaming Save and Save As with memory bounded by scanner limits and the
   sparse edit set rather than source-file size.
 - Long operations cancellable.
@@ -423,9 +430,19 @@ A 10 GB CSV is repeatedly practical to open and navigate on supported Macs while
 Another editor's trademark should not be Quarry's official tagline.
 
 ## Open questions
-Validated minimum macOS version; encoding breadth; persistent index
-format/invalidation.
-[ADR 0003](adr/0003-select-egui-ui.md) selects the UI framework.
+
+Resolved since this document was first written:
+
+- **Minimum macOS version:** the bundle declares macOS 11.0 or later; packaged
+  acceptance covers Apple Silicon on macOS 26 and 27 ([macOS
+  packaging](MACOS_PACKAGING.md)).
+- **Encoding breadth:** Auto (Unicode BOM, otherwise UTF-8), UTF-8, UTF-16
+  LE/BE, Windows-1252, and ISO-8859-1, with no legacy guessing.
+- **Persistent index format and invalidation:** implemented as the optional
+  privacy-preserving sidecar index cache ([architecture](ARCHITECTURE.md#structural-indexing-and-persistent-sidecar-cache)).
+- **UI framework:** [ADR 0013](adr/0013-adopt-gpui-desktop-frontend.md) selects
+  GPUI, superseding the earlier [ADR 0003](adr/0003-select-egui-ui.md) egui
+  bake-off.
 
 Quarry, including the desktop application, engine, and benchmark-oriented CLI,
 is dual-licensed under MIT or Apache-2.0.

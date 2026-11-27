@@ -8,6 +8,7 @@ Quarry runs natively on Linux (`x86_64` and `arm64`) and [Omarchy](https://omarc
 
 - **Native Wayland & Hyprland (`xwayland: false`):** No XWayland blur. Supports fractional display scaling (`1.2×`, `1.5×`, `2.0×`) and tiling window manager ergonomics cleanly.
 - **Live Omarchy theme sync:** Select **View → Theme → Omarchy** to follow your active Omarchy theme automatically. Theme changes reload live without restarting Quarry.
+- **Live Watch Mode:** Opt-in append-only watching of actively growing CSV/TSV writers through native Linux `inotify`, with provisional tail handling, scroll-preserving tail follow, and rename-rotation or truncation recovery (`Ctrl+Shift+L`).
 - **Native desktop integration:** Uses XDG desktop portals for file pickers, in-window application menus (`Quarry`, `File`, `Edit`, `Data`, `View`, `Window`), and Linux **AT-SPI** (`accesskit_unix`) accessibility.
 - **Live Resource HUD:** Displays real-time Linux `VmRSS` alongside per-volume free disk space and active/dormant tab counts.
 - **CoW section splice-save:** Uses Linux `FICLONE` copy-on-write reflinks when supported by the filesystem (such as Btrfs or XFS), with a bounded streaming fallback on ext4 and other filesystems.
@@ -134,11 +135,14 @@ Quarry uses `Ctrl` on Linux where macOS uses `Command`:
 | Reload from Disk | `Ctrl+R` |
 | Undo / Redo | `Ctrl+Z` / `Ctrl+Shift+Z` |
 | Copy Selection | `Ctrl+C` |
-| Edit Selected Cell | `F2` or `Enter` |
+| Edit Selected Cell | `F2` |
 | Find / Find Next / Find Previous | `Ctrl+F` / `Ctrl+G` / `Ctrl+Shift+G` |
 | Replace… | `Ctrl+H` |
 | Toggle Row Bookmark | `Ctrl+B` |
 | Next / Previous Row Bookmark | `Ctrl+]` / `Ctrl+[` |
+| Open Grid Context Menu | `Shift+F10` or right-click |
+| Toggle Adaptive Word Wrap | `Alt+Z` |
+| Start / Stop Live Watch Mode | `Ctrl+Shift+L` |
 | Quit Quarry | `Ctrl+Q` |
 
 ---

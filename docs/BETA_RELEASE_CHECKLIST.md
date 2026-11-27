@@ -1,11 +1,13 @@
 # Beta release checklist
 
-**Public release status, 2026-11-21:** [v0.1.0-beta.3](https://github.com/danchamorro/quarry/releases/tag/v0.1.0-beta.3)
-is published with clean **0.1.0 (167)** at
-`f5402e41a1dd0397e43a074d739404906290a430`. The exact signed archive and
-checksum passed an anonymous public download check. See its
-[verification report](benchmarks/2026-11-21-beta-build167.md) and
-[release notes](releases/v0.1.0-beta.3.md).
+**Latest published release, 2026-11-26:**
+[v0.2.0-beta.3](https://github.com/danchamorro/quarry/releases/tag/v0.2.0-beta.3)
+(build 215, clean `d57dec9`) attaches macOS Apple Silicon `.dmg`/`.zip` and
+Linux `x86_64`/`arm64` tarballs with matching `SHA256SUMS-*` files.
+
+The per-archive tables below document the historical **0.1.0 (egui)** macOS
+candidates. Read each section's stated build before treating a row as evidence
+for a later release; a later archive starts with a fresh, unchecked set.
 
 ## Platform matrix
 
@@ -16,9 +18,9 @@ build 127 are below.
 |---|---|---|
 | macOS 27, Apple Silicon | VMPal 27.2.1 (26B131): SHA-256, strict signature/Gatekeeper (`Notarized Developer ID`), installation, launch, synthetic CSV opening, and Join Files dialog open passed | Complete workflows, wide-grid accessibility, large-file GUI, temporary-storage recovery, browser quarantine, clean-environment, and offline first launch |
 | macOS 26, Apple Silicon | Not tested for this archive | Installation, launch, and native acceptance |
-| Intel Mac, Linux desktop, Windows | No packaged-release acceptance | Outside this beta's scope |
+| Intel Mac, Windows | No packaged-release acceptance | Out of scope |
 
-## Current beta 3 acceptance
+## Beta 3 acceptance (historical, build 167)
 
 The following applies only to build 167. Publication with documented validation
 limits does not mark the unchecked items as passed.

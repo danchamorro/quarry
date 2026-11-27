@@ -182,7 +182,6 @@ cargo build --release -p quarry-cli --locked
 
 Quarry is actively working toward v1.0. High-level upcoming areas include:
 
-- **Streaming & Live Files:** Opt-in append-only **Live Watch Mode** for growing logs and exports.
 - **Power-User UX & Querying:** Interactive `/` regex & expression query bar, keyboard-first navigation (`hjkl`, `gg`, `G`) and fuzzy Command Palette (`Cmd/Ctrl+K`), Cell Inspector Drawer for embedded JSON/Markdown/stack traces, Smart Copy (`CSV`, `Markdown`, `JSON`, `SQL IN`), multi-row freeze & column pinning, async column summary headers, Focus Mode, and custom TOML themes.
 - **File Split, Combine & Format Conversion:** Guided File Splitter (every N rows or at bookmarked rows with header/footer injection), Combine Files v2 (opt-in column alignment, schema-drift flagging, `_source_file` column), `.csv.zst` support, format converters (`CSV`/`TSV`/`PSV`/`JSON`/`NDJSON`/`Markdown`), and reusable custom CSV format profiles.
 - **Analysis & Data Tools:** Out-of-core Pivot Tables (`SUM`, `AVG`, `COUNT`, `MIN`, `MAX`), Autofill (series/dates) & Flash Fill by example, Combine Lines rollup, Transpose, and Extract Frequent Strings.
@@ -194,13 +193,17 @@ Track active issues and priorities in the [Roadmap](docs/ROADMAP.md) and the [Qu
 
 ## Documentation
 
+- [Documentation index](docs/README.md) — map of every guide, ADR, ledger, and evidence report
 - [User Guide](docs/USER_GUIDE.md) — complete desktop workflows, shortcuts (macOS & Linux), filters, sorting, sections, bookmarks, and safety guards
 - [Linux & Omarchy Guide](docs/LINUX_AND_OMARCHY.md) — building, native Wayland/Hyprland ergonomics, live Omarchy theme sync, and AT-SPI
 - [macOS Packaging Guide](docs/MACOS_PACKAGING.md) — bundling, verification, rollback, and signing
 - [Architecture](docs/ARCHITECTURE.md) — streaming engine, parallel positional I/O, SIMD indexing, sidecar cache, bounded memory, and atomic saves
 - [Design System](docs/DESIGN.md) — Light, Dark, and Omarchy semantic palettes, GPUI layout, typography, and accessibility
-- [Architecture Decision Records (`docs/adr/`)](docs/adr/) — key technical decisions (`ADR 0001`–`ADR 0015`)
+- [Architecture Decision Records (`docs/adr/`)](docs/adr/) — key technical decisions (`ADR 0001`–`ADR 0016`)
 - [v1.0 Claim Contract Ledger](docs/V1_CLAIM_LEDGER.md) — quantitative and behavioral engineering contracts with evidence links
+- [Product Requirements](docs/PRD.md) & [Engineering Principles](docs/ENGINEERING_PRINCIPLES.md)
+- [Beta Tester Guide](docs/BETA_TESTER_GUIDE.md) & [Beta Release Notes](docs/BETA_RELEASE_NOTES.md)
+- [Inspect File validation](docs/INSPECTION_VALIDATION.md) — acceptance evidence for inspection and recovery copies
 - [Roadmap](docs/ROADMAP.md) & [Changelog](CHANGELOG.md)
 - [Contributing](docs/CONTRIBUTING.md) & [GitHub Wiki](https://github.com/danchamorro/quarry/wiki)
 
