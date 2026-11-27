@@ -801,6 +801,39 @@ fn is_within_allowed_roots(canonical: &Path, allowed_canon: &[PathBuf]) -> bool 
     allowed_canon.iter().any(|base| canonical.starts_with(base))
 }
 
+fn watch_dangling_symlink_ancestor(
+    link_path: &Path,
+    allowed_canon: &[PathBuf],
+    paths: &mut std::collections::BTreeSet<PathBuf>,
+) {
+    if !std::fs::symlink_metadata(link_path).is_ok_and(|meta| meta.file_type().is_symlink()) {
+        return;
+    }
+    let Ok(link_target) = std::fs::read_link(link_path) else {
+        return;
+    };
+    let target_path = if link_target.is_absolute() {
+        link_target
+    } else if let Some(link_dir) = link_path.parent() {
+        link_dir.join(link_target)
+    } else {
+        return;
+    };
+    // Walk up from the dangling symlink's target parent to the nearest existing allowlisted
+    // directory so recreating the target directory or file wakes the watcher cleanly.
+    let mut ancestor = target_path.parent();
+    while let Some(dir) = ancestor {
+        if let Ok(resolved_dir) = std::fs::canonicalize(dir)
+            && resolved_dir.is_dir()
+            && is_within_allowed_roots(&resolved_dir, allowed_canon)
+        {
+            paths.insert(resolved_dir);
+            break;
+        }
+        ancestor = dir.parent();
+    }
+}
+
 fn omarchy_watch_paths(home: &Path) -> Vec<PathBuf> {
     use std::collections::BTreeSet;
 
@@ -820,18 +853,36 @@ fn omarchy_watch_paths(home: &Path) -> Vec<PathBuf> {
             }
             paths.insert(resolved_root.clone());
             let current = resolved_root.join("current");
-            if let Ok(resolved_current) = std::fs::canonicalize(&current)
-                && resolved_current.is_dir()
-                && is_within_allowed_roots(&resolved_current, &allowed_canon)
-            {
-                paths.insert(resolved_current.clone());
-                let theme = resolved_current.join("theme");
-                if let Ok(resolved_theme) = std::fs::canonicalize(&theme)
-                    && resolved_theme.is_dir()
-                    && is_within_allowed_roots(&resolved_theme, &allowed_canon)
+            if let Ok(resolved_current) = std::fs::canonicalize(&current) {
+                if resolved_current.is_dir()
+                    && is_within_allowed_roots(&resolved_current, &allowed_canon)
                 {
-                    paths.insert(resolved_theme);
+                    paths.insert(resolved_current.clone());
+                    if let Some(parent) = resolved_current.parent()
+                        && parent.is_dir()
+                        && is_within_allowed_roots(parent, &allowed_canon)
+                    {
+                        paths.insert(parent.to_path_buf());
+                    }
+                    let theme = resolved_current.join("theme");
+                    if let Ok(resolved_theme) = std::fs::canonicalize(&theme) {
+                        if resolved_theme.is_dir()
+                            && is_within_allowed_roots(&resolved_theme, &allowed_canon)
+                        {
+                            paths.insert(resolved_theme.clone());
+                            if let Some(parent) = resolved_theme.parent()
+                                && parent.is_dir()
+                                && is_within_allowed_roots(parent, &allowed_canon)
+                            {
+                                paths.insert(parent.to_path_buf());
+                            }
+                        }
+                    } else {
+                        watch_dangling_symlink_ancestor(&theme, &allowed_canon, &mut paths);
+                    }
                 }
+            } else {
+                watch_dangling_symlink_ancestor(&current, &allowed_canon, &mut paths);
             }
         } else if std::fs::symlink_metadata(&root).is_err() {
             // Walk up to the nearest existing ancestor inside `canon_home` so newly created
@@ -870,30 +921,8 @@ fn omarchy_watch_paths(home: &Path) -> Vec<PathBuf> {
             {
                 paths.insert(parent.to_path_buf());
             }
-        } else if std::fs::symlink_metadata(&candidate)
-            .is_ok_and(|meta| meta.file_type().is_symlink())
-            && let Ok(link_target) = std::fs::read_link(&candidate)
-        {
-            let target_path = if link_target.is_absolute() {
-                link_target
-            } else if let Some(link_dir) = candidate.parent() {
-                link_dir.join(link_target)
-            } else {
-                continue;
-            };
-            // Walk up from the broken symlink's target parent to the nearest existing allowlisted
-            // directory so recreating the target wakes the watcher cleanly.
-            let mut ancestor = target_path.parent();
-            while let Some(dir) = ancestor {
-                if let Ok(resolved_dir) = std::fs::canonicalize(dir)
-                    && resolved_dir.is_dir()
-                    && is_within_allowed_roots(&resolved_dir, &allowed_canon)
-                {
-                    paths.insert(resolved_dir);
-                    break;
-                }
-                ancestor = dir.parent();
-            }
+        } else {
+            watch_dangling_symlink_ancestor(&candidate, &allowed_canon, &mut paths);
         }
     }
 
@@ -1924,5 +1953,20 @@ cyan = "#449dab"
         assert!(updated.warning.is_none());
         assert_eq!(updated.appearance, ThemeAppearance::Light);
         assert_eq!(updated.palette.canvas, Rgba::rgb(0xfa, 0xf4, 0xed));
+
+        // When `current/theme` is a symlink to an allowlisted theme directory that is removed,
+        // `omarchy_watch_paths` must keep watching its nearest existing allowlisted parent so
+        // recreating the target directory wakes the watcher cleanly.
+        drop(watcher);
+        std::fs::remove_dir_all(&state_theme).unwrap();
+        symlink(&share_custom, &state_theme).unwrap();
+        std::fs::remove_dir_all(&share_custom).unwrap();
+        let recovery_paths = omarchy_watch_paths(home.path());
+        let canon_share_themes =
+            std::fs::canonicalize(home.path().join(".local/share/omarchy/themes")).unwrap();
+        assert!(
+            recovery_paths.contains(&canon_share_themes),
+            "dangling symlinked current/theme must retain a watch on its allowlisted parent: {recovery_paths:?}"
+        );
     }
 }
