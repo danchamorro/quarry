@@ -547,14 +547,14 @@ ordinals for every stable tie.
 
 The desktop waits for structural indexing to finish so the data-row count is
 known. It combines the current file size, a two-byte-per-row fidelity cushion,
-and conservative upper bounds for committed and active sparse edits. For a
-single non-Natural sort key, the allowance is four times the effective byte
-bound plus 68 bytes per data row; multi-column and Natural sort plans use higher
-allowances—`6×` effective bytes for multi-column non-Natural or single-key
-Natural plans, and `8×` effective bytes plus per-row and per-level overhead for
-multi-column Natural plans—to cover two generations of framed runs, duplicated
-keys (including numeric and NUL-escaped Natural encoding overhead), and the
-guarded output. Scan progress switches to an active
+and conservative upper bounds for committed and active sparse edits. For a single non-Natural sort key, the allowance is four times the effective
+byte bound plus 68 bytes per data row; single-key Natural plans use `6×`
+effective bytes plus 52 bytes per data row; multi-column non-Natural plans use
+`6×` effective bytes plus `48 + 44K` bytes per data row (`K` = sort level
+count); and multi-column Natural plans use `8×` effective bytes plus `48 + 44K`
+bytes per data row—covering two generations of framed runs, duplicated keys
+(including numeric and NUL-escaped Natural encoding overhead), and the guarded
+output. Scan progress switches to an active
 merge phase instead of displaying 100 percent before the worker is done.
 
 Run directories are owner-only, run files and the working CSV are owner-only,

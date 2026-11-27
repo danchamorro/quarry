@@ -1035,10 +1035,11 @@ RFC 3339 uses uppercase `T` and `Z`, or a signed `HH:MM` offset within 23:59.
 Leap seconds, unknown offset `-00:00`, timezone names, and mixed date formats
 are unsupported. Quarry never guesses date order or uses the machine timezone.
 
-Blank, missing, or ASCII-whitespace-only cells sort first with **Oldest first**
-and last with **Newest first**. Surrounding ASCII whitespace is ignored when
-comparing; original cell spelling is preserved. Equal dates or UTC instants
-keep their relative order in either direction. Unsaved cell edits are included.
+Blank, missing, or ASCII-whitespace-only cells sort first with **Ascending**
+(oldest first) and last with **Descending** (newest first). Surrounding ASCII
+whitespace is ignored when comparing; original cell spelling is preserved. Equal
+dates or UTC instants keep their relative order in either direction. Unsaved
+cell edits are included.
 
 A nonblank value that does not match the selected format stops the sort and
 identifies its one-based data row and column. The current document and source
