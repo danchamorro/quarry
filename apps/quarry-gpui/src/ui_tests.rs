@@ -5264,7 +5264,7 @@ fn idle_coordinator_wakes_for_filtered_edit_parks_on_duplicate_preview_and_updat
     let wait_via_coordinator =
         |cx: &mut TestAppContext, pred: &dyn Fn(&QuarryWindow, &App) -> bool| {
             for _ in 0..200 {
-                cx.background_executor()
+                cx.background_executor
                     .advance_clock(std::time::Duration::from_millis(32));
                 cx.run_until_parked();
                 let done = cx
