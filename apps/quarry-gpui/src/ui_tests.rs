@@ -5159,7 +5159,7 @@ fn live_watch_coalesces_tail_refreshes_while_viewport_read_is_in_flight(cx: &mut
             .is_some_and(|doc| {
                 doc.buffered_rows
                     .iter()
-                    .any(|row| row.get(1).is_some_and(|v| v == "stream-070"))
+                    .any(|row| row.fields.get(1).is_some_and(|v| v == "stream-070"))
             })
     });
     assert!(
@@ -5215,10 +5215,12 @@ fn live_watch_coalesces_tail_refreshes_while_viewport_read_is_in_flight(cx: &mut
     }));
     cx.run_until_parked();
     let nav_row_1 = cx.update(|cx| {
-        controller
-            .read(cx)
-            .active_document(win_id)
-            .and_then(|doc| doc.buffered_rows.first().and_then(|r| r.get(1)).cloned())
+        controller.read(cx).active_document(win_id).and_then(|doc| {
+            doc.buffered_rows
+                .first()
+                .and_then(|r| r.fields.get(1))
+                .cloned()
+        })
     });
     assert_eq!(
         nav_row_1.as_deref(),
