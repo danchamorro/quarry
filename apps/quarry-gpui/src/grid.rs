@@ -861,9 +861,42 @@ impl TableDelegate for Grid {
         _: &mut Window,
         cx: &mut Context<TableState<Self>>,
     ) {
+        let prev_start = self.visible_rows.start;
         self.visible_rows = range.clone();
         let window_id = self.window_id;
         self.controller.update(cx, |controller, cx| {
+            let (is_watching, total_rows) = controller
+                .active_document(window_id)
+                .map_or((false, 0), |doc| {
+                    (doc.is_live_watching(), doc.grid_total_rows())
+                });
+            if is_watching {
+                let at_bottom = total_rows == 0 || (range.end as u64) >= total_rows;
+                if at_bottom {
+                    let _ = controller.set_live_watch_tail_follow_active(window_id, true, cx);
+                } else if range.start < prev_start {
+                    let _ = controller.set_live_watch_tail_follow_active(window_id, false, cx);
+                }
+            }
+            let skip_for_in_flight_tail = controller
+                .scheduler()
+                .active_document(window_id)
+                .is_some_and(|doc_id| {
+                    controller.has_live_watch_tail_read_in_flight(doc_id)
+                        && controller
+                            .active_document(window_id)
+                            .is_some_and(|doc| doc.is_live_watching() && doc.live_watch_tail_follow)
+                });
+            if skip_for_in_flight_tail {
+                if let Some(doc) = controller.active_document_mut(window_id) {
+                    let new_visible = range.len().max(1);
+                    if new_visible > doc.visible_rows {
+                        doc.live_watch_viewport_dirty = true;
+                    }
+                    doc.visible_rows = new_visible;
+                }
+                return;
+            }
             controller.request_viewport_rows(window_id, range.start as u64, range.len().max(1), cx);
         });
     }

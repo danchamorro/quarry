@@ -12,6 +12,8 @@ parentheses are GitHub pull requests.
 
 ### Added
 
+- Added opt-in append-only **Live Watch Mode** via **Data → Live Watch** (`Cmd+Shift+L` on macOS / `Ctrl+Shift+L` on Linux) and the toolbar **Watch** button to stream newly appended rows live from active CSV/TSV writers using native `kqueue` (macOS), `inotify` (Linux), or bounded polling on network volumes. (#228)
+- Added provisional tail handling, scroll-preserving tail follow (with **Follow Tail** and **Stop Watch** controls), incremental updates for active filters while watching, and automatic alerts offering **Open New File** on rename rotation or **Reload from Disk** on truncation or tail rewrites. Documented in [ADR 0016](docs/adr/0016-live-watch-mode.md). (#228)
 - Added Linux and Omarchy desktop packaging (`scripts/linux-app.sh`, `packaging/linux/`) with a Wayland `.desktop` launcher, app icon, manifest-tracked `install.sh` / `uninstall.sh`, and automated `x86_64` and `arm64` tarball builds in `.github/workflows/release.yml`. (#224)
 - Added audited third-party license notice inventories for Linux `x86_64` and `arm64` (covering both the desktop app and `quarry` CLI) alongside macOS Apple Silicon in `packaging/licenses/`. (#224)
 - Added `./scripts/macos-app.sh release` to build, Developer ID sign, Apple-notarize, staple, and checksum Apple Silicon `.dmg` and `.zip` release artifacts using either the local Keychain profile or CI credentials. (#223)

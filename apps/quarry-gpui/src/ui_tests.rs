@@ -4881,3 +4881,351 @@ fn adaptive_word_wrap_resets_frame_budget_on_single_row_and_bounds_wide_csvs(
         "wide CSV frame budget must remain <= 128 KiB; got {wide_used}"
     );
 }
+
+#[gpui_kit::test]
+fn live_watch_streams_appended_rows_pauses_scroll_and_handles_rotation(cx: &mut TestAppContext) {
+    use std::io::Write;
+
+    let dir = tempfile::tempdir().unwrap();
+    let csv_path = dir.path().join("live_feed.csv");
+    let mut initial = String::from("id,event\n");
+    for i in 1..=50 {
+        initial.push_str(&format!("{i},seed-{i:03}\n"));
+    }
+    std::fs::write(&csv_path, &initial).unwrap();
+
+    let controller = cx.update(|cx| {
+        gpui_kit::init(cx);
+        crate::apply_light_theme(cx);
+        bind_shortcuts(cx);
+        install_menus(cx);
+        cx.new(|_| {
+            WorkbenchController::new(WorkbenchSchedulerConfig {
+                index_cache_enabled: false,
+                ..WorkbenchSchedulerConfig::default()
+            })
+        })
+    });
+    let (handle, view) = open_test_window(cx, &controller);
+    let win_id = cx.update(|cx| view.read(cx).window_id);
+
+    cx.update(|cx| {
+        controller
+            .update(cx, |c, cx| {
+                c.open_paths(
+                    win_id,
+                    vec![csv_path.clone()],
+                    OpenOptions::default(),
+                    None,
+                    cx,
+                )
+            })
+            .unwrap();
+    });
+    wait_for_ui(cx, handle, &controller, &view, |q, _, cx| {
+        q.snapshot(cx).is_some_and(|s| s.index_done)
+    });
+
+    // Toggle Live Watch ON via the GPUI action.
+    cx.update_window(handle.into(), |_, window, cx| {
+        view.update(cx, |q, cx| {
+            q.toggle_live_watch_action(&crate::menus::ToggleLiveWatch, window, cx);
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    let snap_on = cx.update(|cx| view.read(cx).snapshot(cx).unwrap());
+    assert!(snap_on.live_watch.active);
+    assert!(snap_on.live_watch.tail_follow);
+    assert!(
+        cx.update(|cx| controller.read(cx).hud_announcement(win_id).cloned())
+            .is_some_and(|a| !a.is_alert && a.text.contains("Live Watch started")),
+        "starting Live Watch must emit a quiet transition announcement"
+    );
+
+    // Pause tail-follow by jumping up to row 1 via the real navigation/scroll path, then append 20 new rows.
+    cx.update_window(handle.into(), |_, window, cx| {
+        view.update(cx, |q, cx| {
+            q.row_input
+                .update(cx, |input, cx| input.set_value("1", window, cx));
+            q.go_to_row(cx);
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+    let snap_after_jump = cx.update(|cx| view.read(cx).snapshot(cx).unwrap());
+    assert!(
+        !snap_after_jump.live_watch.tail_follow,
+        "navigating up to row 1 while watching must pause tail-follow automatically"
+    );
+
+    let mut writer = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&csv_path)
+        .unwrap();
+    for i in 51..=70 {
+        writeln!(writer, "{i},stream-{i:03}").unwrap();
+    }
+    writer.flush().unwrap();
+
+    wait_for_ui(cx, handle, &controller, &view, |q, _, cx| {
+        q.snapshot(cx).is_some_and(|s| s.total_rows == 70)
+    });
+    let snap_paused = cx.update(|cx| view.read(cx).snapshot(cx).unwrap());
+    assert!(snap_paused.live_watch.active);
+    assert!(!snap_paused.live_watch.tail_follow);
+    assert_eq!(snap_paused.live_watch.appended_rows, 20);
+
+    // Rename-rotate the file and verify the UI surfaces the Rotated alert and emits Role::Alert.
+    std::fs::rename(&csv_path, dir.path().join("live_feed.csv.1")).unwrap();
+    std::fs::write(&csv_path, b"id,event\n100,rotated-row\n").unwrap();
+
+    wait_for_ui(cx, handle, &controller, &view, |q, _, cx| {
+        q.snapshot(cx)
+            .is_some_and(|s| s.live_watch.alert == Some(quarry_core::WatchAlert::Rotated))
+    });
+    assert!(
+        cx.update(|cx| controller.read(cx).hud_announcement(win_id).cloned())
+            .is_some_and(|a| a.is_alert && a.text.contains("rotated")),
+        "rotation alert must emit a Role::Alert announcement"
+    );
+
+    // Clicking "Open New File" (ReloadFromDisk) loads the rotated replacement cleanly.
+    cx.update_window(handle.into(), |_, window, cx| {
+        view.update(cx, |q, cx| {
+            q.reload_action(&crate::menus::ReloadFromDisk, window, cx);
+        });
+    })
+    .unwrap();
+    wait_for_ui(cx, handle, &controller, &view, |q, _, cx| {
+        q.snapshot(cx)
+            .is_some_and(|s| s.index_done && s.total_rows == 1 && !s.source_changed)
+    });
+}
+
+#[gpui_kit::test]
+fn live_watch_coalesces_tail_refreshes_while_viewport_read_is_in_flight(cx: &mut TestAppContext) {
+    use std::io::Write;
+
+    let dir = tempfile::tempdir().unwrap();
+    let csv_path = dir.path().join("coalesce_feed.csv");
+    let mut initial = String::from("id,event\n");
+    for i in 1..=50 {
+        initial.push_str(&format!("{i},seed-{i:03}\n"));
+    }
+    std::fs::write(&csv_path, &initial).unwrap();
+
+    let controller = cx.update(|cx| {
+        gpui_kit::init(cx);
+        crate::apply_light_theme(cx);
+        bind_shortcuts(cx);
+        install_menus(cx);
+        cx.new(|_| {
+            WorkbenchController::new(WorkbenchSchedulerConfig {
+                index_cache_enabled: false,
+                ..WorkbenchSchedulerConfig::default()
+            })
+        })
+    });
+    let (handle, view) = open_test_window(cx, &controller);
+    let win_id = cx.update(|cx| view.read(cx).window_id);
+
+    let (_, doc_id) = cx.update(|cx| {
+        controller
+            .update(cx, |c, cx| {
+                c.open_paths(
+                    win_id,
+                    vec![csv_path.clone()],
+                    OpenOptions::default(),
+                    None,
+                    cx,
+                )
+            })
+            .unwrap()
+    });
+    wait_for_ui(cx, handle, &controller, &view, |q, _, cx| {
+        q.snapshot(cx).is_some_and(|s| s.index_done)
+    });
+
+    // Start Live Watch with tail-follow enabled and drain the initial tail read.
+    cx.update_window(handle.into(), |_, window, cx| {
+        view.update(cx, |q, cx| {
+            q.toggle_live_watch_action(&crate::menus::ToggleLiveWatch, window, cx);
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+    assert!(!cx.update(|cx| {
+        controller
+            .read(cx)
+            .has_live_watch_tail_read_in_flight(doc_id)
+    }));
+
+    let mut writer = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&csv_path)
+        .unwrap();
+
+    // Batch 1: append 10 rows and poll until the first tail refresh is queued (still in flight
+    // because we do not run the GPUI background executor yet).
+    for i in 51..=60 {
+        writeln!(writer, "{i},stream-{i:03}").unwrap();
+    }
+    writer.flush().unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let ready = cx.update(|cx| {
+            controller.update(cx, |c, cx| {
+                c.poll_background(cx);
+            });
+            controller
+                .read(cx)
+                .active_document(win_id)
+                .is_some_and(|doc| doc.available_rows() >= 61)
+                && controller
+                    .read(cx)
+                    .has_live_watch_tail_read_in_flight(doc_id)
+        });
+        if ready {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for first live-watch tail read to be scheduled"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(15));
+    }
+    let seq_in_flight = cx
+        .update(|cx| controller.read(cx).viewport_read_sequence(doc_id))
+        .expect("tail read sequence must be recorded");
+
+    // Batch 2: append 10 more rows while batch 1's viewport read is still in flight.
+    // Polling must coalesce the dirty refresh rather than incrementing the sequence and
+    // superseding the in-flight read.
+    for i in 61..=70 {
+        writeln!(writer, "{i},stream-{i:03}").unwrap();
+    }
+    writer.flush().unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let ready = cx.update(|cx| {
+            controller.update(cx, |c, cx| {
+                c.poll_background(cx);
+            });
+            controller
+                .read(cx)
+                .active_document(win_id)
+                .is_some_and(|doc| doc.available_rows() >= 71)
+        });
+        if ready {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for second append batch during in-flight tail read"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(15));
+    }
+    assert_eq!(
+        cx.update(|cx| controller.read(cx).viewport_read_sequence(doc_id)),
+        Some(seq_in_flight),
+        "arriving appends during an in-flight tail read must coalesce without bumping viewport_read_seq"
+    );
+    assert!(
+        cx.update(|cx| controller
+            .read(cx)
+            .has_live_watch_tail_read_in_flight(doc_id)),
+        "original tail read must remain in flight until completion"
+    );
+
+    // Completing the background executor installs batch 1 and immediately dispatches and completes
+    // the single coalesced follow-up read for batch 2.
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|cx| controller.read(cx).viewport_read_sequence(doc_id)),
+        Some(seq_in_flight.wrapping_add(1)),
+        "completing the first tail read must dispatch exactly one coalesced follow-up read"
+    );
+    assert!(!cx.update(|cx| {
+        controller
+            .read(cx)
+            .has_live_watch_tail_read_in_flight(doc_id)
+    }));
+    let saw_row_70 = cx.update(|cx| {
+        controller
+            .read(cx)
+            .active_document(win_id)
+            .is_some_and(|doc| {
+                doc.buffered_rows.iter().any(|row| {
+                    row.fields
+                        .get(1)
+                        .is_some_and(|v| v.as_slice() == b"stream-070")
+                })
+            })
+    });
+    assert!(
+        saw_row_70,
+        "coalesced follow-up tail read must install the latest appended rows into the viewport"
+    );
+
+    // Explicit navigation still supersedes an in-flight tail read immediately.
+    for i in 71..=75 {
+        writeln!(writer, "{i},stream-{i:03}").unwrap();
+    }
+    writer.flush().unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let ready = cx.update(|cx| {
+            controller.update(cx, |c, cx| {
+                c.poll_background(cx);
+            });
+            controller
+                .read(cx)
+                .active_document(win_id)
+                .is_some_and(|doc| doc.available_rows() >= 76)
+                && controller
+                    .read(cx)
+                    .has_live_watch_tail_read_in_flight(doc_id)
+        });
+        if ready {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for third tail read to enter flight"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(15));
+    }
+    let seq_before_nav = cx
+        .update(|cx| controller.read(cx).viewport_read_sequence(doc_id))
+        .unwrap();
+    cx.update(|cx| {
+        controller.update(cx, |c, cx| {
+            c.request_viewport_rows(win_id, 1, 20, cx);
+        });
+    });
+    assert_eq!(
+        cx.update(|cx| controller.read(cx).viewport_read_sequence(doc_id)),
+        Some(seq_before_nav.wrapping_add(1)),
+        "explicit navigation must immediately supersede an in-flight tail read"
+    );
+    assert!(!cx.update(|cx| {
+        controller
+            .read(cx)
+            .has_live_watch_tail_read_in_flight(doc_id)
+    }));
+    cx.run_until_parked();
+    let nav_row_1 = cx.update(|cx| {
+        controller.read(cx).active_document(win_id).and_then(|doc| {
+            doc.visible_row(0)
+                .and_then(|(_, fields)| fields.get(1))
+                .cloned()
+        })
+    });
+    assert_eq!(
+        nav_row_1.as_deref(),
+        Some(b"seed-002".as_slice()),
+        "superseded tail read must not overwrite rows loaded by explicit user navigation"
+    );
+}

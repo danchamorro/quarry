@@ -51,6 +51,7 @@ gpui_kit::actions!(
         CombineColumns,
         PauseResumeIndexing,
         VerifySectionBoundary,
+        ToggleLiveWatch,
         ShowAllWhitespace,
         ToggleWordWrap,
         ThemeSystem,
@@ -123,6 +124,11 @@ pub fn bind_shortcuts(cx: &mut App) {
         KeyBinding::new("cmd-]", NextBookmark, Some("QuarryWindow && !Input")),
         KeyBinding::new("cmd-[", PreviousBookmark, Some("QuarryWindow && !Input")),
         KeyBinding::new("alt-z", ToggleWordWrap, Some("QuarryWindow && !Input")),
+        KeyBinding::new(
+            "cmd-shift-l",
+            ToggleLiveWatch,
+            Some("QuarryWindow && !Input"),
+        ),
         KeyBinding::new("cmd-shift-]", NextTab, Some(QUARRY_KEY_CONTEXT)),
         KeyBinding::new("cmd-shift-[", PreviousTab, Some(QUARRY_KEY_CONTEXT)),
     ];
@@ -150,6 +156,11 @@ pub fn bind_shortcuts(cx: &mut App) {
         KeyBinding::new("ctrl-]", NextBookmark, Some("QuarryWindow && !Input")),
         KeyBinding::new("ctrl-[", PreviousBookmark, Some("QuarryWindow && !Input")),
         KeyBinding::new("alt-z", ToggleWordWrap, Some("QuarryWindow && !Input")),
+        KeyBinding::new(
+            "ctrl-shift-l",
+            ToggleLiveWatch,
+            Some("QuarryWindow && !Input"),
+        ),
         KeyBinding::new("ctrl-tab", NextTab, Some(QUARRY_KEY_CONTEXT)),
         KeyBinding::new("ctrl-shift-tab", PreviousTab, Some(QUARRY_KEY_CONTEXT)),
     ];
@@ -246,6 +257,7 @@ pub fn build_app_menus() -> Vec<Menu> {
                 MenuItem::separator(),
                 MenuItem::action("Pause / Resume Indexing", PauseResumeIndexing),
                 MenuItem::action("Verify Section Boundary", VerifySectionBoundary),
+                MenuItem::action("Live Watch", ToggleLiveWatch),
             ],
         },
         Menu {

@@ -72,6 +72,20 @@ pub struct BookmarkListEntry {
     pub global_ordinal: Option<u64>,
 }
 
+/// Read-only snapshot of Live Watch Mode state for the active tab.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LiveWatchUiSnapshot {
+    pub active: bool,
+    pub tail_follow: bool,
+    pub can_start: bool,
+    pub unavailable_reason: Option<&'static str>,
+    pub backend_label: Option<&'static str>,
+    pub following_unlinked: bool,
+    pub appended_rows: u64,
+    pub provisional_tail_bytes: Option<u64>,
+    pub alert: Option<quarry_core::WatchAlert>,
+}
+
 /// Read-only snapshot of an active hydrated document for toolbar, panels, and status bar rendering.
 #[derive(Clone, Debug, PartialEq)]
 pub struct DocumentSnapshot {
@@ -84,6 +98,7 @@ pub struct DocumentSnapshot {
     pub word_wrap: EffectiveWordWrap,
     pub word_wrap_threshold_bytes: u64,
     pub section: Option<Box<SectionSnapshot>>,
+    pub live_watch: LiveWatchUiSnapshot,
     pub bookmark_count: usize,
     pub bookmarks: Vec<BookmarkListEntry>,
     pub split_at_bookmarks_disabled_reason: Option<String>,
@@ -244,6 +259,7 @@ pub struct WorkbenchController {
     windows: BTreeMap<WindowId, WindowHandle<Root>>,
     editing_windows: BTreeSet<WindowId>,
     viewport_read_seq: BTreeMap<DocumentId, u64>,
+    live_watch_tail_read_in_flight: BTreeMap<DocumentId, u64>,
     pending_reveal_cells: BTreeMap<DocumentId, (u64, usize)>,
     whitespace_prefs: whitespace::Preferences,
     word_wrap_prefs: WordWrapPreferences,
@@ -350,6 +366,7 @@ impl WorkbenchController {
             windows: BTreeMap::new(),
             editing_windows: BTreeSet::new(),
             viewport_read_seq: BTreeMap::new(),
+            live_watch_tail_read_in_flight: BTreeMap::new(),
             pending_reveal_cells: BTreeMap::new(),
             whitespace_prefs: whitespace::Preferences::load(None),
             word_wrap_prefs: WordWrapPreferences::load(None),
@@ -702,6 +719,7 @@ impl WorkbenchController {
         };
         // Always advance the generation — even on cache hits or bootstrap reads — so an
         // in-flight async read from an earlier scroll position cannot overwrite current rows.
+        self.live_watch_tail_read_in_flight.remove(&doc_id);
         let seq = {
             let entry = self.viewport_read_seq.entry(doc_id).or_insert(0);
             *entry = entry.wrapping_add(1);
@@ -710,20 +728,115 @@ impl WorkbenchController {
         let Some(plan) = plan else {
             return;
         };
+        self.spawn_viewport_read_plan_with_seq(doc_id, seq, plan, false, 0, cx);
+    }
+
+    fn clear_viewport_read_state(&mut self, doc_id: DocumentId) {
+        self.viewport_read_seq.remove(&doc_id);
+        self.live_watch_tail_read_in_flight.remove(&doc_id);
+    }
+
+    fn is_document_active(&self, doc_id: DocumentId) -> bool {
+        self.windows
+            .keys()
+            .any(|&win| self.scheduler.active_document(win) == Some(doc_id))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn viewport_read_sequence(&self, doc_id: DocumentId) -> Option<u64> {
+        self.viewport_read_seq.get(&doc_id).copied()
+    }
+
+    pub(crate) fn has_live_watch_tail_read_in_flight(&self, doc_id: DocumentId) -> bool {
+        let Some(&in_flight_seq) = self.live_watch_tail_read_in_flight.get(&doc_id) else {
+            return false;
+        };
+        self.viewport_read_seq.get(&doc_id) == Some(&in_flight_seq)
+    }
+
+    fn spawn_live_watch_viewport_refresh(&mut self, doc_id: DocumentId, cx: &mut Context<Self>) {
+        // Explicit watch start or Follow Tail jump supersedes any earlier non-tail viewport read.
+        self.live_watch_tail_read_in_flight.remove(&doc_id);
+        let seq = {
+            let entry = self.viewport_read_seq.entry(doc_id).or_insert(0);
+            *entry = entry.wrapping_add(1);
+            *entry
+        };
+        let plan = self
+            .scheduler
+            .tab_mut(doc_id)
+            .and_then(|t| t.document.as_mut())
+            .and_then(|doc| doc.take_live_watch_viewport_plan());
+        if let Some(plan) = plan {
+            self.live_watch_tail_read_in_flight.insert(doc_id, seq);
+            self.spawn_viewport_read_plan_with_seq(doc_id, seq, plan, true, 1, cx);
+        }
+    }
+
+    fn maybe_spawn_live_watch_tail_refresh(
+        &mut self,
+        doc_id: DocumentId,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        self.maybe_spawn_live_watch_tail_refresh_with_retries(doc_id, 1, cx)
+    }
+
+    fn maybe_spawn_live_watch_tail_refresh_with_retries(
+        &mut self,
+        doc_id: DocumentId,
+        retries_remaining: u8,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        // Keep at most one live-watch tail read in flight per document and coalesce arriving
+        // appends into `doc.live_watch_viewport_dirty` until the current read finishes, so
+        // sustained appends on slow storage never starve the grid.
+        if self.has_live_watch_tail_read_in_flight(doc_id) {
+            return false;
+        }
+        let Some(plan) = self
+            .scheduler
+            .tab_mut(doc_id)
+            .and_then(|t| t.document.as_mut())
+            .and_then(|doc| doc.take_live_watch_viewport_plan())
+        else {
+            return false;
+        };
+        let seq = {
+            let entry = self.viewport_read_seq.entry(doc_id).or_insert(0);
+            *entry = entry.wrapping_add(1);
+            *entry
+        };
+        self.live_watch_tail_read_in_flight.insert(doc_id, seq);
+        self.spawn_viewport_read_plan_with_seq(doc_id, seq, plan, true, retries_remaining, cx);
+        true
+    }
+
+    fn spawn_viewport_read_plan_with_seq(
+        &mut self,
+        doc_id: DocumentId,
+        seq: u64,
+        plan: quarry_workbench::ViewportReadPlan,
+        is_live_watch_tail: bool,
+        retries_remaining: u8,
+        cx: &mut Context<Self>,
+    ) {
         let session = Arc::clone(&plan.session);
-        let index = plan.index;
         let start = plan.start;
-        let count = plan.count;
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
                 .spawn(async move {
                     let began = Instant::now();
-                    let read = session.read_rows(&index, start, count);
+                    let read = plan.execute();
                     (session, read, began.elapsed())
                 })
                 .await;
             let _ = this.update(cx, |controller, cx| {
+                if is_live_watch_tail
+                    && controller.live_watch_tail_read_in_flight.get(&doc_id) == Some(&seq)
+                {
+                    controller.live_watch_tail_read_in_flight.remove(&doc_id);
+                }
                 if controller.viewport_read_seq.get(&doc_id) != Some(&seq) {
                     return;
                 }
@@ -737,14 +850,39 @@ impl WorkbenchController {
                 if !Arc::ptr_eq(&doc.session, &expected_session) {
                     return;
                 }
+                let mut follow_up_retries = None;
                 match read {
                     Ok(rows) => {
                         doc.install_buffer_rows(start, rows, elapsed);
+                        if is_live_watch_tail {
+                            follow_up_retries = Some(1);
+                        }
                     }
                     Err(error) => {
+                        let source_changed =
+                            matches!(error, quarry_core::QuarryError::SourceChanged);
                         let msg = doc.diagnostic_error(error);
                         tab.notice = Some(AppMessage::error(msg));
+                        if is_live_watch_tail
+                            && retries_remaining > 0
+                            && !source_changed
+                            && doc.is_live_watching()
+                            && doc.live_watch_tail_follow
+                            && !doc.filter_active()
+                        {
+                            doc.live_watch_viewport_dirty = true;
+                            follow_up_retries = Some(retries_remaining - 1);
+                        }
                     }
+                }
+                if let Some(next_retries) = follow_up_retries
+                    && controller.is_document_active(doc_id)
+                {
+                    let _ = controller.maybe_spawn_live_watch_tail_refresh_with_retries(
+                        doc_id,
+                        next_retries,
+                        cx,
+                    );
                 }
                 cx.notify();
             });
@@ -1077,7 +1215,7 @@ impl WorkbenchController {
             .map(|col| doc.column_name(col))
             .collect::<Vec<_>>();
         let filter_active = doc.filter_active();
-        let filter_done = doc.filter_job.is_none() && !doc.filter_rows_loading();
+        let filter_done = !doc.is_filter_scanning() && !doc.filter_rows_loading();
         let (structural_running, structural_progress, duplicate_preview) = match &doc.structural_job
         {
             None => (false, None, None),
@@ -1148,6 +1286,30 @@ impl WorkbenchController {
                 speculative_save_warning: doc.speculative_save_warning(),
             })
         });
+        let live_watch = LiveWatchUiSnapshot {
+            active: doc.is_live_watching(),
+            tail_follow: doc.live_watch_tail_follow,
+            can_start: doc.can_start_live_watch(),
+            unavailable_reason: doc.live_watch_unavailable_reason(),
+            backend_label: doc
+                .live_watch
+                .as_ref()
+                .map(|w| w.backend().label())
+                .or_else(|| doc.live_watch_snapshot.as_ref().map(|s| s.backend.label())),
+            following_unlinked: doc
+                .live_watch_snapshot
+                .as_ref()
+                .is_some_and(|s| s.status == quarry_core::WatchStatus::FollowingUnlinked),
+            appended_rows: doc
+                .live_watch_snapshot
+                .as_ref()
+                .map_or(0, |s| s.appended_rows),
+            provisional_tail_bytes: doc
+                .live_watch_snapshot
+                .as_ref()
+                .and_then(|s| s.provisional_tail.as_ref().map(|tail| tail.byte_len)),
+            alert: doc.live_watch_alert.clone(),
+        };
         let bookmark_count = doc.bookmarks.len();
         let bookmarks = doc
             .bookmarks
@@ -1170,6 +1332,7 @@ impl WorkbenchController {
             word_wrap,
             word_wrap_threshold_bytes,
             section,
+            live_watch,
             bookmark_count,
             bookmarks,
             split_at_bookmarks_disabled_reason,
@@ -1182,7 +1345,7 @@ impl WorkbenchController {
             available_rows: doc.grid_total_rows(),
             filter_active,
             filter_done,
-            filter_running: doc.filter_job.is_some(),
+            filter_running: doc.is_filter_scanning(),
             filter_status: doc.filter_status.clone(),
             can_export_filtered: doc.is_filtered_export_ready(),
             export_running: doc.export_job.is_some(),
@@ -1316,6 +1479,127 @@ impl WorkbenchController {
         }
     }
 
+    pub fn toggle_live_watch_active(
+        &mut self,
+        window: WindowId,
+        cx: &mut Context<Self>,
+    ) -> Result<String, AppMessage> {
+        let Some(id) = self.scheduler.active_document(window) else {
+            return Err(AppMessage::warning("Open a file first."));
+        };
+        let watching = self
+            .scheduler
+            .tab(id)
+            .and_then(|t| t.document.as_ref())
+            .is_some_and(quarry_workbench::Document::is_live_watching);
+        if watching {
+            self.stop_live_watch_active(window, cx)
+        } else {
+            self.start_live_watch_active_with_config(
+                window,
+                quarry_core::WatchConfig {
+                    cache_config: if self.scheduler.index_cache_enabled() {
+                        quarry_core::IndexCacheConfig::default()
+                    } else {
+                        quarry_core::IndexCacheConfig::disabled()
+                    },
+                    ..Default::default()
+                },
+                cx,
+            )
+        }
+    }
+
+    pub fn start_live_watch_active_with_config(
+        &mut self,
+        window: WindowId,
+        config: quarry_core::WatchConfig,
+        cx: &mut Context<Self>,
+    ) -> Result<String, AppMessage> {
+        let Some(id) = self.scheduler.active_document(window) else {
+            return Err(AppMessage::warning("Open a file first."));
+        };
+        if let Some(doc) = self.scheduler.tab_mut(id).and_then(|t| t.document.as_mut()) {
+            doc.live_watch_async_viewport = true;
+        }
+        self.scheduler.start_live_watch_with_config(id, config)?;
+        self.spawn_live_watch_viewport_refresh(id, cx);
+        let backend = self
+            .scheduler
+            .tab(id)
+            .and_then(|t| t.document.as_ref())
+            .and_then(|d| d.live_watch.as_ref())
+            .map_or("poll", |w| w.backend().label());
+        let msg = format!("Live Watch started ({backend}).");
+        self.push_hud_announcement(window, msg.clone(), false, cx);
+        cx.notify();
+        Ok(msg)
+    }
+
+    pub fn stop_live_watch_active(
+        &mut self,
+        window: WindowId,
+        cx: &mut Context<Self>,
+    ) -> Result<String, AppMessage> {
+        let Some(id) = self.scheduler.active_document(window) else {
+            return Err(AppMessage::warning("Open a file first."));
+        };
+        let alert = self.scheduler.stop_live_watch(id)?;
+        self.live_watch_tail_read_in_flight.remove(&id);
+        let entry = self.viewport_read_seq.entry(id).or_insert(0);
+        *entry = entry.wrapping_add(1);
+        let (msg, is_alert) = match alert {
+            Some(alert) => (alert.summary(), true),
+            None => ("Live Watch stopped.".to_owned(), false),
+        };
+        self.push_hud_announcement(window, msg.clone(), is_alert, cx);
+        cx.notify();
+        Ok(msg)
+    }
+
+    pub fn set_live_watch_tail_follow_active(
+        &mut self,
+        window: WindowId,
+        follow: bool,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let Some(id) = self.scheduler.active_document(window) else {
+            return Ok(());
+        };
+        let changed = {
+            let Some(doc) = self.scheduler.tab_mut(id).and_then(|t| t.document.as_mut()) else {
+                return Ok(());
+            };
+            if !doc.is_live_watching() || doc.live_watch_tail_follow == follow {
+                return Ok(());
+            }
+            doc.set_live_watch_tail_follow(follow)?;
+            true
+        };
+        if changed {
+            if follow {
+                self.spawn_live_watch_viewport_refresh(id, cx);
+            }
+            let text = if follow {
+                "Following live tail.".to_owned()
+            } else {
+                "Tail follow paused; still reading new rows.".to_owned()
+            };
+            self.push_hud_announcement(window, text, false, cx);
+            cx.notify();
+        }
+        Ok(())
+    }
+
+    pub fn dismiss_live_watch_alert_active(&mut self, window: WindowId, cx: &mut Context<Self>) {
+        if let Some(id) = self.scheduler.active_document(window)
+            && let Some(doc) = self.scheduler.tab_mut(id).and_then(|t| t.document.as_mut())
+        {
+            doc.dismiss_live_watch_alert();
+            cx.notify();
+        }
+    }
+
     pub fn reopen_verified_section_active(
         &mut self,
         window: WindowId,
@@ -1328,7 +1612,7 @@ impl WorkbenchController {
         let notice = self
             .scheduler
             .reopen_verified_section(id, discard_unsaved)?;
-        self.viewport_read_seq.remove(&id);
+        self.clear_viewport_read_state(id);
         self.pending_reveal_cells.remove(&id);
         cx.notify();
         Ok(notice)
@@ -1462,6 +1746,7 @@ impl WorkbenchController {
             .scheduler
             .activate_tab(window, id)
             .map_err(|e| e.to_string())?;
+        let _ = self.maybe_spawn_live_watch_tail_refresh(id, cx);
         cx.notify();
         Ok(outcome)
     }
@@ -1482,6 +1767,7 @@ impl WorkbenchController {
         if let Err(error) = self.scheduler.activate_tab(window, target) {
             self.set_window_message(window, Some(AppMessage::warning(error.to_string())), cx);
         } else {
+            let _ = self.maybe_spawn_live_watch_tail_refresh(target, cx);
             cx.notify();
         }
     }
@@ -1535,7 +1821,7 @@ impl WorkbenchController {
                 Some(_) => quarry_workbench::DelimiterMode::Auto,
             };
         }
-        self.viewport_read_seq.remove(&id);
+        self.clear_viewport_read_state(id);
         self.pending_reveal_cells.remove(&id);
         cx.notify();
         Ok(())
@@ -1571,6 +1857,8 @@ impl WorkbenchController {
         self.scheduler
             .reopen_tab(window, id, options, encoding)
             .map_err(|e| e.to_string())?;
+        self.clear_viewport_read_state(id);
+        self.pending_reveal_cells.remove(&id);
         cx.notify();
         Ok(())
     }
@@ -2035,7 +2323,7 @@ impl WorkbenchController {
         }
 
         let _ = self.scheduler.close_tab(id);
-        self.viewport_read_seq.remove(&id);
+        self.clear_viewport_read_state(id);
         self.pending_reveal_cells.remove(&id);
         let empty_now = self.scheduler.tabs_in_window(window).is_empty();
         if empty_now && close_window_if_last && self.scheduler.close_window(window).is_ok() {
@@ -2249,7 +2537,7 @@ impl WorkbenchController {
                 }
                 let _ = self.scheduler.approve_tab_for_close(document_id);
                 let _ = self.scheduler.close_tab(document_id);
-                self.viewport_read_seq.remove(&document_id);
+                self.clear_viewport_read_state(document_id);
                 self.pending_reveal_cells.remove(&document_id);
                 if close_window_if_last
                     && self.scheduler.tabs_in_window(window_id).is_empty()
@@ -3302,7 +3590,7 @@ impl WorkbenchController {
             return Err(AppMessage::warning(conflict));
         }
         let notice = self.scheduler.confirm_duplicate_removal(doc_id)?;
-        self.viewport_read_seq.remove(&doc_id);
+        self.clear_viewport_read_state(doc_id);
         self.pending_reveal_cells.remove(&doc_id);
         cx.notify();
         Ok(notice)
@@ -4381,7 +4669,36 @@ impl WorkbenchController {
                 self.start_storage_inspection(cx);
             }
         }
+        let pre_watch_states: Vec<(WindowId, DocumentId, u64, bool)> = self
+            .scheduler
+            .windows()
+            .into_iter()
+            .filter_map(|win| {
+                let doc_id = self.scheduler.active_document(win)?;
+                let doc = self.scheduler.tab(doc_id)?.document.as_ref()?;
+                let watch_gen = doc.live_watch_snapshot.as_ref().map_or(0, |s| s.generation);
+                Some((win, doc_id, watch_gen, doc.live_watch_alert.is_some()))
+            })
+            .collect();
         let poll_errors = self.scheduler.poll_all();
+        for (win, doc_id, prev_gen, had_alert) in pre_watch_states {
+            if let Some(doc) = self.scheduler.tab(doc_id).and_then(|t| t.document.as_ref()) {
+                let cur_gen = doc.live_watch_snapshot.as_ref().map_or(0, |s| s.generation);
+                if cur_gen != prev_gen {
+                    changed = true;
+                }
+                if !had_alert && let Some(alert) = &doc.live_watch_alert {
+                    self.last_hud_announcement.insert(
+                        win,
+                        HudAnnouncement {
+                            text: alert.summary(),
+                            is_alert: true,
+                        },
+                    );
+                    changed = true;
+                }
+            }
+        }
         if !poll_errors.is_empty() {
             for (doc_id, error) in poll_errors {
                 if let Some(tab) = self.scheduler.tab_mut(doc_id) {
@@ -4404,6 +4721,9 @@ impl WorkbenchController {
             {
                 changed = true;
             }
+            if self.maybe_spawn_live_watch_tail_refresh(doc_id, cx) {
+                changed = true;
+            }
         }
         let blocked_auto_reopen: BTreeSet<DocumentId> = self
             .editing_windows
@@ -4416,7 +4736,7 @@ impl WorkbenchController {
         {
             changed = true;
             if completion.reopened {
-                self.viewport_read_seq.remove(&completion.document_id);
+                self.clear_viewport_read_state(completion.document_id);
                 self.pending_reveal_cells.remove(&completion.document_id);
             }
             match completion.result {
@@ -4501,7 +4821,7 @@ impl WorkbenchController {
             changed = true;
             match completion.result {
                 Ok(Some(status)) => {
-                    self.viewport_read_seq.remove(&completion.document_id);
+                    self.clear_viewport_read_state(completion.document_id);
                     self.pending_reveal_cells.remove(&completion.document_id);
                     if let Some(tab) = self.scheduler.tab_mut(completion.document_id) {
                         tab.notice = Some(AppMessage::new(status, MessageSeverity::Status));

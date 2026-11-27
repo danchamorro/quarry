@@ -23,6 +23,7 @@ mod source_stamp;
 mod spill;
 mod splice;
 mod storage;
+mod watch;
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -100,10 +101,10 @@ pub use pool::{
     default_single_run_memory_budget_bytes, default_worker_threads, process_memory_usage,
     raise_nofile_limit,
 };
+use quarry_delimited::ParseError;
 pub use quarry_delimited::{
     ByteEncodingClass, EscapeRule, ScannerDialect, SimdBackend, active_simd_backend,
 };
-use quarry_delimited::{ParseError, parse_record};
 pub use search::{
     SearchJob, SearchMatch, SearchOutcome, SearchPosition, SearchProgress, SearchTelemetry,
 };
@@ -136,6 +137,11 @@ pub use storage::{
     estimate_edited_output_bytes_from_values, inspect_storage, restrict_private_file,
     validate_scratch_directory,
 };
+pub use watch::{
+    DEFAULT_WATCH_POLL_INTERVAL, LiveWatchFilterJob, LiveWatchJob, LiveWatchReader,
+    NETWORK_WATCH_POLL_INTERVAL, WatchAlert, WatchBackend, WatchConfig, WatchProvisionalTail,
+    WatchSnapshot, WatchStatus, WatchStopOutcome,
+};
 
 const DEFAULT_SAMPLE_BYTES: usize = 1024 * 1024;
 const DEFAULT_BOOTSTRAP_LIMIT: usize = 64 * 1024 * 1024;
@@ -162,23 +168,49 @@ pub(crate) fn parse_encoded_record_with_bom(
     strip_bom: bool,
     encoding: Encoding,
 ) -> Result<Vec<Cow<'_, [u8]>>, QuarryError> {
+    parse_encoded_record_with_bom_and_field_limit(
+        record,
+        delimiter,
+        physical_row,
+        strip_bom,
+        encoding,
+        usize::MAX,
+    )
+}
+
+/// Parses native record bytes with an explicit upper bound on materialized fields so hostile
+/// delimiter-only records cannot amplify heap allocations beyond `max_fields`.
+pub(crate) fn parse_encoded_record_with_bom_and_field_limit(
+    record: &[u8],
+    delimiter: u8,
+    physical_row: u64,
+    strip_bom: bool,
+    encoding: Encoding,
+    max_fields: usize,
+) -> Result<Vec<Cow<'_, [u8]>>, QuarryError> {
     let body = if strip_bom {
         encoding.strip_bom(record).1
     } else {
         record
     };
     if encoding == Encoding::Utf8 {
-        return parse_record(body, delimiter).map_err(Into::into);
+        return quarry_delimited::parse_record_with_field_limit(body, delimiter, max_fields)
+            .map_err(Into::into);
     }
     let decoded = encoding
         .decode(body, DEFAULT_MAX_RECORD_BYTES)
         .map_err(|error| record_encoding_error(physical_row.saturating_add(1), error))?;
     match decoded {
-        Cow::Borrowed(bytes) => parse_record(bytes, delimiter).map_err(Into::into),
-        Cow::Owned(bytes) => Ok(parse_record(&bytes, delimiter)?
-            .into_iter()
-            .map(|field| Cow::Owned(field.into_owned()))
-            .collect()),
+        Cow::Borrowed(bytes) => {
+            quarry_delimited::parse_record_with_field_limit(bytes, delimiter, max_fields)
+                .map_err(Into::into)
+        }
+        Cow::Owned(bytes) => Ok(quarry_delimited::parse_record_with_field_limit(
+            &bytes, delimiter, max_fields,
+        )?
+        .into_iter()
+        .map(|field| Cow::Owned(field.into_owned()))
+        .collect()),
     }
 }
 
@@ -1093,6 +1125,63 @@ impl Session {
         IndexJob::start_with_options(self, config, threads, cache_config)
     }
 
+    /// Starts opt-in append-only Live Watch Mode (ADR 0016) on a clean, uncompressed, whole-file
+    /// session whose initial [`StructuralIndex`] has already reached validated EOF.
+    pub fn start_live_watch(
+        &self,
+        index: &StructuralIndex,
+        active_filter: Option<&FilterIndex>,
+        config: WatchConfig,
+    ) -> Result<LiveWatchJob, QuarryError> {
+        LiveWatchJob::start(self, index, active_filter, config)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_watch_stop_parts(
+        path: PathBuf,
+        encoding: Encoding,
+        dialect: Dialect,
+        metrics: OpenMetrics,
+        open_file: &File,
+        final_stamp: SourceStamp,
+        final_index: &StructuralIndex,
+        reuse_first_rows: Option<Vec<Row>>,
+    ) -> Result<Self, QuarryError> {
+        let file_size = final_stamp.file_size();
+        let first_rows = match reuse_first_rows {
+            Some(rows) => rows,
+            None => read_bootstrap_rows_from_open_file(
+                open_file,
+                dialect.delimiter,
+                encoding,
+                final_index.committed_record_end(),
+                100,
+                DEFAULT_BOOTSTRAP_LIMIT,
+            )?,
+        };
+        let completed = (final_index.is_complete()
+            && final_index.committed_record_end() == file_size)
+            .then_some(CompletedRecordCount {
+                delimiter: dialect.delimiter,
+                encoding,
+                file_size,
+                records: final_index.indexed_rows(),
+            });
+        let completed_record_count = Arc::new(Mutex::new(completed));
+        Ok(Self {
+            path,
+            source_stamp: final_stamp,
+            encoding,
+            completed_record_count,
+            compressed: None,
+            section: None,
+            file_size,
+            dialect,
+            first_rows,
+            metrics,
+        })
+    }
+
     fn completed_record_count(&self) -> Option<u64> {
         self.completed_record_count
             .lock()
@@ -1615,6 +1704,225 @@ fn cell_kind(value: &[u8]) -> CellKind {
     }
 }
 
+fn read_bootstrap_rows_from_open_file(
+    file: &File,
+    delimiter: u8,
+    encoding: Encoding,
+    end: u64,
+    max_rows: usize,
+    byte_limit: usize,
+) -> Result<Vec<Row>, QuarryError> {
+    if end == 0 || max_rows == 0 || byte_limit == 0 {
+        return Ok(Vec::new());
+    }
+    let mut limit = usize::try_from(end).unwrap_or(byte_limit).min(byte_limit);
+    if encoding.is_utf16() {
+        limit &= !1;
+    }
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let mut scanner = RecordScanner::new(delimiter, encoding)?;
+    let mut bytes = Vec::with_capacity(DEFAULT_READ_CHUNK.min(limit));
+    let mut chunk = vec![0; encoding.chunk_size(DEFAULT_READ_CHUNK.min(limit))];
+    let mut ends = Vec::with_capacity(max_rows);
+    let mut offset = 0u64;
+
+    while ends.len() < max_rows && bytes.len() < limit {
+        let mut allowed = (limit - bytes.len()).min(chunk.len());
+        if encoding.is_utf16() {
+            allowed &= !1;
+        }
+        if allowed == 0 {
+            break;
+        }
+        let read = positional_io::read_at_exact_or_eof(file, offset, &mut chunk[..allowed])?;
+        if read < allowed {
+            return Err(QuarryError::SourceChanged);
+        }
+        bytes.extend_from_slice(&chunk[..read]);
+        scanner.scan_chunk(&chunk[..read], offset, |rec_end| {
+            if ends.len() < max_rows {
+                ends.push(rec_end);
+            }
+        })?;
+        offset += read as u64;
+    }
+
+    if offset == end && ends.len() < max_rows {
+        scanner.finish(offset, |rec_end| {
+            if ends.len() < max_rows {
+                ends.push(rec_end);
+            }
+        })?;
+    }
+    let mut rows = Vec::with_capacity(ends.len());
+    let mut start = 0;
+    for (physical_row, &rec_end) in ends.iter().enumerate() {
+        let rec_end = rec_end as usize;
+        match parse_encoded_record_with_bom_and_field_limit(
+            &bytes[start..rec_end],
+            delimiter,
+            physical_row as u64,
+            physical_row == 0,
+            encoding,
+            MAX_TRANSFORMATION_COLUMNS,
+        ) {
+            Ok(fields) => rows.push(Row {
+                offset: start as u64,
+                fields: fields.into_iter().map(|field| field.into_owned()).collect(),
+            }),
+            Err(QuarryError::Parse(err))
+                if matches!(
+                    err.kind,
+                    quarry_delimited::ParseErrorKind::FieldLimitExceeded(_)
+                ) =>
+            {
+                // Keep any already-parsed bootstrap preview rows and stop before materializing
+                // an overly wide row during watch stop reconciliation.
+                break;
+            }
+            Err(err) => return Err(err),
+        }
+        start = rec_end;
+    }
+    Ok(rows)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn read_rows_from_open_file(
+    file: &File,
+    delimiter: u8,
+    index: &StructuralIndex,
+    start: u64,
+    count: usize,
+    max_record_bytes: usize,
+    encoding: Encoding,
+    end: u64,
+    strip_bom_at_zero: bool,
+) -> Result<Vec<Row>, QuarryError> {
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    if start >= index.indexed_rows() {
+        return Err(QuarryError::RowNotIndexed {
+            requested: start,
+            indexed_rows: index.indexed_rows(),
+        });
+    }
+
+    let target_end = start.saturating_add(count as u64).min(index.indexed_rows());
+    let checkpoint = index.nearest_checkpoint(start);
+    let mut scanner = RecordScanner::at_offset_with_bom_handling(
+        delimiter,
+        checkpoint.offset,
+        encoding,
+        strip_bom_at_zero,
+    )?;
+    let mut chunk = vec![0; encoding.chunk_size(DEFAULT_READ_CHUNK)];
+    let mut absolute_start = checkpoint.offset;
+    let mut row_number = checkpoint.row;
+    let mut record_start = checkpoint.offset;
+    let mut record = Vec::new();
+    let mut rows = Vec::with_capacity((target_end - start) as usize);
+
+    while row_number < target_end {
+        let remaining = end.saturating_sub(absolute_start);
+        let read = if remaining == 0 {
+            0
+        } else {
+            if encoding.is_utf16() && remaining == 1 {
+                return Err(QuarryError::SourceChanged);
+            }
+            let mut limit = chunk
+                .len()
+                .min(usize::try_from(remaining).unwrap_or(usize::MAX));
+            if encoding.is_utf16() {
+                limit &= !1;
+            }
+            if limit == 0 {
+                return Err(QuarryError::SourceChanged);
+            }
+            let got =
+                positional_io::read_at_exact_or_eof(file, absolute_start, &mut chunk[..limit])?;
+            if got < limit {
+                // Any short read below the committed frontier indicates concurrent truncation.
+                return Err(QuarryError::SourceChanged);
+            }
+            got
+        };
+        if read == 0 {
+            if !record.is_empty() && row_number >= start && row_number < target_end {
+                let fields = parse_encoded_record_with_bom_and_field_limit(
+                    &record,
+                    delimiter,
+                    row_number,
+                    strip_bom_at_zero && record_start == 0,
+                    encoding,
+                    MAX_TRANSFORMATION_COLUMNS,
+                )?
+                .into_iter()
+                .map(|field| field.into_owned())
+                .collect();
+                rows.push(Row {
+                    offset: record_start,
+                    fields,
+                });
+            }
+            break;
+        }
+        let mut segment_start = 0;
+        let mut deferred_error = None;
+        scanner.scan_chunk(&chunk[..read], absolute_start, |absolute_end| {
+            let local_end = (absolute_end - absolute_start) as usize;
+            if row_number >= start && row_number < target_end {
+                record.extend_from_slice(&chunk[segment_start..local_end]);
+                if record.len() > max_record_bytes {
+                    deferred_error = Some(QuarryError::RecordTooLarge {
+                        limit: max_record_bytes,
+                    });
+                } else if deferred_error.is_none() {
+                    match parse_encoded_record_with_bom_and_field_limit(
+                        &record,
+                        delimiter,
+                        row_number,
+                        strip_bom_at_zero && record_start == 0,
+                        encoding,
+                        MAX_TRANSFORMATION_COLUMNS,
+                    ) {
+                        Ok(fields) => rows.push(Row {
+                            offset: record_start,
+                            fields: fields.into_iter().map(|field| field.into_owned()).collect(),
+                        }),
+                        Err(error) => deferred_error = Some(error),
+                    }
+                }
+                record.clear();
+            }
+            row_number += 1;
+            record_start = absolute_end;
+            segment_start = local_end;
+        })?;
+        if let Some(error) = deferred_error {
+            return Err(error);
+        }
+        if row_number >= target_end {
+            break;
+        }
+        if row_number >= start {
+            record.extend_from_slice(&chunk[segment_start..read]);
+            if record.len() > max_record_bytes {
+                return Err(QuarryError::RecordTooLarge {
+                    limit: max_record_bytes,
+                });
+            }
+        }
+        absolute_start += read as u64;
+    }
+
+    Ok(rows)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn read_rows_from_index(
     path: &Path,
@@ -1656,7 +1964,7 @@ fn read_rows_from_index(
     let mut row_number = checkpoint.row;
     let mut record_start = checkpoint.offset;
     let mut record = Vec::new();
-    let mut rows = Vec::with_capacity(count);
+    let mut rows = Vec::with_capacity((target_end - start) as usize);
 
     while row_number < target_end {
         // Bound the read itself, so bytes past `end` (such as half of a UTF-16
@@ -1676,12 +1984,13 @@ fn read_rows_from_index(
         };
         if read == 0 {
             if !record.is_empty() && row_number >= start && row_number < target_end {
-                let fields = parse_encoded_record_with_bom(
+                let fields = parse_encoded_record_with_bom_and_field_limit(
                     &record,
                     delimiter,
                     row_number,
                     strip_bom_at_zero && record_start == 0,
                     encoding,
+                    MAX_TRANSFORMATION_COLUMNS,
                 )?
                 .into_iter()
                 .map(|field| field.into_owned())
@@ -1704,12 +2013,13 @@ fn read_rows_from_index(
                         limit: max_record_bytes,
                     });
                 } else if deferred_error.is_none() {
-                    match parse_encoded_record_with_bom(
+                    match parse_encoded_record_with_bom_and_field_limit(
                         &record,
                         delimiter,
                         row_number,
                         strip_bom_at_zero && record_start == 0,
                         encoding,
+                        MAX_TRANSFORMATION_COLUMNS,
                     ) {
                         Ok(fields) => rows.push(Row {
                             offset: record_start,

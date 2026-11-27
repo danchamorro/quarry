@@ -23,14 +23,22 @@ use quarry_core::{
     DuplicateJob, DuplicateOutcome, DuplicateSpec, DuplicateSummary, DuplicateTarget, Encoding,
     FilterExportJob, FilterExportOutcome, FilterExportProgress, FilterIndex, FilterJob,
     FilterMatch, FilterOperator, FilterProgress, FilterQuery, FilterReadJob, FilterReadOutcome,
-    HeaderMode, IndexConfig, IndexJob, IndexProgress, JoinConfig, JoinWorkingSource,
-    LiteralReplacement, MAX_TRANSFORMATION_COLUMNS, OpenOptions, QuarryError, ReplaceAllJob,
-    ReplaceAllOutcome, Row, RowInsertion, SaveAsJob, SaveAsOutcome, SaveAsProgress, SearchJob,
-    SearchMatch, SearchOutcome, SearchPosition, SectionBounds, SectionOpenOptions, Session,
-    SortDirection, SortJob, SortMode, SortOutcome, SortPlan, SplitAnalysisJob,
-    SplitAnalysisOutcome, StructuralIndex, VerifyBoundaryJob, VerifyBoundaryOutcome,
-    VerifyBoundaryProgress,
+    HeaderMode, IndexCacheConfig, IndexConfig, IndexJob, IndexProgress, JoinConfig,
+    JoinWorkingSource, LiteralReplacement, LiveWatchFilterJob, LiveWatchJob,
+    MAX_TRANSFORMATION_COLUMNS, OpenOptions, QuarryError, ReplaceAllJob, ReplaceAllOutcome, Row,
+    RowInsertion, SaveAsJob, SaveAsOutcome, SaveAsProgress, SearchJob, SearchMatch, SearchOutcome,
+    SearchPosition, SectionBounds, SectionOpenOptions, Session, SortDirection, SortJob, SortMode,
+    SortOutcome, SortPlan, SplitAnalysisJob, SplitAnalysisOutcome, StructuralIndex,
+    VerifyBoundaryJob, VerifyBoundaryOutcome, VerifyBoundaryProgress, WatchAlert, WatchConfig,
+    WatchSnapshot, WatchStatus,
 };
+
+/// Actionable reason surfaced when editing or modifying a document while Live Watch is active.
+pub const LIVE_WATCH_READ_ONLY_REASON: &str =
+    "Stop Live Watch before editing or modifying this file.";
+
+/// Repaint/UI ingestion sync throttle (~10 Hz) while Live Watch streams appended rows.
+pub const WATCH_REPAINT_THROTTLE: Duration = Duration::from_millis(100);
 #[cfg(any(test, feature = "test-hooks"))]
 use quarry_core::{SearchProgress, SortSpec};
 use std::collections::{BTreeMap, BTreeSet};
@@ -227,8 +235,21 @@ pub fn sort_progress(
 pub struct ViewportReadPlan {
     pub session: Arc<Session>,
     pub index: StructuralIndex,
+    pub live_watch_reader: Option<quarry_core::LiveWatchReader>,
     pub start: u64,
     pub count: usize,
+}
+
+impl ViewportReadPlan {
+    /// Executes the planned viewport read (off the UI thread), routing live-watched documents
+    /// through the watcher's pinned descriptor and static documents through `Session::read_rows`.
+    pub fn execute(&self) -> Result<Vec<Row>, QuarryError> {
+        if let Some(reader) = &self.live_watch_reader {
+            reader.read_rows(self.start, self.count)
+        } else {
+            self.session.read_rows(&self.index, self.start, self.count)
+        }
+    }
 }
 
 static NEXT_DOCUMENT_INSTANCE_ID: std::sync::atomic::AtomicU64 =
@@ -295,6 +316,16 @@ pub struct Document {
     pub verified_bounds_override: Option<SectionBounds>,
     pub pending_verified_reopen: Option<SectionBounds>,
     pub section_quote_free_confirmed: bool,
+    pub live_watch: Option<LiveWatchJob>,
+    pub live_watch_filter_attach: Option<LiveWatchFilterJob>,
+    pub live_watch_snapshot: Option<WatchSnapshot>,
+    live_watch_header_row: Option<Row>,
+    pub live_watch_alert: Option<WatchAlert>,
+    pub live_watch_tail_follow: bool,
+    pub live_watch_async_viewport: bool,
+    pub live_watch_viewport_dirty: bool,
+    live_watch_last_ui_sync: Instant,
+    live_watch_last_generation: u64,
     pub source_changed: bool,
     pub filter_viewport_start: u64,
     pub filter_buffer_start: u64,
@@ -357,6 +388,7 @@ pub struct ActiveFilterRead {
     pub job: FilterReadJob,
     pub started: Instant,
     pub cancel_requested: bool,
+    pub tail_follow: bool,
 }
 
 type BookmarkOffsetBatch = Result<Option<Vec<(u64, u64)>>, QuarryError>;
@@ -592,6 +624,16 @@ impl Document {
             verified_bounds_override: None,
             pending_verified_reopen: None,
             section_quote_free_confirmed: false,
+            live_watch: None,
+            live_watch_filter_attach: None,
+            live_watch_snapshot: None,
+            live_watch_header_row: None,
+            live_watch_alert: None,
+            live_watch_tail_follow: false,
+            live_watch_async_viewport: false,
+            live_watch_viewport_dirty: false,
+            live_watch_last_ui_sync: Instant::now() - WATCH_REPAINT_THROTTLE,
+            live_watch_last_generation: 0,
             source_changed: false,
             filter_viewport_start: 0,
             filter_buffer_start: 0,
@@ -641,6 +683,9 @@ impl Document {
     fn common_structural_edit_disabled_reason(&self) -> Option<&'static str> {
         if let Some(reason) = self.compressed_read_only_reason() {
             return Some(reason);
+        }
+        if self.is_live_watching() {
+            return Some(LIVE_WATCH_READ_ONLY_REASON);
         }
         if self.join_reserved() {
             return Some(JOIN_INPUT_RESERVED);
@@ -2283,6 +2328,468 @@ impl Document {
         self.progress.rows_scanned.saturating_sub(self.data_start)
     }
 
+    pub fn is_live_watching(&self) -> bool {
+        self.live_watch.is_some()
+    }
+
+    pub fn is_filter_scanning(&self) -> bool {
+        self.filter_job.is_some() || self.live_watch_filter_attach.is_some()
+    }
+
+    pub fn live_watch_fd_count(&self) -> usize {
+        self.live_watch
+            .as_ref()
+            .map_or(0, LiveWatchJob::held_fd_count)
+    }
+
+    pub fn live_watch_unavailable_reason(&self) -> Option<&'static str> {
+        if self.is_compressed() {
+            return Some("Live Watch Mode is unavailable for compressed (.gz) files.");
+        }
+        if self.is_section() {
+            return Some(
+                "Live Watch Mode is only available for whole files, not bounded sections.",
+            );
+        }
+        if self.source_changed {
+            return Some("Reload the changed source before starting Live Watch Mode.");
+        }
+        if self.is_dirty() {
+            return Some("Save or discard unsaved changes before starting Live Watch Mode.");
+        }
+        if self.join_reserved() {
+            return Some(JOIN_INPUT_RESERVED);
+        }
+        if self.save_job.is_some()
+            || self.export_job.is_some()
+            || self.structural_job.is_some()
+            || self.search_job.is_some()
+            || self.is_filter_scanning()
+            || self.pending_materialization.is_some()
+        {
+            return Some(
+                "Wait for active file operations to finish before starting Live Watch Mode.",
+            );
+        }
+        if self.filter_active()
+            && (self.filter_refresh_pending
+                || self.filter_paused_row_limit.is_some()
+                || self
+                    .filter_progress
+                    .is_some_and(|progress| !progress.done || progress.cancelled)
+                || self
+                    .filter_index
+                    .as_ref()
+                    .is_none_or(|idx| !idx.is_complete()))
+        {
+            return Some("Finish or clear the incomplete filter before starting Live Watch Mode.");
+        }
+        if self.job.is_some() || self.index.as_ref().is_none_or(|idx| !idx.is_complete()) {
+            return Some("Wait for initial indexing to finish before starting Live Watch Mode.");
+        }
+        None
+    }
+
+    pub fn can_start_live_watch(&self) -> bool {
+        !self.is_live_watching() && self.live_watch_unavailable_reason().is_none()
+    }
+
+    pub fn start_live_watch(&mut self) -> Result<(), AppMessage> {
+        let cache_config = if self.index_cache_enabled {
+            IndexCacheConfig::default()
+        } else {
+            IndexCacheConfig::disabled()
+        };
+        self.start_live_watch_with_config(WatchConfig {
+            cache_config,
+            ..WatchConfig::default()
+        })
+    }
+
+    pub fn start_live_watch_with_config(&mut self, config: WatchConfig) -> Result<(), AppMessage> {
+        if self.is_live_watching() {
+            return Ok(());
+        }
+        if let Some(reason) = self.live_watch_unavailable_reason() {
+            return Err(AppMessage::warning(reason));
+        }
+        self.commit_edits();
+        self.stop_filter_read();
+        self.stop_bookmark_offset_job();
+        let index = self
+            .index
+            .as_ref()
+            .ok_or_else(|| AppMessage::warning("Wait for initial indexing to finish."))?;
+        let job = self
+            .session
+            .start_live_watch(index, self.filter_index.as_ref(), config)
+            .map_err(|error| {
+                if matches!(error, QuarryError::SourceChanged) {
+                    self.invalidate_changed_source();
+                    AppMessage::warning(SOURCE_CHANGED_NOTICE)
+                } else {
+                    AppMessage::core_error(error)
+                }
+            })?;
+
+        let (snap, live_index, live_filter) = job.state_snapshot();
+        self.index = Some(live_index);
+        if let Some(filter_idx) = live_filter {
+            self.filter_index = Some(filter_idx);
+            if let Some(progress) = self.filter_progress.as_mut() {
+                progress.matches_found = snap.filter_matches_found.unwrap_or(0);
+                progress.done = true;
+            }
+        }
+        self.progress.rows_scanned = snap.committed_rows;
+        self.progress.bytes_scanned = snap.committed_record_end;
+        self.progress.bytes_read = snap.observed_file_len;
+        self.progress.file_size = snap.observed_file_len;
+        self.progress.columns_found = snap.maximum_width;
+        let initial_committed_rows = snap.committed_rows;
+        self.live_watch_last_generation = snap.generation;
+        self.live_watch_last_ui_sync = Instant::now() - WATCH_REPAINT_THROTTLE;
+        self.live_watch_snapshot = Some(snap);
+        self.live_watch_header_row =
+            if self.session.dialect.has_header && initial_committed_rows > 0 {
+                job.read_rows(0, 1).ok().and_then(|mut rows| rows.pop())
+            } else {
+                None
+            };
+        if self.live_watch_header_row.is_some() {
+            self.refresh_column_headers();
+        }
+        self.live_watch_alert = None;
+        self.live_watch_tail_follow = true;
+        self.live_watch = Some(job);
+        // Jump to the live tail immediately on opt-in start; propagate any read failure cleanly.
+        if let Err(err) = self.scroll_to_live_tail(true) {
+            let _ = self.stop_live_watch();
+            return Err(AppMessage::error(err));
+        }
+        Ok(())
+    }
+
+    pub fn stop_live_watch(&mut self) -> Result<Option<WatchAlert>, AppMessage> {
+        self.stop_filter_read();
+        let cancelled_attach = if let Some(attach) = self.live_watch_filter_attach.take() {
+            attach.cancel();
+            drop(attach);
+            true
+        } else {
+            false
+        };
+        let Some(job) = self.live_watch.take() else {
+            return Ok(None);
+        };
+        let outcome = job.stop().map_err(AppMessage::core_error)?;
+        self.session = Arc::new(outcome.session);
+        self.index = Some(outcome.index.clone());
+        self.filter_index = outcome.filter_index;
+        // Reconcile `filter_query` with the actual `FilterIndex` returned by `stop()` so
+        // cancelling an in-flight replacement filter on Stop Watch never leaves a mismatched
+        // query/index pair (e.g., grid showing filter A while export evaluates filter B).
+        match self.filter_index.as_ref() {
+            Some(idx) => {
+                if self.filter_query.as_ref() != Some(idx.query()) {
+                    self.filter_query = Some(idx.query().clone());
+                    self.filter_status = Some(format!(
+                        "Filter complete. {} matches.",
+                        group_digits(idx.matches_found())
+                    ));
+                }
+            }
+            None if cancelled_attach => {
+                self.filter_query = None;
+                self.filter_progress = None;
+                self.filter_status = Some("Filter cancelled.".into());
+            }
+            None => {}
+        }
+        self.progress.rows_scanned = outcome.index.indexed_rows();
+        self.progress.bytes_scanned = outcome.index.committed_record_end();
+        self.progress.bytes_read = outcome.snapshot.observed_file_len;
+        self.progress.file_size = self.session.file_size;
+        self.progress.columns_found = outcome.index.maximum_width();
+        self.progress.done = outcome.index.is_complete();
+        self.live_watch_tail_follow = false;
+        self.live_watch_viewport_dirty = false;
+        self.live_watch_last_generation = outcome.snapshot.generation;
+        self.live_watch_snapshot = Some(outcome.snapshot);
+        self.live_watch_header_row = None;
+        self.apply_indexed_width(outcome.index.maximum_width());
+        self.refresh_column_headers();
+
+        let alert = match outcome.final_status {
+            WatchStatus::Alert(alert) => {
+                if matches!(
+                    alert,
+                    WatchAlert::Truncated { .. } | WatchAlert::Rewritten | WatchAlert::Rotated
+                ) || !outcome.index.is_complete()
+                {
+                    self.invalidate_changed_source();
+                }
+                self.live_watch_alert = Some(alert.clone());
+                Some(alert)
+            }
+            _ => {
+                self.live_watch_alert = None;
+                if !self
+                    .bookmarks
+                    .pending_offset_rows(self.source_generation)
+                    .is_empty()
+                {
+                    self.bookmark_offset_refresh_pending = true;
+                }
+                // Reload buffer cleanly from reconciled static session at current scroll anchor.
+                self.buffered_rows.clear();
+                self.filtered_rows.clear();
+                self.whitespace.invalidate_rows();
+                if self.filter_active() {
+                    if let Some(progress) = self.filter_progress.as_mut() {
+                        progress.matches_found = self
+                            .filter_index
+                            .as_ref()
+                            .map_or(0, FilterIndex::matches_found);
+                        progress.done = true;
+                    }
+                    let _ = self.navigate_filter(self.filter_viewport_start);
+                } else if self.available_data_rows() > 0 {
+                    let clamped = self
+                        .viewport_start
+                        .min(self.available_rows().saturating_sub(1))
+                        .max(self.data_start);
+                    let _ = self.navigate(clamped);
+                }
+                None
+            }
+        };
+        Ok(alert)
+    }
+
+    pub fn dismiss_live_watch_alert(&mut self) {
+        self.live_watch_alert = None;
+    }
+
+    pub fn set_live_watch_tail_follow(&mut self, follow: bool) -> Result<(), String> {
+        if !self.is_live_watching() {
+            self.live_watch_tail_follow = false;
+            return Ok(());
+        }
+        self.live_watch_tail_follow = follow;
+        if follow {
+            self.scroll_to_live_tail(true)?;
+        }
+        Ok(())
+    }
+
+    fn scroll_to_live_tail(&mut self, force_reload: bool) -> Result<(), String> {
+        if self.filter_active() {
+            let available = self.available_filter_rows();
+            if available == 0 {
+                self.filter_viewport_start = 0;
+                self.filtered_rows.clear();
+                self.whitespace.invalidate_rows();
+                self.cancel_filter_read_for_navigation();
+                return Ok(());
+            }
+            let target = max_viewport_start(available, self.visible_rows);
+            self.filter_viewport_start = target;
+            // Preserve the current filtered buffer while the background tail read refreshes so
+            // sustained matching appends never blank the grid or starve completed reads.
+            return self.schedule_filter_buffer_inner(target, true);
+        }
+        let available_data = self.available_data_rows();
+        if available_data == 0 {
+            self.viewport_start = self.data_start;
+            self.buffered_rows.clear();
+            self.whitespace.invalidate_rows();
+            return Ok(());
+        }
+        let target = self
+            .data_start
+            .saturating_add(max_viewport_start(available_data, self.visible_rows));
+        self.viewport_start = target;
+        if self.live_watch_async_viewport {
+            self.live_watch_viewport_dirty = true;
+            return Ok(());
+        }
+        if force_reload {
+            self.buffered_rows.clear();
+            self.whitespace.invalidate_rows();
+        }
+        self.load_buffer(target)
+    }
+
+    /// Takes any deferred unfiltered Live Watch viewport refresh as an off-UI-thread
+    /// [`ViewportReadPlan`], ensuring active-tab tail refreshes never perform disk I/O on the UI
+    /// thread and inactive watched tabs do not read from disk until activated.
+    pub fn take_live_watch_viewport_plan(&mut self) -> Option<ViewportReadPlan> {
+        if !self.live_watch_viewport_dirty {
+            return None;
+        }
+        self.live_watch_viewport_dirty = false;
+        if self.filter_active() {
+            return None;
+        }
+        let watch = self.live_watch.as_ref()?;
+        let available = self.available_rows();
+        if available <= self.data_start {
+            self.viewport_start = self.data_start;
+            self.buffered_rows.clear();
+            self.whitespace.invalidate_rows();
+            return None;
+        }
+        let capacity = self.visible_rows.saturating_add(2 * OVERSCAN_ROWS) as u64;
+        let last_start = available.saturating_sub(capacity).max(self.data_start);
+        let start = self
+            .viewport_start
+            .saturating_sub(OVERSCAN_ROWS as u64)
+            .max(self.data_start)
+            .min(last_start);
+        let count = available.saturating_sub(start).min(capacity) as usize;
+        if count == 0 {
+            return None;
+        }
+        Some(ViewportReadPlan {
+            session: Arc::clone(&self.session),
+            index: watch.index_snapshot(),
+            live_watch_reader: Some(watch.reader()),
+            start,
+            count,
+        })
+    }
+
+    /// Polls active Live Watch Mode, throttling steady-stream UI syncs to ~10 Hz while surfacing
+    /// alerts and status transitions immediately. Returns `Ok(true)` when UI state changed.
+    pub fn poll_live_watch(&mut self) -> Result<bool, String> {
+        let Some(job) = self.live_watch.as_ref() else {
+            return Ok(false);
+        };
+        let snap = job.snapshot();
+        // Alerts / terminal watch transitions bypass the ~10 Hz repaint throttle immediately.
+        if !snap.status.is_active() {
+            match self.stop_live_watch() {
+                Ok(_) => return Ok(true),
+                Err(msg) => {
+                    let fallback_alert = match snap.status {
+                        WatchStatus::Alert(alert) => alert,
+                        _ => WatchAlert::IoError(msg.text.clone()),
+                    };
+                    self.invalidate_changed_source();
+                    self.live_watch_alert = Some(fallback_alert);
+                    return Err(msg.text);
+                }
+            }
+        }
+        let status_changed = self
+            .live_watch_snapshot
+            .as_ref()
+            .is_some_and(|prev| prev.status != snap.status);
+        if snap.generation == self.live_watch_last_generation && !status_changed {
+            return Ok(false);
+        }
+        if !status_changed && self.live_watch_last_ui_sync.elapsed() < WATCH_REPAINT_THROTTLE {
+            return Ok(false);
+        }
+
+        let prev_rows = self
+            .live_watch_snapshot
+            .as_ref()
+            .map_or(0, |prev| prev.committed_rows);
+        let prev_matches = self
+            .live_watch_snapshot
+            .as_ref()
+            .and_then(|prev| prev.filter_matches_found)
+            .unwrap_or(0);
+
+        self.live_watch_last_ui_sync = Instant::now();
+        let (snap, live_index, live_filter) = job.state_snapshot();
+        if !snap.status.is_active() {
+            match self.stop_live_watch() {
+                Ok(_) => return Ok(true),
+                Err(msg) => {
+                    let fallback_alert = match snap.status {
+                        WatchStatus::Alert(alert) => alert,
+                        _ => WatchAlert::IoError(msg.text.clone()),
+                    };
+                    self.invalidate_changed_source();
+                    self.live_watch_alert = Some(fallback_alert);
+                    return Err(msg.text);
+                }
+            }
+        }
+        let committed_header_row = if self.session.dialect.has_header
+            && self.live_watch_header_row.is_none()
+            && snap.committed_rows > 0
+        {
+            job.read_rows(0, 1).ok().and_then(|mut rows| rows.pop())
+        } else {
+            None
+        };
+        self.live_watch_last_generation = snap.generation;
+        self.index = Some(live_index);
+        let mut live_filter_query_changed = false;
+        if let Some(filter_idx) = live_filter {
+            live_filter_query_changed = self
+                .filter_index
+                .as_ref()
+                .is_some_and(|prev| prev.query() != filter_idx.query());
+            if live_filter_query_changed {
+                self.stop_filter_read();
+                self.filtered_rows.clear();
+                self.whitespace.invalidate_rows();
+            }
+            let matches = filter_idx.matches_found();
+            self.filter_index = Some(filter_idx);
+            if let Some(progress) = self.filter_progress.as_mut() {
+                progress.matches_found = matches;
+                progress.rows_scanned = snap.committed_rows;
+                progress.bytes_scanned = snap.committed_record_end;
+                progress.file_size = snap.observed_file_len;
+                progress.done = true;
+            }
+            self.filter_status = Some(format!("Live filter: {} matches.", group_digits(matches)));
+        }
+        self.progress.rows_scanned = snap.committed_rows;
+        self.progress.bytes_scanned = snap.committed_record_end;
+        self.progress.bytes_read = snap.observed_file_len;
+        self.progress.file_size = snap.observed_file_len;
+        self.progress.columns_found = snap.maximum_width;
+        if let Some(header_row) = committed_header_row {
+            self.live_watch_header_row = Some(header_row);
+            self.apply_indexed_width(snap.maximum_width);
+            self.refresh_column_headers();
+        } else {
+            self.apply_indexed_width(snap.maximum_width);
+        }
+
+        let rows_grew = snap.committed_rows > prev_rows;
+        let matches_grew = snap.filter_matches_found.unwrap_or(0) > prev_matches;
+        self.live_watch_snapshot = Some(snap);
+
+        if self.live_watch_tail_follow {
+            if rows_grew || matches_grew || live_filter_query_changed {
+                self.scroll_to_live_tail(true)?;
+            }
+        } else if self.filter_active() {
+            if live_filter_query_changed
+                || (matches_grew && self.filtered_rows.len() < self.visible_rows)
+            {
+                self.schedule_filter_buffer_inner(self.filter_viewport_start, true)?;
+            }
+        } else if rows_grew && self.buffered_rows.len() < self.visible_rows {
+            if self.live_watch_async_viewport {
+                self.live_watch_viewport_dirty = true;
+            } else {
+                self.buffered_rows.clear();
+                self.whitespace.invalidate_rows();
+                self.load_buffer(self.viewport_start)?;
+            }
+        }
+        Ok(true)
+    }
+
     pub fn pause_indexing(&mut self) -> Result<(), String> {
         let Some(job) = &self.job else {
             return Err("No active indexing job to pause.".into());
@@ -2505,6 +3012,7 @@ impl Document {
     ) -> bool {
         if query.is_empty()
             || self.is_compressed()
+            || self.is_live_watching()
             || self.search_job.is_some()
             || self.save_job.is_some()
             || self.structural_job.is_some()
@@ -2667,7 +3175,7 @@ impl Document {
         if self.export_job.is_some() {
             return Err("Cancel the active export before changing filters.".into());
         }
-        if self.filter_job.is_some() {
+        if self.is_filter_scanning() {
             return Err("A filter is already running.".into());
         }
         if self.search_job.is_some() {
@@ -2697,6 +3205,40 @@ impl Document {
             .map_err(|error| self.diagnostic_error(error))?;
 
         self.commit_edits();
+        if let Some(watch) = &self.live_watch {
+            let attach_job = watch
+                .start_attach_filter_query(query.clone())
+                .map_err(|error| self.diagnostic_error(error))?;
+            self.stop_filter_read();
+            self.filter_job = None;
+            self.live_watch_filter_attach = Some(attach_job);
+            self.filter_index = None;
+            self.filter_query = Some(query);
+            self.filter_refresh_pending = false;
+            self.filter_paused_row_limit = None;
+            self.filter_progress = Some(FilterProgress {
+                bytes_scanned: 0,
+                rows_scanned: 0,
+                matches_found: 0,
+                file_size: self.progress.file_size,
+                elapsed: Duration::ZERO,
+                done: false,
+                cancelled: false,
+            });
+            self.filter_status = Some("Filtering live file…".into());
+            self.export_progress = None;
+            self.export_status = None;
+            self.export_cancel_requested = false;
+            self.filter_viewport_start = 0;
+            self.filter_buffer_start = 0;
+            self.whitespace.invalidate_rows();
+            self.filtered_rows.clear();
+            self.selection = None;
+            self.clear_row_selection();
+            self.reveal_cell = None;
+            self.scroll_points = 0.0;
+            return Ok(());
+        }
         let (max_bytes, paused_row_limit) = if self.is_indexing_paused() {
             let partial = self.job.as_ref().map(IndexJob::snapshot);
             (
@@ -2793,6 +3335,129 @@ impl Document {
     }
 
     pub fn poll_filter_scan(&mut self) -> Result<(), String> {
+        if let Some(attach) = self.live_watch_filter_attach.as_ref() {
+            if !attach.is_done() {
+                return Ok(());
+            }
+            let attach = self
+                .live_watch_filter_attach
+                .take()
+                .expect("live watch filter attach job is present");
+            match attach.wait() {
+                Ok(Some(attached_index)) => {
+                    // Collect the watcher's current synchronized filter index so rows appended
+                    // after filter installation (already synced by `poll_live_watch`) are never
+                    // overwritten by the older snapshot returned by the attachment worker.
+                    let filter_index = self
+                        .live_watch
+                        .as_ref()
+                        .and_then(LiveWatchJob::filter_index_snapshot)
+                        .unwrap_or(attached_index);
+                    let matches = filter_index.matches_found();
+                    self.filter_index = Some(filter_index);
+                    self.filter_progress = Some(FilterProgress {
+                        bytes_scanned: self.progress.bytes_scanned,
+                        rows_scanned: self.progress.rows_scanned,
+                        matches_found: matches,
+                        file_size: self.progress.file_size,
+                        elapsed: Duration::ZERO,
+                        done: true,
+                        cancelled: false,
+                    });
+                    self.filter_status =
+                        Some(format!("Live filter: {} matches.", group_digits(matches)));
+                    self.filter_viewport_start = if self.live_watch_tail_follow {
+                        max_viewport_start(matches, self.visible_rows)
+                    } else {
+                        0
+                    };
+                    self.stop_filter_read();
+                    self.filter_buffer_start = 0;
+                    self.whitespace.invalidate_rows();
+                    self.filtered_rows.clear();
+                    self.schedule_filter_buffer(self.filter_viewport_start)?;
+                }
+                Ok(None) => {
+                    self.stop_filter_read();
+                    if let Some(existing) = self
+                        .live_watch
+                        .as_ref()
+                        .and_then(LiveWatchJob::filter_index_snapshot)
+                    {
+                        let matches = existing.matches_found();
+                        self.filter_query = Some(existing.query().clone());
+                        self.filter_index = Some(existing);
+                        self.filter_progress = Some(FilterProgress {
+                            bytes_scanned: self.progress.bytes_scanned,
+                            rows_scanned: self.progress.rows_scanned,
+                            matches_found: matches,
+                            file_size: self.progress.file_size,
+                            elapsed: Duration::ZERO,
+                            done: true,
+                            cancelled: false,
+                        });
+                        self.filter_status = Some(format!(
+                            "Filter change cancelled; keeping previous live filter ({} matches).",
+                            group_digits(matches)
+                        ));
+                        self.filter_viewport_start = if self.live_watch_tail_follow {
+                            max_viewport_start(matches, self.visible_rows)
+                        } else {
+                            0
+                        };
+                        self.filter_buffer_start = 0;
+                        self.whitespace.invalidate_rows();
+                        self.filtered_rows.clear();
+                        self.schedule_filter_buffer(self.filter_viewport_start)?;
+                    } else {
+                        self.filter_query = None;
+                        self.filter_index = None;
+                        self.filter_progress = None;
+                        self.filter_status = Some("Filter cancelled.".into());
+                    }
+                }
+                Err(error) => {
+                    self.stop_filter_read();
+                    if matches!(error, QuarryError::SourceChanged) {
+                        self.invalidate_changed_source();
+                    }
+                    // Keep `filter_query`, `filter_index`, and the watcher's live filter aligned
+                    // when a replacement attachment fails instead of leaving the failed query
+                    // paired with the previous filter's index.
+                    if let Some(existing) = self
+                        .live_watch
+                        .as_ref()
+                        .and_then(LiveWatchJob::filter_index_snapshot)
+                    {
+                        let matches = existing.matches_found();
+                        self.filter_query = Some(existing.query().clone());
+                        self.filter_index = Some(existing);
+                        self.filter_progress = Some(FilterProgress {
+                            bytes_scanned: self.progress.bytes_scanned,
+                            rows_scanned: self.progress.rows_scanned,
+                            matches_found: matches,
+                            file_size: self.progress.file_size,
+                            elapsed: Duration::ZERO,
+                            done: true,
+                            cancelled: false,
+                        });
+                        if !matches!(error, QuarryError::SourceChanged) {
+                            self.filter_buffer_start = 0;
+                            self.whitespace.invalidate_rows();
+                            self.filtered_rows.clear();
+                            let _ = self.schedule_filter_buffer(self.filter_viewport_start);
+                        }
+                    } else {
+                        self.filter_query = None;
+                        self.filter_index = None;
+                        self.filter_progress = None;
+                    }
+                    self.filter_status = Some("Filter failed.".into());
+                    return Err(self.diagnostic_error(error));
+                }
+            }
+            return Ok(());
+        }
         let Some(job) = self.filter_job.as_ref() else {
             return Ok(());
         };
@@ -2890,8 +3555,14 @@ impl Document {
             .take()
             .expect("completed filter read should be active");
         let desired = self.filter_read_window(self.filter_viewport_start);
+        let install_coalesced_live = active.tail_follow
+            && !active.cancel_requested
+            && self.filter_active()
+            && self.is_live_watching();
         match active.job.wait() {
-            Ok(FilterReadOutcome::Complete(rows)) if desired == Some(active.window) => {
+            Ok(FilterReadOutcome::Complete(rows))
+                if desired == Some(active.window) || install_coalesced_live =>
+            {
                 let loaded_columns = rows.iter().map(|row| row.fields.len()).max().unwrap_or(0);
                 if loaded_columns > self.total_columns {
                     self.ensure_column_count(loaded_columns);
@@ -2913,7 +3584,10 @@ impl Document {
                     && desired.is_some_and(|window| window != active.window)
                 {
                     self.pending_filter_read = desired;
-                    let _ = self.schedule_filter_buffer(self.filter_viewport_start);
+                    let _ = self.schedule_filter_buffer_inner(
+                        self.filter_viewport_start,
+                        self.is_live_watching() && self.live_watch_tail_follow,
+                    );
                 } else {
                     self.pending_filter_read = None;
                 }
@@ -2924,7 +3598,10 @@ impl Document {
         if self.filter_waiting_for_page() {
             return Ok(());
         }
-        self.schedule_filter_buffer(self.filter_viewport_start)
+        self.schedule_filter_buffer_inner(
+            self.filter_viewport_start,
+            self.is_live_watching() && self.live_watch_tail_follow,
+        )
     }
 
     pub fn start_filtered_export(&mut self, destination: PathBuf) -> Result<(), AppMessage> {
@@ -3045,6 +3722,7 @@ impl Document {
 
     pub fn is_filtered_export_ready(&self) -> bool {
         !self.source_changed
+            && !self.is_live_watching()
             && self.filter_query.is_some()
             && self.filter_paused_row_limit.is_none()
             && !self.filter_refresh_pending
@@ -3277,6 +3955,9 @@ impl Document {
     ///
     /// Returns `true` when a background worker was spawned.
     pub fn start_bookmark_offset_refresh(&mut self) -> bool {
+        if self.is_live_watching() {
+            return false;
+        }
         self.refresh_bookmark_offsets_from_buffers();
         let generation = self.source_generation;
         let pending = self.bookmarks.pending_offset_rows(generation);
@@ -3410,6 +4091,9 @@ impl Document {
     /// Returns a clear explanation when Split-at-Bookmarks is unavailable (including Speculative
     /// sections per Phase 5A-5 / Phase 7A-1), or `None` when ready to snapshot split targets.
     pub fn split_at_bookmarks_disabled_reason(&self) -> Option<String> {
+        if self.is_live_watching() {
+            return Some("Stop Live Watch before splitting at bookmarks.".into());
+        }
         if self.source_changed {
             return Some(SOURCE_CHANGED_NOTICE.into());
         }
@@ -3723,6 +4407,7 @@ impl Document {
 
     pub fn save_operations_ready(&self) -> bool {
         !self.join_reserved()
+            && !self.is_live_watching()
             && !self.source_changed
             && self.save_job.is_none()
             && self.export_job.is_none()
@@ -3953,6 +4638,9 @@ impl Document {
         if let Some(job) = &self.filter_job {
             job.cancel();
         }
+        if let Some(attach) = &self.live_watch_filter_attach {
+            attach.cancel();
+        }
     }
 
     pub fn clear_filter(&mut self) -> Result<(), String> {
@@ -3969,6 +4657,13 @@ impl Document {
 
     /// Drop filter state without starting a read while a save is being handed off.
     pub fn reset_filter_state(&mut self) {
+        if let Some(attach) = self.live_watch_filter_attach.take() {
+            attach.cancel();
+            drop(attach);
+        }
+        if let Some(watch) = &self.live_watch {
+            watch.clear_filter();
+        }
         self.stop_filter_read();
         if let Some(job) = self.filter_job.take() {
             job.cancel();
@@ -4045,6 +4740,7 @@ impl Document {
     pub fn is_search_ready(&self) -> bool {
         self.structural_job.is_none()
             && !self.source_changed
+            && !self.is_live_watching()
             && ((self.index.is_some() && self.progress.done && !self.progress.cancelled)
                 || (self.is_indexing_paused() && self.job.is_some()))
     }
@@ -4165,14 +4861,25 @@ impl Document {
         self.header_renames
             .get(&column)
             .map(|name| field_text(name.as_bytes()))
-            .unwrap_or_else(|| column_name(&self.session, column))
+            .unwrap_or_else(|| {
+                if self.session.dialect.has_header
+                    && let Some(row) = self.live_watch_header_row.as_ref()
+                {
+                    return row
+                        .fields
+                        .get(column)
+                        .map(|field| field_text(field))
+                        .unwrap_or_else(|| format!("Column {}", column + 1));
+                }
+                column_name(&self.session, column)
+            })
     }
 
     pub fn current_header_fields(&self) -> Vec<Vec<u8>> {
         let mut fields = self
-            .session
-            .first_rows
-            .first()
+            .live_watch_header_row
+            .as_ref()
+            .or_else(|| self.session.first_rows.first())
             .map(|row| row.fields.clone())
             .unwrap_or_default();
         for (column, name) in self.header_renames.iter() {
@@ -4191,6 +4898,7 @@ impl Document {
     pub fn header_is_editable(&self, column: usize) -> bool {
         !self.is_compressed()
             && !self.is_section()
+            && !self.is_live_watching()
             && !self.join_reserved()
             && self.save_job.is_none()
             && self.export_job.is_none()
@@ -4234,6 +4942,9 @@ impl Document {
     pub fn rename_header(&mut self, column: usize, name: String) -> Result<(), String> {
         if let Some(reason) = self.compressed_read_only_reason() {
             return Err(reason.into());
+        }
+        if self.is_live_watching() {
+            return Err(LIVE_WATCH_READ_ONLY_REASON.into());
         }
         if self.is_section() {
             return Err(
@@ -4286,6 +4997,9 @@ impl Document {
     pub fn cell_edit_disabled_reason(&self, source: Option<&[u8]>) -> Option<&'static str> {
         if let Some(reason) = self.compressed_read_only_reason() {
             return Some(reason);
+        }
+        if self.is_live_watching() {
+            return Some(LIVE_WATCH_READ_ONLY_REASON);
         }
         if self.join_reserved() {
             return Some(JOIN_INPUT_RESERVED);
@@ -4516,6 +5230,7 @@ impl Document {
 
     pub fn history_ready(&self) -> bool {
         !self.join_reserved()
+            && !self.is_live_watching()
             && !self.source_changed
             && !self.filter_refresh_pending
             && self.header_edit.is_none()
@@ -4577,7 +5292,13 @@ impl Document {
     }
 
     pub fn index_status(&self) -> &'static str {
-        if self.source_changed {
+        if self.is_live_watching() {
+            if self.live_watch_tail_follow {
+                "Live Watch"
+            } else {
+                "Live Watch (paused scroll)"
+            }
+        } else if self.source_changed {
             "Source changed"
         } else if let Some(status) = self.compressed_index_status() {
             status
@@ -4593,6 +5314,14 @@ impl Document {
     }
 
     pub fn shutdown(&mut self) {
+        if let Some(attach) = self.live_watch_filter_attach.take() {
+            attach.cancel();
+            drop(attach);
+        }
+        if let Some(watch) = self.live_watch.take() {
+            drop(watch);
+        }
+        self.live_watch_tail_follow = false;
         self.stop_decompression();
         self.stop_bookmark_offset_job();
         self.whitespace.invalidate();
@@ -4656,6 +5385,12 @@ impl Document {
     }
 
     pub fn available_rows(&self) -> u64 {
+        if self.is_live_watching() {
+            return self
+                .index
+                .as_ref()
+                .map_or(self.progress.rows_scanned, StructuralIndex::indexed_rows);
+        }
         self.index
             .as_ref()
             .map(StructuralIndex::indexed_rows)
@@ -4736,6 +5471,13 @@ impl Document {
                 self.scroll_points = 0.0;
                 return Ok(());
             }
+            if self.is_live_watching() {
+                if rows.is_negative() || target < maximum {
+                    self.live_watch_tail_follow = false;
+                } else if target >= maximum {
+                    self.live_watch_tail_follow = true;
+                }
+            }
             return self.navigate_filter(target);
         }
         let available = self.available_data_rows();
@@ -4749,6 +5491,13 @@ impl Document {
         if target == current {
             self.scroll_points = 0.0;
             return Ok(());
+        }
+        if self.is_live_watching() {
+            if rows.is_negative() || target < maximum {
+                self.live_watch_tail_follow = false;
+            } else if target >= maximum {
+                self.live_watch_tail_follow = true;
+            }
         }
         self.navigate(self.data_start.saturating_add(target))
     }
@@ -4798,6 +5547,13 @@ impl Document {
             self.available_data_rows(),
             self.visible_rows,
         );
+        if self.is_live_watching() {
+            let max_start = self.data_start.saturating_add(max_viewport_start(
+                self.available_data_rows(),
+                self.visible_rows,
+            ));
+            self.live_watch_tail_follow = start >= max_start;
+        }
         self.load_buffer(start)?;
         self.viewport_start = start;
         self.clear_hidden_selection();
@@ -4838,7 +5594,11 @@ impl Document {
         let count = available.saturating_sub(start).min(capacity) as usize;
         let end = start.saturating_add(count as u64);
         let began = Instant::now();
-        let rows = if end <= self.session.first_rows.len() as u64 {
+        let rows = if let Some(watch) = &self.live_watch {
+            watch
+                .read_rows(start, count)
+                .map_err(|error| self.diagnostic_error(error))?
+        } else if end <= self.session.first_rows.len() as u64 {
             self.session.first_rows[start as usize..end as usize].to_vec()
         } else if let Some(index) = &self.index {
             self.session
@@ -4899,7 +5659,19 @@ impl Document {
             self.available_data_rows(),
             self.visible_rows,
         );
+        let prev_viewport_start = self.viewport_start;
         self.viewport_start = viewport_start;
+        if self.is_live_watching() {
+            let max_start = self.data_start.saturating_add(max_viewport_start(
+                self.available_data_rows(),
+                self.visible_rows,
+            ));
+            if viewport_start < prev_viewport_start && viewport_start < max_start {
+                self.live_watch_tail_follow = false;
+            } else if viewport_start >= max_start {
+                self.live_watch_tail_follow = true;
+            }
+        }
         self.clear_hidden_selection();
 
         let visible_end = viewport_start.saturating_add(
@@ -4925,6 +5697,15 @@ impl Document {
             .min(last_start);
         let count = available.saturating_sub(start).min(capacity) as usize;
         let end = start.saturating_add(count as u64);
+        if let Some(watch) = &self.live_watch {
+            return Ok(Some(ViewportReadPlan {
+                session: Arc::clone(&self.session),
+                index: watch.index_snapshot(),
+                live_watch_reader: Some(watch.reader()),
+                start,
+                count,
+            }));
+        }
         if end <= self.session.first_rows.len() as u64 {
             let began = Instant::now();
             let rows = self.session.first_rows[start as usize..end as usize].to_vec();
@@ -4935,6 +5716,7 @@ impl Document {
             return Ok(Some(ViewportReadPlan {
                 session: Arc::clone(&self.session),
                 index: index.clone(),
+                live_watch_reader: None,
                 start,
                 count,
             }));
@@ -4949,6 +5731,7 @@ impl Document {
             return Ok(Some(ViewportReadPlan {
                 session: Arc::clone(&self.session),
                 index: job.snapshot(),
+                live_watch_reader: None,
                 start,
                 count,
             }));
@@ -5003,6 +5786,14 @@ impl Document {
     }
 
     pub fn schedule_filter_buffer(&mut self, viewport_start: u64) -> Result<(), String> {
+        self.schedule_filter_buffer_inner(viewport_start, false)
+    }
+
+    fn schedule_filter_buffer_inner(
+        &mut self,
+        viewport_start: u64,
+        is_tail_follow: bool,
+    ) -> Result<(), String> {
         let Some(window) = self.filter_read_window(viewport_start) else {
             self.cancel_filter_read_for_navigation();
             self.filter_buffer_start = 0;
@@ -5028,10 +5819,18 @@ impl Document {
             return Ok(());
         }
 
-        self.refresh_filter_snapshot_for(window.start_match.saturating_add(window.count as u64));
+        if self.live_watch.is_none() {
+            self.refresh_filter_snapshot_for(
+                window.start_match.saturating_add(window.count as u64),
+            );
+        }
         if let Some(active) = self.filter_read.as_mut() {
             if active.window == window && !active.cancel_requested {
                 self.pending_filter_read = None;
+            } else if is_tail_follow && active.tail_follow && !active.cancel_requested {
+                // Keep one live-watch filtered tail read in flight and coalesce subsequent tail
+                // window updates instead of cancelling and discarding completed results.
+                self.pending_filter_read = Some(window);
             } else {
                 if !active.cancel_requested {
                     active.job.cancel();
@@ -5042,31 +5841,45 @@ impl Document {
             return Ok(());
         }
 
-        self.start_filter_read(window)
+        self.start_filter_read_with_mode(window, is_tail_follow)
     }
 
     pub fn start_filter_read(&mut self, window: FilterReadWindow) -> Result<(), String> {
+        self.start_filter_read_with_mode(window, false)
+    }
+
+    fn start_filter_read_with_mode(
+        &mut self,
+        window: FilterReadWindow,
+        tail_follow: bool,
+    ) -> Result<(), String> {
         self.pending_filter_read = None;
-        let index = self
-            .filter_index
-            .as_ref()
-            .ok_or_else(|| "No filter index is available.".to_owned())?;
-        let job = self
-            .session
-            .start_filtered_read(index, window.start_match, window.count)
-            .map_err(|error| {
-                if matches!(error, QuarryError::SourceChanged) {
-                    self.invalidate_changed_source();
-                    SOURCE_CHANGED_NOTICE.to_owned()
-                } else {
-                    self.diagnostic_error(error)
-                }
-            })?;
+        let job = if let Some(watch) = &self.live_watch {
+            watch
+                .start_filtered_read(window.start_match, window.count)
+                .map_err(|error| self.diagnostic_error(error))?
+        } else {
+            let index = self
+                .filter_index
+                .as_ref()
+                .ok_or_else(|| "No filter index is available.".to_owned())?;
+            self.session
+                .start_filtered_read(index, window.start_match, window.count)
+                .map_err(|error| {
+                    if matches!(error, QuarryError::SourceChanged) {
+                        self.invalidate_changed_source();
+                        SOURCE_CHANGED_NOTICE.to_owned()
+                    } else {
+                        self.diagnostic_error(error)
+                    }
+                })?
+        };
         self.filter_read = Some(ActiveFilterRead {
             window,
             job,
             started: Instant::now(),
             cancel_requested: false,
+            tail_follow,
         });
         Ok(())
     }
@@ -5714,7 +6527,7 @@ pub fn footer_range_text(document: &Document) -> String {
     if document.filter_active() {
         let total = document.available_filter_rows();
         let visible = document.visible_row_count() as u64;
-        if document.filter_job.is_some() && total == 0 {
+        if document.is_filter_scanning() && total == 0 {
             return "Finding matching rows…".into();
         }
         if document.filter_rows_loading() && visible == 0 {

@@ -274,6 +274,41 @@ shift deterministically when you insert or delete rows, and clear cleanly with a
 notice (restorable via Undo) when a full-file Sort or Duplicate removal reorders
 or removes rows.
 
+### Watch a growing file with Live Watch Mode
+
+Point Quarry at an actively appended CSV or TSV file (such as an ETL export or
+log stream) and watch new rows appear without losing your scroll position:
+
+- **Start or stop Live Watch:** Click **Watch** in the toolbar, choose
+  **Data → Live Watch**, or press **Command+Shift+L** (macOS) /
+  **Ctrl+Shift+L** (Linux). Live Watch is opt-in and available on clean,
+  uncompressed whole files once initial indexing finishes (compressed `.csv.gz`
+  files and bounded sections cannot enter Live Watch).
+- **Read-only while watching:** Editing, Undo/Redo, Save, Save As, and
+  structural transforms stay disabled until you stop Live Watch. Stopping Live
+  Watch cleanly transitions the tab back to normal editable mode (reconciling
+  the final EOF state and refreshing any enabled sidecar cache once).
+- **Tail-follow and scroll preservation:** Live Watch starts following the tail
+  automatically. Scroll up at any time to inspect earlier rows—tail-follow
+  pauses automatically while Quarry keeps reading new rows in the background
+  with zero scroll jump. Click **Follow Tail** in the watch banner (or scroll
+  back to the bottom) to resume following live output.
+- **Incremental filters and provisional tail:** Any active filter evaluates
+  only newly appended rows instead of rescanning the file. An unterminated
+  trailing line stays provisional (capped at the 64 MiB record limit) until its
+  newline arrives, safely carrying partial UTF-8 sequences, odd UTF-16 bytes,
+  surrogate pairs, quoted fields, and split `CRLF` endings across writes.
+- **Rotation, truncation, and rewrite detection:** Quarry uses native OS
+  notifications (`kqueue` on macOS, `inotify` on Linux) and bounded polling on
+  network volumes, checking the file size, path identity, and committed tail
+  seam (`4 KiB`) on every growth event. Rename rotation drains remaining bytes
+  from the old file handle, stops Live Watch, and offers **Open New File**;
+  truncation or `copytruncate` / seam overwrites stop Live Watch and offer
+  **Reload from Disk**. *(Note: an append-only tail watcher cannot detect a
+  silent in-place overwrite strictly earlier than the 4 KiB tail seam that
+  keeps total file size unchanged; stop Live Watch and reload if you need
+  full-file re-verification.)*
+
 ### Open compressed files
 
 Quarry opens gzip-compressed delimited files, such as `sales.csv.gz`, read-only.
