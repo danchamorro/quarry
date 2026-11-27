@@ -20,6 +20,7 @@ use crate::encoding::RecordScanner;
 use crate::export::source_matches_stamp;
 use crate::pool::{JobExecutor, JobPriority, engine_pool, resolve_worker_count};
 use crate::positional_io::{advise_readahead, read_at_exact_or_eof};
+use crate::regex_match::compile_bounded_regex;
 use crate::sort::numeric_key;
 use crate::source_stamp::SourceStamp;
 use crate::{
@@ -124,6 +125,7 @@ pub enum FilterOperator {
     Contains,
     Equals,
     NotEquals,
+    Regex,
     GreaterThan,
     GreaterThanOrEqual,
     LessThan,
@@ -1259,17 +1261,16 @@ pub(crate) fn validate_query(query: &FilterQuery) -> Result<(), QuarryError> {
     compile_matchers(query).map(|_| ())
 }
 
-pub(crate) enum PredicateMatcher<'a> {
-    Text(Box<ByteMatcher<'a>>),
+pub(crate) enum PredicateMatcher {
+    Text(Box<ByteMatcher>),
+    Regex(regex::bytes::Regex),
     Numeric {
         lower: Vec<u8>,
         upper: Option<Vec<u8>>,
     },
 }
 
-pub(crate) fn compile_matchers(
-    query: &FilterQuery,
-) -> Result<Vec<PredicateMatcher<'_>>, QuarryError> {
+pub(crate) fn compile_matchers(query: &FilterQuery) -> Result<Vec<PredicateMatcher>, QuarryError> {
     if query.predicates.is_empty() {
         return Err(QuarryError::InvalidOption(
             "filter query must contain at least one predicate",
@@ -1280,12 +1281,20 @@ pub(crate) fn compile_matchers(
         .iter()
         .enumerate()
         .map(|(index, predicate)| {
-            let invalid = |reason| QuarryError::InvalidFilter {
+            let invalid = |reason: &'static str| QuarryError::InvalidFilter {
                 rule: index + 1,
-                reason,
+                reason: Cow::Borrowed(reason),
             };
             if predicate.operator != FilterOperator::Between && predicate.upper_bound.is_some() {
                 return Err(invalid("only Between accepts an upper bound"));
+            }
+            if predicate.operator == FilterOperator::Regex {
+                let compiled = compile_bounded_regex(&predicate.value, query.case_sensitivity)
+                    .map_err(|reason| QuarryError::InvalidFilter {
+                        rule: index + 1,
+                        reason: Cow::Owned(reason),
+                    })?;
+                return Ok(PredicateMatcher::Regex(compiled));
             }
             if !predicate.operator.is_numeric() {
                 if predicate.operator == FilterOperator::Contains && predicate.value.is_empty() {
@@ -1326,7 +1335,7 @@ pub(crate) fn compile_matchers(
         .collect()
 }
 
-impl PredicateMatcher<'_> {
+impl PredicateMatcher {
     fn matches(
         &self,
         operator: FilterOperator,
@@ -1337,8 +1346,9 @@ impl PredicateMatcher<'_> {
             Self::Text(matcher) => match operator {
                 FilterOperator::Contains => matcher.find(field).is_some(),
                 FilterOperator::Equals | FilterOperator::NotEquals => matcher.equals(field),
-                _ => unreachable!("numeric operators compile to numeric matchers"),
+                _ => unreachable!("only literal text operators compile to text matchers"),
             },
+            Self::Regex(regex) => regex.is_match(field),
             Self::Numeric { lower, upper } => {
                 if field.is_empty() {
                     return false;
@@ -1405,7 +1415,7 @@ pub(crate) fn matching_fields_with_edits<'a>(
     physical_row: u64,
     strip_bom: bool,
     query: &FilterQuery,
-    matchers: &[PredicateMatcher<'_>],
+    matchers: &[PredicateMatcher],
     groups: &[Vec<usize>],
     edits: &FilterEdits,
     encoding: Encoding,
@@ -1478,7 +1488,7 @@ pub(crate) fn record_matches_fast(
     physical_row: u64,
     strip_bom: bool,
     query: &FilterQuery,
-    matchers: &[PredicateMatcher<'_>],
+    matchers: &[PredicateMatcher],
     groups: &[Vec<usize>],
     max_column: usize,
     edits: &FilterEdits,
@@ -1594,8 +1604,8 @@ fn run_filter(
         .as_ref()
         .is_none_or(|source| source.strip_bom_at_zero);
     drop(index);
-    let matchers = compile_matchers(query)?;
-    let groups = predicate_groups(query);
+    let matchers = Arc::new(compile_matchers(query)?);
+    let groups = Arc::new(predicate_groups(query));
     let max_column = query.predicates.iter().map(|p| p.column).max().unwrap_or(0);
     let mut field_ranges = Vec::with_capacity((max_column + 1).min(64));
     let mut scanner = RecordScanner::at_offset_with_bom_handling(
@@ -1866,7 +1876,7 @@ fn eval_filter_slice_from_field_start(
     encoding: Encoding,
     byte_class: ByteEncodingClass,
     query: &FilterQuery,
-    matchers: &[PredicateMatcher<'_>],
+    matchers: &[PredicateMatcher],
     groups: &[Vec<usize>],
     max_column: usize,
     edits: &FilterEdits,
@@ -2026,6 +2036,9 @@ fn scan_filter_chunk_worker(
     encoding: Encoding,
     byte_class: ByteEncodingClass,
     query: &FilterQuery,
+    matchers: &[PredicateMatcher],
+    groups: &[Vec<usize>],
+    max_column: usize,
     max_record_bytes: usize,
     stop_flag: &AtomicBool,
     #[cfg(test)] delay_chunk_zero: Option<Duration>,
@@ -2055,12 +2068,6 @@ fn scan_filter_chunk_worker(
         return None;
     }
 
-    let matchers = match compile_matchers(query) {
-        Ok(m) => m,
-        Err(err) => return Some(Err(err)),
-    };
-    let groups = predicate_groups(query);
-    let max_column = query.predicates.iter().map(|p| p.column).max().unwrap_or(0);
     let empty_edits: FilterEdits = Arc::default();
 
     // Non-initial chunks always contain data rows (>= data_start) because chunk 0 ends after
@@ -2078,8 +2085,8 @@ fn scan_filter_chunk_worker(
         encoding,
         byte_class,
         query,
-        &matchers,
-        &groups,
+        matchers,
+        groups,
         max_column,
         &empty_edits,
         max_record_bytes,
@@ -2146,8 +2153,8 @@ fn scan_filter_chunk_worker(
                 encoding,
                 byte_class,
                 query,
-                &matchers,
-                &groups,
+                matchers,
+                groups,
                 max_column,
                 &empty_edits,
                 max_record_bytes,
@@ -2221,7 +2228,7 @@ impl FilterMergeState {
         encoding: Encoding,
         byte_class: ByteEncodingClass,
         query: &FilterQuery,
-        matchers: &[PredicateMatcher<'_>],
+        matchers: &[PredicateMatcher],
         groups: &[Vec<usize>],
         max_column: usize,
         edits: &FilterEdits,
@@ -2430,7 +2437,7 @@ fn scan_filter_giant_line_sequential(
     encoding: Encoding,
     byte_class: ByteEncodingClass,
     query: &FilterQuery,
-    matchers: &[PredicateMatcher<'_>],
+    matchers: &[PredicateMatcher],
     groups: &[Vec<usize>],
     max_column: usize,
     edits: &FilterEdits,
@@ -2621,8 +2628,8 @@ fn run_parallel_filter(
     let edits = shared.index.read().unwrap().edits.clone();
     let dialect = ScannerDialect::rfc4180(delimiter);
     dialect.validate(byte_class)?;
-    let matchers = compile_matchers(query)?;
-    let groups = predicate_groups(query);
+    let matchers = Arc::new(compile_matchers(query)?);
+    let groups = Arc::new(predicate_groups(query));
     let max_column = query.predicates.iter().map(|p| p.column).max().unwrap_or(0);
 
     let chunk_size = tuning.chunk_bytes.max(64);
@@ -2842,6 +2849,8 @@ fn run_parallel_filter(
 
             let worker_file = Arc::clone(&file);
             let worker_query = Arc::clone(&query_arc);
+            let worker_matchers = Arc::clone(&matchers);
+            let worker_groups = Arc::clone(&groups);
             let worker_stop = Arc::clone(&stop_flag);
             let worker_tx = tx.clone();
             #[cfg(test)]
@@ -2861,6 +2870,9 @@ fn run_parallel_filter(
                     encoding,
                     byte_class,
                     &worker_query,
+                    &worker_matchers,
+                    &worker_groups,
+                    max_column,
                     max_record_bytes,
                     &worker_stop,
                     #[cfg(test)]
@@ -3559,8 +3571,8 @@ mod tests {
             }),
             Err(QuarryError::InvalidFilter {
                 rule: 2,
-                reason: "contains filter value must not be empty",
-            })
+                reason,
+            }) if reason == "contains filter value must not be empty"
         ));
         assert!(matches!(
             session.start_filter(FilterQuery {
@@ -4530,5 +4542,337 @@ mod tests {
         };
         assert_eq!(async_rows, rows);
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn regex_filter_validates_bounds_anchors_overlays_encodings_case_folding_and_parallel_parity() {
+        // 1. Validation & ReDoS bounds inside FilterQuery::validate().
+        let empty = FilterQuery::single(0, FilterOperator::Regex, Vec::new());
+        assert!(matches!(
+            empty.validate(),
+            Err(QuarryError::InvalidFilter { rule: 1, .. })
+        ));
+
+        let invalid_syntax = FilterQuery::single(0, FilterOperator::Regex, b"[unclosed".to_vec());
+        assert!(matches!(
+            invalid_syntax.validate(),
+            Err(QuarryError::InvalidFilter { rule: 1, .. })
+        ));
+
+        let too_long = FilterQuery::single(
+            0,
+            FilterOperator::Regex,
+            vec![b'a'; crate::MAX_REGEX_PATTERN_BYTES + 1],
+        );
+        assert!(matches!(
+            too_long.validate(),
+            Err(QuarryError::InvalidFilter { rule: 1, .. })
+        ));
+
+        let too_big = FilterQuery::single(0, FilterOperator::Regex, b"a{1000000}".to_vec());
+        assert!(matches!(
+            too_big.validate(),
+            Err(QuarryError::InvalidFilter { rule: 1, .. })
+        ));
+
+        let mut with_upper = FilterQuery::single(0, FilterOperator::Regex, b"^a$".to_vec());
+        with_upper.predicates[0].upper_bound = Some(b"z".to_vec());
+        assert!(matches!(
+            with_upper.validate(),
+            Err(QuarryError::InvalidFilter { rule: 1, .. })
+        ));
+
+        // 2. Per-field ^/$ anchors, escaped quotes, multiline quoted cells, and raw invalid UTF-8 bytes.
+        let mut raw = Vec::new();
+        raw.extend_from_slice(b"id,note\n");
+        raw.extend_from_slice(b"1,exact\n");
+        raw.extend_from_slice(b"2,\"first\nexact\nlast\"\n");
+        raw.extend_from_slice(b"3,\"say \"\"hi\"\"\"\n");
+        raw.extend_from_slice(b"4,\xffneedle\xfe\n");
+        raw.extend_from_slice("5,CAFÉ\n".as_bytes());
+        raw.extend_from_slice(b"6,\n");
+        let path = fixture(&raw);
+        let sess = session(&path, HeaderMode::FirstRow);
+
+        // Per-field ^exact$ matches row 1 only, NOT multiline row 2.
+        let anchored = sess
+            .start_filter(FilterQuery::single(
+                1,
+                FilterOperator::Regex,
+                b"^exact$".to_vec(),
+            ))
+            .unwrap()
+            .wait()
+            .unwrap();
+        let anchored_rows = sess.read_filtered_rows(&anchored, 0, 10).unwrap();
+        assert_eq!(anchored_rows.len(), 1);
+        assert_eq!(anchored_rows[0].row, 1);
+
+        // Unquoted decoded field with escaped quotes.
+        let quoted = sess
+            .start_filter(FilterQuery::single(
+                1,
+                FilterOperator::Regex,
+                b"^say \"hi\"$".to_vec(),
+            ))
+            .unwrap()
+            .wait()
+            .unwrap();
+        let quoted_rows = sess.read_filtered_rows(&quoted, 0, 10).unwrap();
+        assert_eq!(quoted_rows.len(), 1);
+        assert_eq!(quoted_rows[0].row, 3);
+
+        // UTF-8 raw bytes matched without lossy replacement.
+        let raw_match = sess
+            .start_filter(FilterQuery::single(
+                1,
+                FilterOperator::Regex,
+                b"needle".to_vec(),
+            ))
+            .unwrap()
+            .wait()
+            .unwrap();
+        assert_eq!(
+            sess.read_filtered_rows(&raw_match, 0, 10)
+                .unwrap()
+                .iter()
+                .map(|r| r.row)
+                .collect::<Vec<_>>(),
+            vec![4]
+        );
+        let no_fffd = sess
+            .start_filter(FilterQuery::single(
+                1,
+                FilterOperator::Regex,
+                "\u{FFFD}".as_bytes().to_vec(),
+            ))
+            .unwrap()
+            .wait()
+            .unwrap();
+        assert_eq!(no_fffd.matches_found(), 0);
+
+        // Empty-cell regex ^$ matches blank field in row 6.
+        let empty_cell = sess
+            .start_filter(FilterQuery::single(
+                1,
+                FilterOperator::Regex,
+                b"^$".to_vec(),
+            ))
+            .unwrap()
+            .wait()
+            .unwrap();
+        assert_eq!(
+            sess.read_filtered_rows(&empty_cell, 0, 10)
+                .unwrap()
+                .iter()
+                .map(|r| r.row)
+                .collect::<Vec<_>>(),
+            vec![6]
+        );
+
+        // Unicode simple case folding in regex vs ASCII case folding in literal mode.
+        let regex_ci = sess
+            .start_filter(FilterQuery::single_with_case(
+                1,
+                FilterOperator::Regex,
+                "café".as_bytes().to_vec(),
+                CaseSensitivity::Insensitive,
+            ))
+            .unwrap()
+            .wait()
+            .unwrap();
+        assert_eq!(
+            sess.read_filtered_rows(&regex_ci, 0, 10)
+                .unwrap()
+                .iter()
+                .map(|r| r.row)
+                .collect::<Vec<_>>(),
+            vec![5]
+        );
+        let literal_ci = sess
+            .start_filter(FilterQuery::single_with_case(
+                1,
+                FilterOperator::Equals,
+                "café".as_bytes().to_vec(),
+                CaseSensitivity::Insensitive,
+            ))
+            .unwrap()
+            .wait()
+            .unwrap();
+        assert_eq!(literal_ci.matches_found(), 0);
+
+        // 3. Sparse edit overlays evaluated before regex matching.
+        let mut edits = BTreeMap::new();
+        edits.insert((1, 1), Arc::new(b"changed".to_vec()));
+        edits.insert((6, 1), Arc::new(b"exact".to_vec()));
+        let edits = Arc::new(edits);
+        let edited_idx = sess
+            .start_filter_with_edits(
+                FilterQuery::single(1, FilterOperator::Regex, b"^exact$".to_vec()),
+                Arc::clone(&edits),
+            )
+            .unwrap()
+            .wait()
+            .unwrap();
+        let edited_rows = sess.read_filtered_rows(&edited_idx, 0, 10).unwrap();
+        assert_eq!(edited_rows.len(), 1);
+        assert_eq!(edited_rows[0].row, 6);
+        let edited_export = path.with_extension("edited-regex.csv");
+        sess.start_filtered_export_with_edits_and_threads(
+            FilterQuery::single(1, FilterOperator::Regex, b"^exact$".to_vec()),
+            edits,
+            BTreeMap::new(),
+            &edited_export,
+            Some(1),
+        )
+        .unwrap()
+        .wait()
+        .unwrap();
+        assert_eq!(fs::read(&edited_export).unwrap(), b"id,note\n6,exact\n");
+        fs::remove_file(edited_export).unwrap();
+        fs::remove_file(path).unwrap();
+
+        // 4. Encodings: UTF-16 LE, UTF-16 BE, Windows-1252, Latin-1.
+        let unicode_csv = "id,city\n1,café\n2,CAFÉ\n3,plain\n";
+        let utf16le: Vec<u8> = std::iter::once(0xFEFF_u16)
+            .chain(unicode_csv.encode_utf16())
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        let utf16be: Vec<u8> = std::iter::once(0xFEFF_u16)
+            .chain(unicode_csv.encode_utf16())
+            .flat_map(u16::to_be_bytes)
+            .collect();
+        let win1252 = b"id,city\n1,caf\xe9\n2,CAF\xc9\n3,plain\n".to_vec();
+        for (enc, bytes) in [
+            (crate::Encoding::Utf16Le, utf16le),
+            (crate::Encoding::Utf16Be, utf16be),
+            (crate::Encoding::Windows1252, win1252.clone()),
+            (crate::Encoding::Latin1, win1252),
+        ] {
+            let p = fixture(&bytes);
+            let s = Session::open_with_encoding(
+                &p,
+                OpenOptions {
+                    delimiter: Some(b','),
+                    header_mode: HeaderMode::FirstRow,
+                    ..OpenOptions::default()
+                },
+                Some(enc),
+            )
+            .unwrap();
+            let q = FilterQuery::single_with_case(
+                1,
+                FilterOperator::Regex,
+                "^café$".as_bytes().to_vec(),
+                CaseSensitivity::Insensitive,
+            );
+            let idx = s.start_filter(q).unwrap().wait().unwrap();
+            let rows = s.read_filtered_rows(&idx, 0, 10).unwrap();
+            assert_eq!(
+                rows.iter().map(|r| r.row).collect::<Vec<_>>(),
+                vec![1, 2],
+                "encoding {enc}"
+            );
+            fs::remove_file(p).unwrap();
+        }
+
+        // 5. Parallel vs serial filter + filtered export parity across chunk boundaries and quotes.
+        let mut big = Vec::from(&b"id,code,note\n"[..]);
+        for i in 1..=300 {
+            if i % 10 == 0 {
+                big.extend_from_slice(
+                    format!("{i},ERR-{i:03},\"multi\nERR-{i:03}\nline\"\n").as_bytes(),
+                );
+            } else {
+                big.extend_from_slice(format!("{i},OK-{i:03},normal-{i}\n").as_bytes());
+            }
+        }
+        let big_path = fixture(&big);
+        let big_session = session(&big_path, HeaderMode::FirstRow);
+        let par_query = FilterQuery::single(1, FilterOperator::Regex, b"^ERR-[0-9]{3}$".to_vec());
+        let tuning = |threads| super::FilterParallelTuning {
+            requested_threads: threads,
+            min_parallel_bytes: 256,
+            chunk_bytes: 512,
+            max_alignment_search: 256,
+            delay_chunk_zero: None,
+        };
+        let serial = FilterJob::start_with_edits_and_tuning(
+            big_path.clone(),
+            big_session.file_size,
+            b',',
+            1,
+            par_query.clone(),
+            DEFAULT_FILTER_SCAN_CONFIG,
+            Arc::default(),
+            None,
+            crate::Encoding::Utf8,
+            tuning(1),
+            false,
+        )
+        .unwrap()
+        .wait()
+        .unwrap();
+        let parallel = FilterJob::start_with_edits_and_tuning(
+            big_path.clone(),
+            big_session.file_size,
+            b',',
+            1,
+            par_query.clone(),
+            DEFAULT_FILTER_SCAN_CONFIG,
+            Arc::default(),
+            None,
+            crate::Encoding::Utf8,
+            tuning(4),
+            false,
+        )
+        .unwrap()
+        .wait()
+        .unwrap();
+        assert_eq!(serial.matches_found(), 30);
+        assert_eq!(parallel.matches_found(), 30);
+        assert_eq!(
+            big_session.read_filtered_rows(&serial, 0, 50).unwrap(),
+            big_session.read_filtered_rows(&parallel, 0, 50).unwrap()
+        );
+
+        let exp_serial = big_path.with_extension("exp-serial.csv");
+        let exp_parallel = big_path.with_extension("exp-parallel.csv");
+        big_session
+            .start_filtered_export_with_edits_and_threads(
+                par_query.clone(),
+                Arc::default(),
+                BTreeMap::new(),
+                &exp_serial,
+                Some(1),
+            )
+            .unwrap()
+            .wait()
+            .unwrap();
+        big_session
+            .start_filtered_export_with_edits_and_threads(
+                par_query,
+                Arc::default(),
+                BTreeMap::new(),
+                &exp_parallel,
+                Some(4),
+            )
+            .unwrap()
+            .wait()
+            .unwrap();
+        let serial_bytes = fs::read(&exp_serial).unwrap();
+        let parallel_bytes = fs::read(&exp_parallel).unwrap();
+        assert_eq!(serial_bytes, parallel_bytes);
+        assert!(serial_bytes.starts_with(b"id,code,note\n10,ERR-010,"));
+        assert_eq!(
+            String::from_utf8(serial_bytes)
+                .unwrap()
+                .matches(",ERR-")
+                .count(),
+            30
+        );
+        fs::remove_file(exp_serial).unwrap();
+        fs::remove_file(exp_parallel).unwrap();
+        fs::remove_file(big_path).unwrap();
     }
 }

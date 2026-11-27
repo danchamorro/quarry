@@ -122,7 +122,7 @@ fn format_export_slice_from_field_start(
     config: ExportConfig,
     byte_class: ByteEncodingClass,
     query: &FilterQuery,
-    matchers: &[PredicateMatcher<'_>],
+    matchers: &[PredicateMatcher],
     groups: &[Vec<usize>],
     max_column: usize,
     reorder_budget: &Arc<ByteBudget>,
@@ -321,6 +321,9 @@ fn scan_export_chunk_worker(
     config: ExportConfig,
     byte_class: ByteEncodingClass,
     query: &FilterQuery,
+    matchers: &[PredicateMatcher],
+    groups: &[Vec<usize>],
+    max_column: usize,
     reorder_budget: &Arc<ByteBudget>,
     next_merge_id: &AtomicU64,
     stop_flag: &AtomicBool,
@@ -350,13 +353,6 @@ fn scan_export_chunk_worker(
     if stop_flag.load(Ordering::Acquire) {
         return None;
     }
-
-    let matchers = match compile_matchers(query) {
-        Ok(m) => m,
-        Err(err) => return Some(Err(err)),
-    };
-    let groups = predicate_groups(query);
-    let max_column = query.predicates.iter().map(|p| p.column).max().unwrap_or(0);
 
     // Chunk 0 (start == 0) is always formatted sequentially via `process_record` on the writer
     // thread so row-0 BOM handling, header renaming, and edits match `scan_export` identically;
@@ -397,8 +393,8 @@ fn scan_export_chunk_worker(
         config,
         byte_class,
         query,
-        &matchers,
-        &groups,
+        matchers,
+        groups,
         max_column,
         reorder_budget,
         next_merge_id,
@@ -461,8 +457,8 @@ fn scan_export_chunk_worker(
                 config,
                 byte_class,
                 query,
-                &matchers,
-                &groups,
+                matchers,
+                groups,
                 max_column,
                 reorder_budget,
                 next_merge_id,
@@ -552,7 +548,7 @@ impl ExportMergeState {
         byte_class: ByteEncodingClass,
         query: &FilterQuery,
         edits: &FilteredEdits,
-        matchers: &[PredicateMatcher<'_>],
+        matchers: &[PredicateMatcher],
         groups: &[Vec<usize>],
         config: ExportConfig,
         source_had_bom: bool,
@@ -682,7 +678,7 @@ impl ExportMergeState {
         byte_class: ByteEncodingClass,
         query: &FilterQuery,
         edits: &FilteredEdits,
-        matchers: &[PredicateMatcher<'_>],
+        matchers: &[PredicateMatcher],
         groups: &[Vec<usize>],
         config: ExportConfig,
         source_had_bom: bool,
@@ -868,7 +864,7 @@ fn scan_export_giant_line_sequential(
     byte_class: ByteEncodingClass,
     query: &FilterQuery,
     edits: &FilteredEdits,
-    matchers: &[PredicateMatcher<'_>],
+    matchers: &[PredicateMatcher],
     groups: &[Vec<usize>],
     config: ExportConfig,
     source_had_bom: bool,
@@ -1051,8 +1047,9 @@ pub(super) fn scan_export_parallel(
     let file_size = shared.total_bytes;
     let dialect = ScannerDialect::rfc4180(delimiter);
     dialect.validate(byte_class)?;
-    let matchers = compile_matchers(query)?;
-    let groups = predicate_groups(query);
+    let matchers = Arc::new(compile_matchers(query)?);
+    let groups = Arc::new(predicate_groups(query));
+    let max_column = query.predicates.iter().map(|p| p.column).max().unwrap_or(0);
 
     let chunk_size = tuning.chunk_bytes.max(64);
     let estimated_chunks = file_size.div_ceil(chunk_size as u64).max(1) as usize;
@@ -1271,6 +1268,8 @@ pub(super) fn scan_export_parallel(
 
             let worker_file = Arc::clone(&file);
             let worker_query = Arc::clone(&query_arc);
+            let worker_matchers = Arc::clone(&matchers);
+            let worker_groups = Arc::clone(&groups);
             let worker_reorder = Arc::clone(&reorder_budget);
             let worker_next_merge = Arc::clone(&next_merge_id);
             let worker_stop = Arc::clone(&stop_flag);
@@ -1291,6 +1290,9 @@ pub(super) fn scan_export_parallel(
                     config,
                     byte_class,
                     &worker_query,
+                    &worker_matchers,
+                    &worker_groups,
+                    max_column,
                     &worker_reorder,
                     &worker_next_merge,
                     &worker_stop,

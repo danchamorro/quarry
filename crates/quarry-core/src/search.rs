@@ -7,20 +7,87 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use memchr::memchr;
+
 use crate::Encoding;
 use crate::case::ByteMatcher;
 use crate::encoding::RecordScanner;
 use crate::pool::{JobExecutor, JobPriority, engine_pool, resolve_worker_count};
 use crate::positional_io::{advise_readahead, read_at_exact_or_eof};
+use crate::regex_match::compile_bounded_regex;
 use crate::source_stamp::SourceStamp;
 use crate::{
     CaseSensitivity, Checkpoint, DEFAULT_MAX_RECORD_BYTES, DEFAULT_READ_CHUNK, QuarryError,
-    Session, StructuralIndex,
+    Session, StructuralIndex, UTF8_BOM,
 };
 
 const DEFAULT_SEARCH_STRIPE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_SINGLE_READ_STRIPE_BYTES: u64 = 8 * 1024 * 1024;
 const WORKER_CANCEL_SLICE_BYTES: usize = 256 * 1024;
+
+/// Matching mode for Find/Search operations. Literal matching is the default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SearchMode {
+    #[default]
+    Literal,
+    Regex,
+}
+
+enum SearchMatcher {
+    Literal {
+        matcher: ByteMatcher,
+        has_quote: bool,
+    },
+    Regex(regex::bytes::Regex),
+}
+
+impl SearchMatcher {
+    fn compile(
+        needle: &[u8],
+        case_sensitivity: CaseSensitivity,
+        mode: SearchMode,
+    ) -> Result<Self, QuarryError> {
+        match mode {
+            SearchMode::Literal => {
+                if needle.is_empty() {
+                    return Err(QuarryError::InvalidOption("search query must not be empty"));
+                }
+                Ok(Self::Literal {
+                    matcher: ByteMatcher::new(needle, case_sensitivity),
+                    has_quote: needle.contains(&b'"'),
+                })
+            }
+            SearchMode::Regex => {
+                let regex = compile_bounded_regex(needle, case_sensitivity)
+                    .map_err(QuarryError::InvalidRegex)?;
+                Ok(Self::Regex(regex))
+            }
+        }
+    }
+
+    fn can_prefilter(&self, encoding: Encoding) -> bool {
+        match self {
+            Self::Literal { has_quote, .. } => encoding == Encoding::Utf8 && !*has_quote,
+            // Raw-record prefiltering is unsafe for regexes (e.g. per-field ^/$,
+            // empty-cell patterns, or quoted/escaped fields), so always evaluate per field.
+            Self::Regex(_) => false,
+        }
+    }
+
+    fn raw_contains(&self, haystack: &[u8]) -> bool {
+        match self {
+            Self::Literal { matcher, .. } => matcher.find(haystack).is_some(),
+            Self::Regex(_) => true,
+        }
+    }
+
+    fn is_match(&self, field: &[u8]) -> bool {
+        match self {
+            Self::Literal { matcher, .. } => matcher.find(field).is_some(),
+            Self::Regex(regex) => regex.is_match(field),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SearchPosition {
@@ -174,6 +241,7 @@ impl SearchJob {
             delimiter,
             needle,
             case_sensitivity,
+            SearchMode::Literal,
             start,
             checkpoint,
             stripes,
@@ -195,6 +263,7 @@ impl SearchJob {
         delimiter: u8,
         needle: Vec<u8>,
         case_sensitivity: CaseSensitivity,
+        mode: SearchMode,
         start: SearchPosition,
         checkpoint: Checkpoint,
         stripes: Vec<SearchStripe>,
@@ -204,6 +273,7 @@ impl SearchJob {
         strip_bom_at_zero: bool,
         tuning: SearchTuning,
     ) -> Result<Self, QuarryError> {
+        let matcher = Arc::new(SearchMatcher::compile(&needle, case_sensitivity, mode)?);
         if cell_edits
             .values()
             .any(|value| value.len() > max_record_bytes)
@@ -246,8 +316,7 @@ impl SearchJob {
                         indexed_frontier,
                         indexed_rows,
                         delimiter,
-                        &needle,
-                        case_sensitivity,
+                        matcher,
                         start,
                         &stripes,
                         &cell_edits,
@@ -264,8 +333,7 @@ impl SearchJob {
                         indexed_frontier,
                         indexed_rows,
                         delimiter,
-                        &needle,
-                        case_sensitivity,
+                        &matcher,
                         start,
                         checkpoint,
                         &cell_edits,
@@ -471,27 +539,73 @@ impl Session {
         case_sensitivity: CaseSensitivity,
         threads: Option<usize>,
     ) -> Result<SearchJob, QuarryError> {
-        let requested_threads = resolve_worker_count(threads)?;
-        self.start_search_with_tuning(
+        self.start_search_with_mode(
             index,
             needle,
             start,
             cell_edits,
             case_sensitivity,
+            SearchMode::Literal,
+            threads,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_search_with_mode(
+        &self,
+        index: &StructuralIndex,
+        needle: Vec<u8>,
+        start: SearchPosition,
+        cell_edits: BTreeMap<(u64, usize), Vec<u8>>,
+        case_sensitivity: CaseSensitivity,
+        mode: SearchMode,
+        threads: Option<usize>,
+    ) -> Result<SearchJob, QuarryError> {
+        let requested_threads = resolve_worker_count(threads)?;
+        self.start_search_with_mode_and_tuning(
+            index,
+            needle,
+            start,
+            cell_edits,
+            case_sensitivity,
+            mode,
             SearchTuning::for_production(requested_threads),
         )
     }
 
+    #[cfg(test)]
     fn start_search_with_tuning(
+        &self,
+        index: &StructuralIndex,
+        needle: Vec<u8>,
+        start: SearchPosition,
+        cell_edits: BTreeMap<(u64, usize), Vec<u8>>,
+        case_sensitivity: CaseSensitivity,
+        tuning: SearchTuning,
+    ) -> Result<SearchJob, QuarryError> {
+        self.start_search_with_mode_and_tuning(
+            index,
+            needle,
+            start,
+            cell_edits,
+            case_sensitivity,
+            SearchMode::Literal,
+            tuning,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn start_search_with_mode_and_tuning(
         &self,
         index: &StructuralIndex,
         needle: Vec<u8>,
         start: SearchPosition,
         mut cell_edits: BTreeMap<(u64, usize), Vec<u8>>,
         case_sensitivity: CaseSensitivity,
+        mode: SearchMode,
         tuning: SearchTuning,
     ) -> Result<SearchJob, QuarryError> {
-        if needle.is_empty() {
+        if mode == SearchMode::Literal && needle.is_empty() {
             return Err(QuarryError::InvalidOption("search query must not be empty"));
         }
         let (section_base, section_end) = self.active_byte_range();
@@ -540,6 +654,7 @@ impl Session {
             self.dialect.delimiter,
             needle,
             case_sensitivity,
+            mode,
             start,
             checkpoint,
             stripes,
@@ -564,8 +679,7 @@ fn scan_search_stripe(
     stripe: SearchStripe,
     file: &File,
     delimiter: u8,
-    needle: &[u8],
-    case_sensitivity: CaseSensitivity,
+    matcher: &SearchMatcher,
     start: SearchPosition,
     cell_edits: &BTreeMap<(u64, usize), Vec<u8>>,
     edited_rows: &BTreeSet<u64>,
@@ -609,8 +723,7 @@ fn scan_search_stripe(
             stripe,
             file,
             delimiter,
-            needle,
-            case_sensitivity,
+            matcher,
             start,
             cell_edits,
             edited_rows,
@@ -647,9 +760,8 @@ fn scan_search_stripe(
         }
     }
 
-    let matcher = ByteMatcher::new(needle, case_sensitivity);
-    let can_prefilter = encoding == Encoding::Utf8 && !needle.contains(&b'"');
-    let raw_stripe_has_hit = !can_prefilter || matcher.find(&buf).is_some();
+    let can_prefilter = matcher.can_prefilter(encoding);
+    let raw_stripe_has_hit = !can_prefilter || matcher.raw_contains(&buf);
 
     let mut scanner = match RecordScanner::at_offset_with_bom_handling(
         delimiter,
@@ -700,10 +812,10 @@ fn scan_search_stripe(
                             !edited_rows.is_empty() && edited_rows.contains(&row_number);
                         let should_parse = row_has_edit
                             || (raw_stripe_has_hit
-                                && (!can_prefilter || matcher.find(rec_bytes).is_some()));
+                                && (!can_prefilter || matcher.raw_contains(rec_bytes)));
                         if should_parse {
                             match find_record(
-                                &matcher,
+                                matcher,
                                 rec_bytes,
                                 delimiter,
                                 row_number,
@@ -777,10 +889,10 @@ fn scan_search_stripe(
                     let row_has_edit = !edited_rows.is_empty() && edited_rows.contains(&row_number);
                     let should_parse = row_has_edit
                         || (raw_stripe_has_hit
-                            && (!can_prefilter || matcher.find(rec_bytes).is_some()));
+                            && (!can_prefilter || matcher.raw_contains(rec_bytes)));
                     if should_parse {
                         match find_record(
-                            &matcher,
+                            matcher,
                             rec_bytes,
                             delimiter,
                             row_number,
@@ -853,8 +965,7 @@ fn scan_search_stripe_streaming(
     stripe: SearchStripe,
     file: &File,
     delimiter: u8,
-    needle: &[u8],
-    case_sensitivity: CaseSensitivity,
+    matcher: &SearchMatcher,
     start: SearchPosition,
     cell_edits: &BTreeMap<(u64, usize), Vec<u8>>,
     edited_rows: &BTreeSet<u64>,
@@ -864,8 +975,7 @@ fn scan_search_stripe_streaming(
     stop_flag: &AtomicBool,
     earliest_hit_stripe: &AtomicU64,
 ) -> Option<StripeResult> {
-    let matcher = ByteMatcher::new(needle, case_sensitivity);
-    let can_prefilter = encoding == Encoding::Utf8 && !needle.contains(&b'"');
+    let can_prefilter = matcher.can_prefilter(encoding);
     let mut scanner = match RecordScanner::at_offset_with_bom_handling(
         delimiter,
         stripe.start_offset,
@@ -927,7 +1037,7 @@ fn scan_search_stripe_streaming(
             }
         };
 
-        let chunk_has_raw_hit = !can_prefilter || matcher.find(&chunk[..read]).is_some();
+        let chunk_has_raw_hit = !can_prefilter || matcher.raw_contains(&chunk[..read]);
         let mut segment_start = 0usize;
         let mut found: Option<SearchMatch> = None;
         let mut deferred_error: Option<QuarryError> = None;
@@ -943,10 +1053,10 @@ fn scan_search_stripe_streaming(
                         });
                     } else if row_has_edit
                         || (chunk_has_raw_hit
-                            && (!can_prefilter || matcher.find(rec_bytes).is_some()))
+                            && (!can_prefilter || matcher.raw_contains(rec_bytes)))
                     {
                         match find_record(
-                            &matcher,
+                            matcher,
                             rec_bytes,
                             delimiter,
                             row_number,
@@ -975,9 +1085,9 @@ fn scan_search_stripe_streaming(
                             &chunk[segment_start..local_end],
                             record_cap,
                         );
-                        if row_has_edit || !can_prefilter || matcher.find(&record).is_some() {
+                        if row_has_edit || !can_prefilter || matcher.raw_contains(&record) {
                             match find_record(
-                                &matcher,
+                                matcher,
                                 &record,
                                 delimiter,
                                 row_number,
@@ -1066,9 +1176,9 @@ fn scan_search_stripe_streaming(
                         });
                     }
                     let row_has_edit = !edited_rows.is_empty() && edited_rows.contains(&row_number);
-                    if row_has_edit || !can_prefilter || matcher.find(&record).is_some() {
+                    if row_has_edit || !can_prefilter || matcher.raw_contains(&record) {
                         match find_record(
-                            &matcher,
+                            matcher,
                             &record,
                             delimiter,
                             row_number,
@@ -1149,8 +1259,7 @@ fn run_parallel_search(
     indexed_frontier: u64,
     indexed_rows: u64,
     delimiter: u8,
-    needle: &[u8],
-    case_sensitivity: CaseSensitivity,
+    matcher: Arc<SearchMatcher>,
     start: SearchPosition,
     stripes: &[SearchStripe],
     cell_edits: &BTreeMap<(u64, usize), Vec<u8>>,
@@ -1180,7 +1289,6 @@ fn run_parallel_search(
     let earliest_hit_stripe = Arc::new(AtomicU64::new(u64::MAX));
     let (tx, rx) = mpsc::channel::<StripeResult>();
 
-    let needle_arc = Arc::new(needle.to_vec());
     let edits_arc = Arc::new(cell_edits.clone());
     let edited_rows_arc: Arc<BTreeSet<u64>> =
         Arc::new(cell_edits.keys().map(|(row, _)| *row).collect());
@@ -1230,7 +1338,7 @@ fn run_parallel_search(
             );
 
             let worker_file = Arc::clone(&file);
-            let worker_needle = Arc::clone(&needle_arc);
+            let worker_matcher = Arc::clone(&matcher);
             let worker_edits = Arc::clone(&edits_arc);
             let worker_edited_rows = Arc::clone(&edited_rows_arc);
             let worker_stop = Arc::clone(&stop_flag);
@@ -1245,8 +1353,7 @@ fn run_parallel_search(
                     stripe,
                     &worker_file,
                     delimiter,
-                    &worker_needle,
-                    case_sensitivity,
+                    &worker_matcher,
                     start,
                     &worker_edits,
                     &worker_edited_rows,
@@ -1354,14 +1461,14 @@ fn run_search(
     shared: &SharedState,
 ) -> Result<SearchOutcome, QuarryError> {
     let file_size = file.metadata()?.len();
+    let matcher = SearchMatcher::compile(needle, case_sensitivity, SearchMode::Literal)?;
     run_search_bounded(
         file,
         file_size,
         file_size,
         0,
         delimiter,
-        needle,
-        case_sensitivity,
+        &matcher,
         start,
         checkpoint,
         cell_edits,
@@ -1379,8 +1486,7 @@ fn run_search_bounded(
     indexed_frontier: u64,
     indexed_rows: u64,
     delimiter: u8,
-    needle: &[u8],
-    case_sensitivity: CaseSensitivity,
+    matcher: &SearchMatcher,
     start: SearchPosition,
     checkpoint: Checkpoint,
     cell_edits: &BTreeMap<(u64, usize), Vec<u8>>,
@@ -1389,8 +1495,7 @@ fn run_search_bounded(
     strip_bom_at_zero: bool,
     shared: &SharedState,
 ) -> Result<SearchOutcome, QuarryError> {
-    let matcher = ByteMatcher::new(needle, case_sensitivity);
-    let can_prefilter = encoding == Encoding::Utf8 && !needle.contains(&b'"');
+    let can_prefilter = matcher.can_prefilter(encoding);
     let edited_rows: BTreeSet<u64> = cell_edits.keys().map(|(row, _)| *row).collect();
     let mut scanner = RecordScanner::at_offset_with_bom_handling(
         delimiter,
@@ -1434,7 +1539,7 @@ fn run_search_bounded(
                             });
                         }
                         if let Some(found) = find_record(
-                            &matcher,
+                            matcher,
                             &record,
                             delimiter,
                             row_number,
@@ -1462,7 +1567,7 @@ fn run_search_bounded(
             });
         }
 
-        let chunk_has_raw_hit = !can_prefilter || matcher.find(&chunk[..read]).is_some();
+        let chunk_has_raw_hit = !can_prefilter || matcher.raw_contains(&chunk[..read]);
         let mut segment_start = 0;
         let mut found = None;
         let mut deferred_error = None;
@@ -1482,10 +1587,10 @@ fn run_search_bounded(
                             });
                         } else if row_has_edit
                             || (chunk_has_raw_hit
-                                && (!can_prefilter || matcher.find(rec_bytes).is_some()))
+                                && (!can_prefilter || matcher.raw_contains(rec_bytes)))
                         {
                             match find_record(
-                                &matcher,
+                                matcher,
                                 rec_bytes,
                                 delimiter,
                                 row_number,
@@ -1505,10 +1610,9 @@ fn run_search_bounded(
                             deferred_error = Some(QuarryError::RecordTooLarge {
                                 limit: max_record_bytes,
                             });
-                        } else if row_has_edit || !can_prefilter || matcher.find(&record).is_some()
-                        {
+                        } else if row_has_edit || !can_prefilter || matcher.raw_contains(&record) {
                             match find_record(
-                                &matcher,
+                                matcher,
                                 &record,
                                 delimiter,
                                 row_number,
@@ -1563,7 +1667,7 @@ fn run_search_bounded(
 
 #[allow(clippy::too_many_arguments)]
 fn find_record(
-    matcher: &ByteMatcher<'_>,
+    matcher: &SearchMatcher,
     record: &[u8],
     delimiter: u8,
     row: u64,
@@ -1574,6 +1678,45 @@ fn find_record(
     strip_bom_at_zero: bool,
 ) -> Result<Option<SearchMatch>, QuarryError> {
     let first_column = if row == start.row { start.column } else { 0 };
+    let row_has_edit = !cell_edits.is_empty()
+        && cell_edits
+            .range((row, 0)..=(row, usize::MAX))
+            .next()
+            .is_some();
+    if encoding == Encoding::Utf8 && !row_has_edit && memchr(b'"', record).is_none() {
+        let body = if strip_bom_at_zero && record_offset == 0 {
+            record.strip_prefix(UTF8_BOM).unwrap_or(record)
+        } else {
+            record
+        };
+        let body = if let Some(stripped) = body.strip_suffix(b"\r\n") {
+            stripped
+        } else if let Some(stripped) = body.strip_suffix(b"\n") {
+            stripped
+        } else {
+            body
+        };
+        let mut pos = 0usize;
+        let mut column = 0usize;
+        loop {
+            let (end, has_more) = match memchr(delimiter, &body[pos..]) {
+                Some(rel) => (pos + rel, true),
+                None => (body.len(), false),
+            };
+            if column >= first_column && matcher.is_match(&body[pos..end]) {
+                return Ok(Some(SearchMatch {
+                    row,
+                    column,
+                    record_offset,
+                }));
+            }
+            if !has_more {
+                return Ok(None);
+            }
+            pos = end + 1;
+            column += 1;
+        }
+    }
     let fields = crate::parse_encoded_record_with_bom(
         record,
         delimiter,
@@ -1589,7 +1732,7 @@ fn find_record(
             let value = cell_edits
                 .get(&(row, *column))
                 .map_or_else(|| field.as_ref(), Vec::as_slice);
-            matcher.find(value).is_some()
+            matcher.is_match(value)
         })
         .map(|(column, _)| SearchMatch {
             row,
@@ -2422,6 +2565,7 @@ mod tests {
             session.dialect.delimiter,
             b"missing".to_vec(),
             CaseSensitivity::Sensitive,
+            super::SearchMode::Literal,
             SearchPosition { row: 1, column: 0 },
             index.nearest_checkpoint(1),
             super::build_search_stripes(
@@ -2447,5 +2591,346 @@ mod tests {
             Err(QuarryError::RecordTooLarge { limit: 64 })
         ));
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn regex_search_preserves_literal_default_and_handles_anchors_overlays_encodings_and_parallel_parity()
+     {
+        let mut raw = Vec::new();
+        raw.extend_from_slice(b"id,val,extra\n");
+        raw.extend_from_slice(b"1,a+b,meta\n");
+        raw.extend_from_slice(b"2,\"first\nexact\nlast\",quoted\n");
+        raw.extend_from_slice(b"3,exact,\"say \"\"hi\"\"\"\n");
+        raw.extend_from_slice(b"4,,trailing\n");
+        raw.extend_from_slice(b"5,\xffrawneedle\xfe,bytes\n");
+        raw.extend_from_slice("6,CAFÉ,unicode\n".as_bytes());
+        let path = fixture(&raw);
+        let (session, index) = session_and_index(&path, true);
+
+        // Literal mode remains default: "a+b" matches literally on row 1, col 1.
+        let literal_hit = session
+            .start_search(
+                &index,
+                b"a+b".to_vec(),
+                SearchPosition { row: 1, column: 0 },
+            )
+            .unwrap()
+            .wait()
+            .unwrap();
+        assert!(matches!(
+            literal_hit,
+            SearchOutcome::Match(super::SearchMatch {
+                row: 1,
+                column: 1,
+                ..
+            })
+        ));
+
+        // Regex validation fails synchronously before scanning.
+        for bad in [
+            b"".as_slice(),
+            b"[unclosed".as_slice(),
+            b"a{1000000}".as_slice(),
+        ] {
+            let err = session.start_search_with_mode(
+                &index,
+                bad.to_vec(),
+                SearchPosition { row: 1, column: 0 },
+                BTreeMap::new(),
+                CaseSensitivity::Sensitive,
+                super::SearchMode::Regex,
+                Some(1),
+            );
+            assert!(matches!(err, Err(QuarryError::InvalidRegex(_))));
+        }
+
+        // Per-field ^exact$ skips multiline row 2 and finds row 3, col 1.
+        let anchored = session
+            .start_search_with_mode(
+                &index,
+                b"^exact$".to_vec(),
+                SearchPosition { row: 1, column: 0 },
+                BTreeMap::new(),
+                CaseSensitivity::Sensitive,
+                super::SearchMode::Regex,
+                Some(1),
+            )
+            .unwrap()
+            .wait()
+            .unwrap();
+        assert!(matches!(
+            anchored,
+            SearchOutcome::Match(super::SearchMatch {
+                row: 3,
+                column: 1,
+                ..
+            })
+        ));
+
+        // Escaped quotes are decoded before regex matching.
+        let escaped_quote = session
+            .start_search_with_mode(
+                &index,
+                b"^say \"hi\"$".to_vec(),
+                SearchPosition { row: 1, column: 0 },
+                BTreeMap::new(),
+                CaseSensitivity::Sensitive,
+                super::SearchMode::Regex,
+                Some(1),
+            )
+            .unwrap()
+            .wait()
+            .unwrap();
+        assert!(matches!(
+            escaped_quote,
+            SearchOutcome::Match(super::SearchMatch {
+                row: 3,
+                column: 2,
+                ..
+            })
+        ));
+
+        // Empty-cell regex ^$ finds row 4, col 1.
+        let empty_cell = session
+            .start_search_with_mode(
+                &index,
+                b"^$".to_vec(),
+                SearchPosition { row: 1, column: 0 },
+                BTreeMap::new(),
+                CaseSensitivity::Sensitive,
+                super::SearchMode::Regex,
+                Some(1),
+            )
+            .unwrap()
+            .wait()
+            .unwrap();
+        assert!(matches!(
+            empty_cell,
+            SearchOutcome::Match(super::SearchMatch {
+                row: 4,
+                column: 1,
+                ..
+            })
+        ));
+
+        // Raw invalid UTF-8 bytes matched without lossy U+FFFD replacement.
+        let raw_hit = session
+            .start_search_with_mode(
+                &index,
+                b"rawneedle".to_vec(),
+                SearchPosition { row: 1, column: 0 },
+                BTreeMap::new(),
+                CaseSensitivity::Sensitive,
+                super::SearchMode::Regex,
+                Some(1),
+            )
+            .unwrap()
+            .wait()
+            .unwrap();
+        assert!(matches!(
+            raw_hit,
+            SearchOutcome::Match(super::SearchMatch {
+                row: 5,
+                column: 1,
+                ..
+            })
+        ));
+        let no_fffd = session
+            .start_search_with_mode(
+                &index,
+                "\u{FFFD}".as_bytes().to_vec(),
+                SearchPosition { row: 1, column: 0 },
+                BTreeMap::new(),
+                CaseSensitivity::Sensitive,
+                super::SearchMode::Regex,
+                Some(1),
+            )
+            .unwrap()
+            .wait()
+            .unwrap();
+        assert_eq!(no_fffd, SearchOutcome::NotFound);
+
+        // Unicode simple case folding in regex mode.
+        let unicode_ci = session
+            .start_search_with_mode(
+                &index,
+                "^café$".as_bytes().to_vec(),
+                SearchPosition { row: 1, column: 0 },
+                BTreeMap::new(),
+                CaseSensitivity::Insensitive,
+                super::SearchMode::Regex,
+                Some(1),
+            )
+            .unwrap()
+            .wait()
+            .unwrap();
+        assert!(matches!(
+            unicode_ci,
+            SearchOutcome::Match(super::SearchMatch {
+                row: 6,
+                column: 1,
+                ..
+            })
+        ));
+
+        // Sparse edit overlay takes precedence over disk bytes.
+        let mut edits = BTreeMap::new();
+        edits.insert((3, 1), b"overwritten".to_vec());
+        edits.insert((4, 2), b"exact".to_vec());
+        let overlay_hit = session
+            .start_search_with_mode(
+                &index,
+                b"^exact$".to_vec(),
+                SearchPosition { row: 1, column: 0 },
+                edits,
+                CaseSensitivity::Sensitive,
+                super::SearchMode::Regex,
+                Some(1),
+            )
+            .unwrap()
+            .wait()
+            .unwrap();
+        assert!(matches!(
+            overlay_hit,
+            SearchOutcome::Match(super::SearchMatch {
+                row: 4,
+                column: 2,
+                ..
+            })
+        ));
+        fs::remove_file(path).unwrap();
+
+        // Encodings: UTF-16 LE, UTF-16 BE, Windows-1252, Latin-1.
+        let unicode_csv = "id,city\n1,plain\n2,CAFÉ\n";
+        let utf16le: Vec<u8> = std::iter::once(0xFEFF_u16)
+            .chain(unicode_csv.encode_utf16())
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        let utf16be: Vec<u8> = std::iter::once(0xFEFF_u16)
+            .chain(unicode_csv.encode_utf16())
+            .flat_map(u16::to_be_bytes)
+            .collect();
+        let win1252 = b"id,city\n1,plain\n2,CAF\xc9\n".to_vec();
+        for (enc, bytes) in [
+            (crate::Encoding::Utf16Le, utf16le),
+            (crate::Encoding::Utf16Be, utf16be),
+            (crate::Encoding::Windows1252, win1252.clone()),
+            (crate::Encoding::Latin1, win1252),
+        ] {
+            let p = fixture(&bytes);
+            let s = Session::open_with_encoding(
+                &p,
+                OpenOptions {
+                    delimiter: Some(b','),
+                    header_mode: HeaderMode::FirstRow,
+                    ..OpenOptions::default()
+                },
+                Some(enc),
+            )
+            .unwrap();
+            let idx = s
+                .start_indexing(IndexConfig::default())
+                .unwrap()
+                .wait()
+                .unwrap();
+            let outcome = s
+                .start_search_with_mode(
+                    &idx,
+                    "^café$".as_bytes().to_vec(),
+                    SearchPosition { row: 1, column: 0 },
+                    BTreeMap::new(),
+                    CaseSensitivity::Insensitive,
+                    super::SearchMode::Regex,
+                    Some(2),
+                )
+                .unwrap()
+                .wait()
+                .unwrap();
+            assert!(
+                matches!(
+                    outcome,
+                    SearchOutcome::Match(super::SearchMatch {
+                        row: 2,
+                        column: 1,
+                        ..
+                    })
+                ),
+                "encoding {enc}: {outcome:?}"
+            );
+            fs::remove_file(p).unwrap();
+        }
+
+        // Parallel striped regex search returns deterministic earliest match even when a later stripe finishes first.
+        let mut many = Vec::from(&b"id,tag\n"[..]);
+        for i in 1..=200 {
+            let tag = if i == 15 || i == 180 {
+                format!("HIT-{i:03}")
+            } else {
+                format!("miss-{i:03}")
+            };
+            many.extend_from_slice(format!("{i},{tag}\n").as_bytes());
+        }
+        let many_path = fixture(&many);
+        let many_session = Session::open(
+            &many_path,
+            OpenOptions {
+                header_mode: HeaderMode::FirstRow,
+                ..OpenOptions::default()
+            },
+        )
+        .unwrap();
+        let many_index = many_session
+            .start_indexing(IndexConfig {
+                chunk_bytes: 128,
+                checkpoint_every: 10,
+                memory_budget_bytes: 4096,
+            })
+            .unwrap()
+            .wait()
+            .unwrap();
+        let serial_outcome = many_session
+            .start_search_with_mode_and_tuning(
+                &many_index,
+                b"^HIT-[0-9]{3}$".to_vec(),
+                SearchPosition { row: 1, column: 0 },
+                BTreeMap::new(),
+                CaseSensitivity::Sensitive,
+                super::SearchMode::Regex,
+                SearchTuning {
+                    requested_threads: 1,
+                    stripe_target_bytes: 128,
+                    wait_for_later_hit_before_stripe_zero: false,
+                },
+            )
+            .unwrap()
+            .wait()
+            .unwrap();
+        let parallel_outcome = many_session
+            .start_search_with_mode_and_tuning(
+                &many_index,
+                b"^HIT-[0-9]{3}$".to_vec(),
+                SearchPosition { row: 1, column: 0 },
+                BTreeMap::new(),
+                CaseSensitivity::Sensitive,
+                super::SearchMode::Regex,
+                SearchTuning {
+                    requested_threads: 4,
+                    stripe_target_bytes: 128,
+                    wait_for_later_hit_before_stripe_zero: true,
+                },
+            )
+            .unwrap()
+            .wait()
+            .unwrap();
+        assert_eq!(serial_outcome, parallel_outcome);
+        assert!(matches!(
+            parallel_outcome,
+            SearchOutcome::Match(super::SearchMatch {
+                row: 15,
+                column: 1,
+                ..
+            })
+        ));
+        fs::remove_file(many_path).unwrap();
     }
 }

@@ -17,12 +17,12 @@ use quarry_core::{
     FilterMatch, FilterOperator, FilterPredicate, FilterProgress, FilterQuery, HeaderMode,
     IndexCacheConfig, IndexConfig, IndexJob, IndexProgress, LiteralReplacement,
     MAX_TRANSFORMATION_COLUMNS, OpenOptions, ReplaceAllJob, ReplaceAllOutcome, SaveAsJob,
-    SaveAsOutcome, SaveAsProgress, SearchJob, SearchOutcome, SearchPosition, SearchProgress,
-    SearchTelemetry, Session, SortDirection, SortJob, SortMode, SortOutcome, SortPlan,
-    SortProgress, SortSpec, SplitAnalysisJob, SplitAnalysisOutcome, SplitAnalysisProgress,
-    StructuralIndex, WorkingCopyCleanup, check_storage, clear_index_cache, detect_compression,
-    estimate_edited_output_bytes, estimate_sort_plan_temporary_bytes, inspect_storage,
-    is_compressed_destination,
+    SaveAsOutcome, SaveAsProgress, SearchJob, SearchMode, SearchOutcome, SearchPosition,
+    SearchProgress, SearchTelemetry, Session, SortDirection, SortJob, SortMode, SortOutcome,
+    SortPlan, SortProgress, SortSpec, SplitAnalysisJob, SplitAnalysisOutcome,
+    SplitAnalysisProgress, StructuralIndex, WorkingCopyCleanup, check_storage, clear_index_cache,
+    detect_compression, estimate_edited_output_bytes, estimate_sort_plan_temporary_bytes,
+    inspect_storage, is_compressed_destination, validate_regex,
 };
 
 type CliResult<T> = Result<T, Box<dyn Error>>;
@@ -243,16 +243,16 @@ fn print_help() {
          [--seed 1] [--cache-state unknown|cold|warm] [--live] \
          [--interval-ms 16] [--chunk-bytes 1048576] \
          [--temp-dir DIRECTORY] [--max-decompressed-bytes N]\n  \
-           quarry search <FILE> --query LITERAL [--start-row 1] \
+           quarry search <FILE> --query PATTERN [--regex] [--ignore-case] [--start-row 1] \
          [--start-column 1] [--cancel-after-bytes N] \
          [--cache-state unknown|warm] [--temp-dir DIRECTORY] [--max-decompressed-bytes N]\n  \
-           quarry filter <FILE> --column N --operator contains|equals|not-equals|gt|gte|lt|lte|between \
-         --value VALUE [--upper-bound VALUE] [--and N OPERATOR VALUE [UPPER]]... \
+           quarry filter <FILE> --column N --operator contains|equals|not-equals|regex|gt|gte|lt|lte|between \
+         --value VALUE [--upper-bound VALUE] [--and N OPERATOR VALUE [UPPER]]... [--ignore-case] \
          [--cancel-after-bytes N] \
          [--cache-state unknown|cold|warm] [--temp-dir DIRECTORY] [--max-decompressed-bytes N]\n  \
            quarry export <FILE> --output FILE --column N \
-         --operator contains|equals|not-equals|gt|gte|lt|lte|between --value VALUE \
-         [--upper-bound VALUE] [--and N OPERATOR VALUE [UPPER]]... [--cancel-after-bytes N] \
+         --operator contains|equals|not-equals|regex|gt|gte|lt|lte|between --value VALUE \
+         [--upper-bound VALUE] [--and N OPERATOR VALUE [UPPER]]... [--ignore-case] [--cancel-after-bytes N] \
          [--cache-state unknown|cold|warm] [--temp-dir DIRECTORY] [--max-decompressed-bytes N]\n  \
            quarry edit-save-as <FILE> --output FILE \
          --edit DATA_ROW COLUMN VALUE [--edit DATA_ROW COLUMN VALUE]... \
@@ -304,6 +304,8 @@ fn print_help() {
          Temporary runs use --temp-dir when set; final output staging stays beside its destination.\n\
          Filters: between includes both bounds and requires --upper-bound (or UPPER after --and).\n\
          Numeric values accept signed decimals and scientific notation; blank or invalid cells do not match.\n\
+         Regex: opt-in via search --regex or filter/export --operator regex (literal remains the default).\n\
+         Regex uses bounded Unicode matching with per-field ^/$ anchors and Unicode simple case folding under --ignore-case (literal --ignore-case uses ASCII case folding).\n\
          Sort: --column and --order are required for text, natural, number, date, characters, and words.\n\
          Date sorting requires --date-format; suggest-date-format samples bounded rows/bytes without auto-selecting.\n\
          Shuffle and reverse reorder all data rows; --seed repeats a shuffle within the same build."
@@ -366,15 +368,30 @@ fn parse_filter_operator(value: &str, option: &str) -> CliResult<FilterOperator>
         "contains" => Ok(FilterOperator::Contains),
         "equals" => Ok(FilterOperator::Equals),
         "not-equals" => Ok(FilterOperator::NotEquals),
+        "regex" => Ok(FilterOperator::Regex),
         "gt" => Ok(FilterOperator::GreaterThan),
         "gte" => Ok(FilterOperator::GreaterThanOrEqual),
         "lt" => Ok(FilterOperator::LessThan),
         "lte" => Ok(FilterOperator::LessThanOrEqual),
         "between" => Ok(FilterOperator::Between),
         _ => Err(format!(
-            "{option} must be contains, equals, not-equals, gt, gte, lt, lte, or between"
+            "{option} must be contains, equals, not-equals, regex, gt, gte, lt, lte, or between"
         )
         .into()),
+    }
+}
+
+fn filter_operator_label(operator: FilterOperator) -> &'static str {
+    match operator {
+        FilterOperator::Contains => "contains",
+        FilterOperator::Equals => "equals",
+        FilterOperator::NotEquals => "not-equals",
+        FilterOperator::Regex => "regex",
+        FilterOperator::GreaterThan => "gt",
+        FilterOperator::GreaterThanOrEqual => "gte",
+        FilterOperator::LessThan => "lt",
+        FilterOperator::LessThanOrEqual => "lte",
+        FilterOperator::Between => "between",
     }
 }
 
@@ -422,6 +439,7 @@ fn filter_command(args: Vec<String>) -> CliResult<()> {
     let mut filter_value = None;
     let mut upper_bound = None;
     let mut and_predicates = Vec::new();
+    let mut case_sensitivity = CaseSensitivity::Sensitive;
     let mut cancel_after_bytes = None;
     let mut cache_state = "unknown".to_owned();
     let mut threads = None;
@@ -449,6 +467,7 @@ fn filter_command(args: Vec<String>) -> CliResult<()> {
                 )
             }
             "--and" => and_predicates.push(parse_and_filter(&args, &mut cursor)?),
+            "--ignore-case" => case_sensitivity = CaseSensitivity::Insensitive,
             "--cancel-after-bytes" => {
                 cancel_after_bytes =
                     Some(value(&args, &mut cursor, "--cancel-after-bytes")?.parse::<u64>()?)
@@ -486,7 +505,8 @@ fn filter_command(args: Vec<String>) -> CliResult<()> {
         return Err("cancel-after-bytes must be non-zero".into());
     }
 
-    let mut query = FilterQuery::single(column - 1, operator, filter_value);
+    let mut query =
+        FilterQuery::single_with_case(column - 1, operator, filter_value, case_sensitivity);
     query.predicates[0].upper_bound = upper_bound;
     query.predicates.extend(and_predicates);
     query.validate()?;
@@ -524,16 +544,7 @@ fn filter_command(args: Vec<String>) -> CliResult<()> {
             "Predicate {}: column {}, operator {}, value {}",
             position + 1,
             predicate.column + 1,
-            match predicate.operator {
-                FilterOperator::Contains => "contains",
-                FilterOperator::Equals => "equals",
-                FilterOperator::NotEquals => "not-equals",
-                FilterOperator::GreaterThan => "gt",
-                FilterOperator::GreaterThanOrEqual => "gte",
-                FilterOperator::LessThan => "lt",
-                FilterOperator::LessThanOrEqual => "lte",
-                FilterOperator::Between => "between",
-            },
+            filter_operator_label(predicate.operator),
             render_field(&predicate.value)
         );
         if let Some(upper) = &predicate.upper_bound {
@@ -661,6 +672,7 @@ fn export_command(args: Vec<String>) -> CliResult<()> {
     let mut filter_value = None;
     let mut upper_bound = None;
     let mut and_predicates = Vec::new();
+    let mut case_sensitivity = CaseSensitivity::Sensitive;
     let mut cancel_after_bytes = None;
     let mut cache_state = "unknown".to_owned();
     let mut threads = None;
@@ -689,6 +701,7 @@ fn export_command(args: Vec<String>) -> CliResult<()> {
                 )
             }
             "--and" => and_predicates.push(parse_and_filter(&args, &mut cursor)?),
+            "--ignore-case" => case_sensitivity = CaseSensitivity::Insensitive,
             "--cancel-after-bytes" => {
                 cancel_after_bytes =
                     Some(value(&args, &mut cursor, "--cancel-after-bytes")?.parse::<u64>()?)
@@ -728,7 +741,8 @@ fn export_command(args: Vec<String>) -> CliResult<()> {
         return Err("cancel-after-bytes must be non-zero".into());
     }
 
-    let mut query = FilterQuery::single(column - 1, operator, filter_value);
+    let mut query =
+        FilterQuery::single_with_case(column - 1, operator, filter_value, case_sensitivity);
     query.predicates[0].upper_bound = upper_bound;
     query.predicates.extend(and_predicates);
     query.validate()?;
@@ -794,16 +808,7 @@ fn export_command(args: Vec<String>) -> CliResult<()> {
             "Predicate {}: column {}, operator {}, value {}",
             position + 1,
             predicate.column + 1,
-            match predicate.operator {
-                FilterOperator::Contains => "contains",
-                FilterOperator::Equals => "equals",
-                FilterOperator::NotEquals => "not-equals",
-                FilterOperator::GreaterThan => "gt",
-                FilterOperator::GreaterThanOrEqual => "gte",
-                FilterOperator::LessThan => "lt",
-                FilterOperator::LessThanOrEqual => "lte",
-                FilterOperator::Between => "between",
-            },
+            filter_operator_label(predicate.operator),
             render_field(&predicate.value)
         );
         if let Some(upper) = &predicate.upper_bound {
@@ -3370,6 +3375,8 @@ fn search_command(args: Vec<String>) -> CliResult<()> {
     let mut encoding = None;
     let mut path = None;
     let mut query = None;
+    let mut mode = SearchMode::Literal;
+    let mut case_sensitivity = CaseSensitivity::Sensitive;
     let mut start_row = 1_u64;
     let mut start_column = 1_usize;
     let mut cancel_after_bytes = None;
@@ -3383,6 +3390,8 @@ fn search_command(args: Vec<String>) -> CliResult<()> {
         match args[cursor].as_str() {
             "--encoding" => encoding = parse_encoding(value(&args, &mut cursor, "--encoding")?)?,
             "--query" => query = Some(value(&args, &mut cursor, "--query")?.as_bytes().to_vec()),
+            "--regex" => mode = SearchMode::Regex,
+            "--ignore-case" => case_sensitivity = CaseSensitivity::Insensitive,
             "--start-row" => start_row = value(&args, &mut cursor, "--start-row")?.parse()?,
             "--start-column" => {
                 start_column = value(&args, &mut cursor, "--start-column")?.parse()?
@@ -3428,6 +3437,9 @@ fn search_command(args: Vec<String>) -> CliResult<()> {
     if cache_state == "cold" {
         return Err("search cannot be cold because indexing reads the file first".into());
     }
+    if mode == SearchMode::Regex {
+        validate_regex(&query, case_sensitivity)?;
+    }
 
     let mut input = open_input(&path, OpenOptions::default(), encoding, &compressed)?;
     let prepared_index = input.index.take();
@@ -3447,12 +3459,13 @@ fn search_command(args: Vec<String>) -> CliResult<()> {
     if cancel_after_bytes.is_some_and(|bytes| bytes >= search_bytes) {
         return Err("cancel-after-bytes must be less than the searchable byte span".into());
     }
-    let job = session.start_search_with_options(
+    let job = session.start_search_with_mode(
         &index,
         query.clone(),
         start,
         BTreeMap::new(),
-        CaseSensitivity::Sensitive,
+        case_sensitivity,
+        mode,
         threads,
     )?;
     let (outcome, progress, search_telemetry, cancellation) =
@@ -3475,6 +3488,20 @@ fn search_command(args: Vec<String>) -> CliResult<()> {
         }
     );
     println!("Search cache state: {cache_state} after indexing prepass");
+    println!(
+        "Mode: {}",
+        match mode {
+            SearchMode::Literal => "literal",
+            SearchMode::Regex => "regex",
+        }
+    );
+    println!(
+        "Case sensitivity: {}",
+        match case_sensitivity {
+            CaseSensitivity::Sensitive => "sensitive",
+            CaseSensitivity::Insensitive => "insensitive",
+        }
+    );
     println!("Query: {}", render_field(&query));
     println!("Start: data row {start_row}, column {start_column}");
     println!("Rows indexed: {}", index.indexed_rows());
@@ -5474,11 +5501,11 @@ mod tests {
                     "--column",
                     "1",
                     "--operator",
-                    "regex",
+                    "wildcard",
                     "--value",
                     "x",
                 ],
-                "--operator must be contains, equals, not-equals, gt, gte, lt, lte, or between",
+                "--operator must be contains, equals, not-equals, regex, gt, gte, lt, lte, or between",
             ),
             (
                 vec![
@@ -5566,10 +5593,10 @@ mod tests {
                     "x",
                     "--and",
                     "2",
-                    "regex",
+                    "wildcard",
                     "x",
                 ],
-                "--and operator must be contains, equals, not-equals, gt, gte, lt, lte, or between",
+                "--and operator must be contains, equals, not-equals, regex, gt, gte, lt, lte, or between",
             ),
         ] {
             let error = filter_command(args.into_iter().map(str::to_owned).collect()).unwrap_err();
@@ -7314,6 +7341,136 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(fs::read_to_string(&dst).unwrap(), "k,v\na,1\nb,2\n");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn cli_regex_search_filter_and_export_preserve_literal_defaults_and_validate_bounds() {
+        let dir = std::env::temp_dir().join(format!(
+            "quarry-cli-regex-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("data.csv");
+        let dst = dir.join("filtered.csv");
+        let dst_ci = dir.join("filtered-ci.csv");
+        fs::write(
+            &src,
+            "id,code,city\n1,a+b,plain\n2,ERR-007,CAFÉ\n3,ERR-99,café\n4,OK-123,other\n",
+        )
+        .unwrap();
+
+        // Literal search remains the default (a+b matches literally without --regex).
+        search_command(vec![
+            src.display().to_string(),
+            "--query".into(),
+            "a+b".into(),
+            "--no-index-cache".into(),
+        ])
+        .unwrap();
+
+        // Opt-in regex search with --ignore-case matches Unicode CAFÉ for ^café$.
+        search_command(vec![
+            src.display().to_string(),
+            "--query".into(),
+            "^café$".into(),
+            "--regex".into(),
+            "--ignore-case".into(),
+            "--no-index-cache".into(),
+        ])
+        .unwrap();
+
+        // Invalid or oversized regex fails immediately on search, filter, and export.
+        let bad_search = search_command(vec![
+            src.display().to_string(),
+            "--query".into(),
+            "[unclosed".into(),
+            "--regex".into(),
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(bad_search.contains("invalid regular expression"));
+
+        let oversized_pattern = "a".repeat(quarry_core::MAX_REGEX_PATTERN_BYTES + 1);
+        let big_search = search_command(vec![
+            src.display().to_string(),
+            "--query".into(),
+            oversized_pattern.clone(),
+            "--regex".into(),
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(big_search.contains("4096-byte limit"));
+
+        let bad_filter = filter_command(vec![
+            src.display().to_string(),
+            "--column".into(),
+            "2".into(),
+            "--operator".into(),
+            "regex".into(),
+            "--value".into(),
+            "a{1000000}".into(),
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(bad_filter.contains("size limit"));
+
+        // Filter & export with --operator regex + --and regex.
+        filter_command(vec![
+            src.display().to_string(),
+            "--column".into(),
+            "2".into(),
+            "--operator".into(),
+            "regex".into(),
+            "--value".into(),
+            "^ERR-[0-9]{3}$".into(),
+        ])
+        .unwrap();
+
+        export_command(vec![
+            src.display().to_string(),
+            "--output".into(),
+            dst.display().to_string(),
+            "--column".into(),
+            "2".into(),
+            "--operator".into(),
+            "regex".into(),
+            "--value".into(),
+            "^ERR-[0-9]{3}$".into(),
+        ])
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(&dst).unwrap(),
+            "id,code,city\n2,ERR-007,CAFÉ\n"
+        );
+
+        // --ignore-case uses Unicode simple case folding for regex filters.
+        export_command(vec![
+            src.display().to_string(),
+            "--output".into(),
+            dst_ci.display().to_string(),
+            "--column".into(),
+            "3".into(),
+            "--operator".into(),
+            "regex".into(),
+            "--value".into(),
+            "^café$".into(),
+            "--and".into(),
+            "2".into(),
+            "regex".into(),
+            "^err-[0-9]+$".into(),
+            "--ignore-case".into(),
+        ])
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(&dst_ci).unwrap(),
+            "id,code,city\n2,ERR-007,CAFÉ\n3,ERR-99,café\n"
+        );
+
         fs::remove_dir_all(&dir).unwrap();
     }
 }

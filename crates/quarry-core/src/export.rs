@@ -4330,7 +4330,7 @@ fn run_save_as(
 struct EncodedSaveState<'a> {
     output: &'a mut ExportTarget,
     edits: &'a PreparedSaveEdits,
-    replacement_matcher: Option<&'a (ByteMatcher<'a>, bool)>,
+    replacement_matcher: Option<&'a (ByteMatcher, bool)>,
     config: ExportConfig,
     shared: &'a SharedState,
     delimiter: u8,
@@ -5512,7 +5512,7 @@ fn write_saved_record(
     delimiter: u8,
     has_header: bool,
     edits: &PreparedSaveEdits,
-    replacement_matcher: Option<&(ByteMatcher<'_>, bool)>,
+    replacement_matcher: Option<&(ByteMatcher, bool)>,
     max_record_bytes: usize,
 ) -> Result<SaveCopySummary, QuarryError> {
     if record.len() > max_record_bytes {
@@ -6700,7 +6700,7 @@ fn process_record(
     delimiter: u8,
     query: &FilterQuery,
     edits: &FilteredEdits,
-    matchers: &[PredicateMatcher<'_>],
+    matchers: &[PredicateMatcher],
     groups: &[Vec<usize>],
     max_record_bytes: usize,
     source_had_bom: bool,

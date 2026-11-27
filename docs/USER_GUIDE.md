@@ -1167,9 +1167,40 @@ reopen it instead of overwriting the external update.
 Find and Replace, text filters, Text sorting, and Find Duplicates each have an
 independent **Match case** setting:
 
-- Off, the default: ASCII uppercase and lowercase letters are treated as
-  equivalent.
+- Off, the default in the desktop app: literal Find/Replace, literal text
+  filters, Text sorting, and Find Duplicates treat ASCII uppercase and lowercase
+  letters as equivalent (**ASCII case folding**).
 - On: ASCII letter case is compared exactly.
+
+In the CLI, `quarry search`, `quarry filter`, and `quarry export` are
+case-sensitive by default and accept `--ignore-case` to enable case-insensitive
+matching.
+
+### Bounded regular expressions (CLI & core)
+
+Literal matching remains the default everywhere. Opt-in bounded regular
+expressions are available in the CLI via `quarry search --regex --query PATTERN`,
+`quarry filter --operator regex --value PATTERN`, and
+`quarry export --operator regex --value PATTERN` (combinable with `--and` and
+`--ignore-case`):
+
+- **Per-field evaluation:** Patterns match against unquoted, decoded field
+  values (after any unsaved cell overlays in core). Anchors `^` and `$` match
+  the start and end of each field (not embedded line breaks inside a multiline
+  quoted cell, unless you opt in with inline `(?m)`).
+- **Unicode mode & case folding:** Regex patterns run with Unicode mode enabled
+  (supporting classes such as `\p{L}` and `\d`). When case-insensitive matching
+  is enabled (`--ignore-case`), **regex matching uses Unicode simple case
+  folding** (for example, `café` matches `CAFÉ`), whereas literal matching
+  continues to use **ASCII case folding**.
+- **Encodings:** UTF-16 LE, UTF-16 BE, Windows-1252, and ISO-8859-1 (Latin-1)
+  records are decoded to UTF-8 bytes before matching. UTF-8 files are matched
+  directly on raw field bytes without lossy UTF-8 replacement.
+- **Safety bounds:** To guarantee linear-time matching and prevent pathological
+  patterns from exhausting memory or stack depth, patterns are validated before
+  scanning with explicit limits: 4,096-byte maximum pattern length, 2 MiB
+  compiled program limit, 2 MiB DFA cache limit, and syntax nesting limit of 64.
+  Empty, malformed, or oversized patterns fail immediately with a clear error.
 
 The duplicate dialog starts with **Match case** off each time. Search inside the
 **Columns** popover is always case-insensitive. Split matches its separator

@@ -19,8 +19,8 @@ use std::time::Duration;
 use crate::encoding::{EncodedScanner, Encoding};
 use crate::export::source_matches_stamp;
 use crate::filter::{
-    FilterEdits, FilterIndex, FilterMatch, FilterQuery, compile_matchers, predicate_groups,
-    record_matches_fast,
+    FilterEdits, FilterIndex, FilterMatch, FilterQuery, PredicateMatcher, compile_matchers,
+    predicate_groups, record_matches_fast,
 };
 use crate::index::StructuralIndex;
 use crate::positional_io::read_at_exact_or_eof;
@@ -182,13 +182,26 @@ pub struct WatchStopOutcome {
 
 struct WatchFilterState {
     index: FilterIndex,
+    matchers: Arc<Vec<PredicateMatcher>>,
+    groups: Vec<Vec<usize>>,
     data_start: u64,
     max_column: usize,
     edits: FilterEdits,
 }
 
 impl WatchFilterState {
-    fn new(index: FilterIndex, data_start: u64) -> Self {
+    fn try_new(index: FilterIndex, data_start: u64) -> Result<Self, QuarryError> {
+        let matchers = Arc::new(compile_matchers(index.query())?);
+        let groups = predicate_groups(index.query());
+        Ok(Self::new_compiled(index, matchers, groups, data_start))
+    }
+
+    fn new_compiled(
+        index: FilterIndex,
+        matchers: Arc<Vec<PredicateMatcher>>,
+        groups: Vec<Vec<usize>>,
+        data_start: u64,
+    ) -> Self {
         let max_column = index
             .query()
             .predicates
@@ -198,6 +211,8 @@ impl WatchFilterState {
             .unwrap_or(0);
         Self {
             index,
+            matchers,
+            groups,
             data_start,
             max_column,
             edits: Arc::default(),
@@ -428,16 +443,6 @@ impl TailScanner {
             }
         }
 
-        // Pre-compile filter matchers once for all committed records in this chunk.
-        let filter_query = filter.as_deref().map(|state| state.index.query().clone());
-        let compiled_filter = if let Some(query) = filter_query.as_ref() {
-            let matchers = compile_matchers(query)?;
-            let groups = predicate_groups(query);
-            Some((query, matchers, groups))
-        } else {
-            None
-        };
-
         // Process each newly terminated record in order so `provisional_bytes` never exceeds the cap.
         // Batch seam updates across contiguous records borrowed directly from `new_bytes` so a
         // stream of tiny records (e.g., 1-byte `\n` lines) updates the 4 KiB seam once per chunk
@@ -491,8 +496,7 @@ impl TailScanner {
                 }
             }
 
-            if let (Some(filter_state), Some((query, matchers, groups))) =
-                (filter.as_deref_mut(), compiled_filter.as_ref())
+            if let Some(filter_state) = filter.as_deref_mut()
                 && row_number >= filter_state.data_start
             {
                 let matched = match record_matches_fast(
@@ -500,9 +504,9 @@ impl TailScanner {
                     self.delimiter,
                     row_number,
                     record_start == 0,
-                    query,
-                    matchers,
-                    groups,
+                    filter_state.index.query(),
+                    &filter_state.matchers,
+                    &filter_state.groups,
                     filter_state.max_column,
                     &filter_state.edits,
                     self.encoding,
@@ -619,18 +623,15 @@ impl TailScanner {
         if let Some(filter_state) = filter
             && row_number >= filter_state.data_start
         {
-            let query = filter_state.index.query().clone();
-            let matchers = compile_matchers(&query)?;
-            let groups = predicate_groups(&query);
             let mut field_ranges = Vec::new();
             let matched = record_matches_fast(
                 &self.provisional_bytes,
                 self.delimiter,
                 row_number,
                 record_start == 0,
-                &query,
-                &matchers,
-                &groups,
+                filter_state.index.query(),
+                &filter_state.matchers,
+                &filter_state.groups,
                 filter_state.max_column,
                 &filter_state.edits,
                 self.encoding,
@@ -1034,13 +1035,15 @@ impl LiveWatchJob {
         }
 
         let mut live_index = index.clone();
-        let mut live_filter = active_filter.map(|f| {
-            let mut cloned = f.clone();
-            // Live filter snapshots track the growing committed frontier and are not eligible
-            // as whole-file baselines for another `start_live_watch` until clean stop.
-            cloned.set_complete(false);
-            WatchFilterState::new(cloned, data_start)
-        });
+        let mut live_filter = active_filter
+            .map(|f| {
+                let mut cloned = f.clone();
+                // Live filter snapshots track the growing committed frontier and are not eligible
+                // as whole-file baselines for another `start_live_watch` until clean stop.
+                cloned.set_complete(false);
+                WatchFilterState::try_new(cloned, data_start)
+            })
+            .transpose()?;
 
         // If the baseline file ended without a trailing newline, roll back that final row so it
         // remains provisional until the writer finishes and terminates it with a newline.
@@ -1075,18 +1078,15 @@ impl LiveWatchJob {
             if let Some(filter_state) = live_filter.as_mut()
                 && last_row >= data_start
             {
-                let query = filter_state.index.query().clone();
-                let matchers = compile_matchers(&query)?;
-                let groups = predicate_groups(&query);
                 let mut field_ranges = Vec::new();
                 if record_matches_fast(
                     &tail_buf,
                     delimiter,
                     last_row,
                     last_row_start == 0,
-                    &query,
-                    &matchers,
-                    &groups,
+                    filter_state.index.query(),
+                    &filter_state.matchers,
+                    &filter_state.groups,
                     filter_state.max_column,
                     &filter_state.edits,
                     encoding,
@@ -1629,7 +1629,7 @@ fn attach_filter_query_shared(
         shared.data_start,
         shared.encoding,
     )?;
-    let matchers = compile_matchers(&query)?;
+    let matchers = Arc::new(compile_matchers(&query)?);
     let groups = predicate_groups(&query);
     let max_column = query
         .predicates
@@ -1655,7 +1655,7 @@ fn attach_filter_query_shared(
     fn scan_filter_range(
         shared: &WatchShared,
         query: &FilterQuery,
-        matchers: &[crate::filter::PredicateMatcher<'_>],
+        matchers: &[crate::filter::PredicateMatcher],
         groups: &[Vec<usize>],
         max_column: usize,
         edits: &FilterEdits,
@@ -1820,7 +1820,12 @@ fn attach_filter_query_shared(
         // reused as whole-file static baselines before clean stop.
         filter_index.set_complete(false);
         let snapshot_index = filter_index.clone();
-        *filter_guard = Some(WatchFilterState::new(filter_index, shared.data_start));
+        *filter_guard = Some(WatchFilterState::new_compiled(
+            filter_index,
+            matchers,
+            groups,
+            shared.data_start,
+        ));
         {
             let mut snap = shared.snapshot.write().unwrap();
             snap.filter_matches_found = Some(snapshot_index.matches_found());
@@ -4732,5 +4737,77 @@ mod tests {
         stopper.join().unwrap();
         assert_eq!(stop_ev, DirectoryWatchEvent::Stopped);
         assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn live_watch_evaluates_regex_filter_incrementally_across_appends() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stream.csv");
+        std::fs::write(&path, b"id,code\n1,ERR-001\n2,OK-002\n").unwrap();
+
+        let session = Session::open(
+            &path,
+            OpenOptions {
+                delimiter: Some(b','),
+                header_mode: HeaderMode::FirstRow,
+                ..OpenOptions::default()
+            },
+        )
+        .unwrap();
+        let index = session
+            .start_indexing(IndexConfig::default())
+            .unwrap()
+            .wait()
+            .unwrap();
+        let query = FilterQuery::single_with_case(
+            1,
+            crate::FilterOperator::Regex,
+            b"^err-[0-9]{3}$".to_vec(),
+            crate::CaseSensitivity::Insensitive,
+        );
+        let filter_index = session.start_filter(query).unwrap().wait().unwrap();
+        assert_eq!(filter_index.matches_found(), 1);
+
+        let watch = session
+            .start_live_watch(
+                &index,
+                Some(&filter_index),
+                WatchConfig {
+                    poll_interval: Duration::from_millis(10),
+                    force_polling: true,
+                    ..WatchConfig::default()
+                },
+            )
+            .unwrap();
+
+        let mut appender = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        appender
+            .write_all(b"3,OK-003\n4,err-004\n5,ERR-99\n6,ERR-006\n")
+            .unwrap();
+        appender.flush().unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            let snap = watch.snapshot();
+            if snap.committed_rows >= 7 && snap.filter_matches_found == Some(3) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        let stop = watch.stop().unwrap();
+        let final_filter = stop.filter_index.expect("active regex filter preserved");
+        assert_eq!(final_filter.matches_found(), 3);
+        let matches = stop
+            .session
+            .read_filtered_rows(&final_filter, 0, 10)
+            .unwrap();
+        assert_eq!(
+            matches.iter().map(|m| m.row).collect::<Vec<_>>(),
+            vec![1, 4, 6]
+        );
     }
 }
