@@ -187,7 +187,7 @@ Quarry is actively working toward v1.0. High-level upcoming areas include:
 - **Analysis & Data Tools:** Out-of-core Pivot Tables (`SUM`, `AVG`, `COUNT`, `MIN`, `MAX`), Autofill (series/dates) & Flash Fill by example, Combine Lines rollup, Transpose, and Extract Frequent Strings.
 - **Cross-Platform Packaging & Release Verification:** Signed/notarized macOS builds (Apple Silicon and Intel), Linux packages, bare-metal 120 Hz & accessibility verification, and full [v1.0 Claim Ledger](docs/V1_CLAIM_LEDGER.md) reconciliation.
 
-Track active issues and priorities in the [Roadmap](docs/ROADMAP.md) and the [Quarry GitHub Project](https://github.com/users/danchamorro/projects/1).
+Track active issues and milestones in the [Roadmap](docs/ROADMAP.md) and [Open GitHub Issues](https://github.com/danchamorro/quarry/issues).
 
 ---
 

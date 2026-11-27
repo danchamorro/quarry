@@ -291,7 +291,10 @@ destination. Public Save, Save As, and filtered export still publish without
 waiting for result consumption. Private-job elapsed time can include the wait
 for the caller's handoff; final publication errors still come from `wait()`.
 
-The GUI's working-folder choice lasts for the app session. Each generation is
+The GUI's working-folder choice persists across restarts and is revalidated on
+every use (mounted, owner-accessible, not a symlink); if validation fails, Quarry
+surfaces a notice and requires reselection rather than silently falling back to
+another volume. Each generation is
 created in an owner-only directory under that folder. A folder change retains
 previous directories needed by the active document and adjacent Undo/Redo
 snapshot. History lookup and cleanup recognize all owned directories. Existing
@@ -496,9 +499,13 @@ external run/merge budgets, source guards, progress, cancellation, storage revie
 completed-index handoff, and structural history apply unchanged. Original cell
 spelling is preserved. See [the date/time decision](adr/0008-date-time-sorting.md).
 
-Quarry sorts data rows by exactly one selected numbered column using stable,
-ASCII case-insensitive text ordering by default. The Sort tool's **Match case**
-setting switches key comparison to raw bytes. **Number** instead builds exact,
+Quarry sorts data rows by 1 to 16 selected numbered columns ([ADR 0010](adr/0010-multi-column-sorting.md))
+using stable, ASCII case-insensitive text ordering by default. Each sort level
+carries its own direction and mode: **Text** (with an independent **Match case**
+option switching to raw bytes), **Number** (exact canonical decimal byte keys),
+**Natural** (prefix-orderable ASCII digit-run keys so `v1.9 < v1.10`),
+**Date / time**, **Character count**, **Word count**, or whole-row **Shuffle**
+and **Reverse**. **Number** builds exact,
 canonical decimal byte keys once per row. The key encodes sign, decimal order,
 and significant digits so the same lexicographic run sort and merge compare
 numbers without floating-point rounding or expanding scientific exponents.
@@ -615,8 +622,9 @@ streams those ranges through the private working-copy path, preserves the
 header and unselected records, applies sparse edits to retained records, and
 keeps Save, Save As, Discard, Undo, and Redo behavior. Filtering clears row
 selection, and row selection plus deletion remain unavailable while filtered.
-Row insertion is tracked separately in
-[issue #73](https://github.com/danchamorro/quarry/issues/73).
+Row and column insertion are implemented via the guarded rewrite path; see
+[Row and column insertion](#row-and-column-insertion) and
+[ADR 0009](adr/0009-row-column-insertion.md).
 
 A document is dirty while effective cell or header edits exist, or while its
 active CSV is a materialized working copy that differs from the last opened or

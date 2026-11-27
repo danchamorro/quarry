@@ -1,10 +1,9 @@
 # Quarry Roadmap History
 
-Historical planning snapshot preserved when the live roadmap moved to
-[GitHub Projects](https://github.com/users/danchamorro/projects/1). Checkboxes and
-priorities below describe that snapshot, not current scheduling. All unfinished
-roadmap items and later ideas have been captured in Projects. Do not add new
-planning items here; see [the roadmap policy](ROADMAP.md) and linked issues for
+Historical planning snapshot preserved when the earlier roadmap moved to
+GitHub Projects (since retired). Checkboxes and
+priorities below describe that snapshot, not current scheduling. Do not add new
+planning items here; see [the current roadmap](ROADMAP.md) and [GitHub Issues](https://github.com/danchamorro/quarry/issues) for
 ongoing work.
 
 The roadmap is ordered by technical risk rather than feature excitement.
