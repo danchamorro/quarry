@@ -10,8 +10,14 @@ parentheses are GitHub pull requests.
 
 ## [2026-11-27]
 
+### Added
+
+- Added opt-in bounded regular expression matching to the CLI (`quarry search --regex`, `quarry filter --operator regex`, and `quarry export --operator regex`, plus `--ignore-case`) and core search, filter, filtered export, and live-watch engines while keeping literal matching as the default. (#232)
+- Added explicit regex validation limits (4 KiB pattern length, 2 MiB compiled and DFA budgets, syntax nesting depth of 64, and up to 16 regex rules per compound filter) and documented Unicode simple case folding vs literal ASCII case folding in `docs/USER_GUIDE.md`. (#232)
+
 ### Changed
 
+- Refreshed audited third-party license notice inventories across macOS Apple Silicon and Linux `x86_64` / `arm64` after adding `regex` to `quarry-core` (with no new third-party crates added to `Cargo.lock`). (#232)
 - Updated **Download & Install** links and asset filenames in `README.md` and `docs/LINUX_AND_OMARCHY.md` to point to the published `v0.2.0-beta.3` release. (#230)
 
 ## [2026-11-26]
