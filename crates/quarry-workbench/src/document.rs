@@ -3441,6 +3441,12 @@ impl Document {
                             done: true,
                             cancelled: false,
                         });
+                        if !matches!(error, QuarryError::SourceChanged) {
+                            self.filter_buffer_start = 0;
+                            self.whitespace.invalidate_rows();
+                            self.filtered_rows.clear();
+                            let _ = self.schedule_filter_buffer(self.filter_viewport_start);
+                        }
                     } else {
                         self.filter_query = None;
                         self.filter_index = None;

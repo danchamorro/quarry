@@ -889,7 +889,11 @@ impl TableDelegate for Grid {
                 });
             if skip_for_in_flight_tail {
                 if let Some(doc) = controller.active_document_mut(window_id) {
-                    doc.visible_rows = range.len().max(1);
+                    let new_visible = range.len().max(1);
+                    if new_visible > doc.visible_rows {
+                        doc.live_watch_viewport_dirty = true;
+                    }
+                    doc.visible_rows = new_visible;
                 }
                 return;
             }

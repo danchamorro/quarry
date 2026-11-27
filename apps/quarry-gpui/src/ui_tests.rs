@@ -5218,15 +5218,14 @@ fn live_watch_coalesces_tail_refreshes_while_viewport_read_is_in_flight(cx: &mut
     cx.run_until_parked();
     let nav_row_1 = cx.update(|cx| {
         controller.read(cx).active_document(win_id).and_then(|doc| {
-            doc.buffered_rows
-                .first()
-                .and_then(|r| r.fields.get(1))
+            doc.visible_row(0)
+                .and_then(|(_, fields)| fields.get(1))
                 .cloned()
         })
     });
     assert_eq!(
         nav_row_1.as_deref(),
-        Some(b"seed-001".as_slice()),
+        Some(b"seed-002".as_slice()),
         "superseded tail read must not overwrite rows loaded by explicit user navigation"
     );
 }

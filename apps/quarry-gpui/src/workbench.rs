@@ -728,7 +728,7 @@ impl WorkbenchController {
         let Some(plan) = plan else {
             return;
         };
-        self.spawn_viewport_read_plan_with_seq(doc_id, seq, plan, false, cx);
+        self.spawn_viewport_read_plan_with_seq(doc_id, seq, plan, false, 0, cx);
     }
 
     fn clear_viewport_read_state(&mut self, doc_id: DocumentId) {
@@ -769,13 +769,22 @@ impl WorkbenchController {
             .and_then(|doc| doc.take_live_watch_viewport_plan());
         if let Some(plan) = plan {
             self.live_watch_tail_read_in_flight.insert(doc_id, seq);
-            self.spawn_viewport_read_plan_with_seq(doc_id, seq, plan, true, cx);
+            self.spawn_viewport_read_plan_with_seq(doc_id, seq, plan, true, 1, cx);
         }
     }
 
     fn maybe_spawn_live_watch_tail_refresh(
         &mut self,
         doc_id: DocumentId,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        self.maybe_spawn_live_watch_tail_refresh_with_retries(doc_id, 1, cx)
+    }
+
+    fn maybe_spawn_live_watch_tail_refresh_with_retries(
+        &mut self,
+        doc_id: DocumentId,
+        retries_remaining: u8,
         cx: &mut Context<Self>,
     ) -> bool {
         // Keep at most one live-watch tail read in flight per document and coalesce arriving
@@ -798,7 +807,7 @@ impl WorkbenchController {
             *entry
         };
         self.live_watch_tail_read_in_flight.insert(doc_id, seq);
-        self.spawn_viewport_read_plan_with_seq(doc_id, seq, plan, true, cx);
+        self.spawn_viewport_read_plan_with_seq(doc_id, seq, plan, true, retries_remaining, cx);
         true
     }
 
@@ -808,6 +817,7 @@ impl WorkbenchController {
         seq: u64,
         plan: quarry_workbench::ViewportReadPlan,
         is_live_watch_tail: bool,
+        retries_remaining: u8,
         cx: &mut Context<Self>,
     ) {
         let session = Arc::clone(&plan.session);
@@ -840,19 +850,39 @@ impl WorkbenchController {
                 if !Arc::ptr_eq(&doc.session, &expected_session) {
                     return;
                 }
-                let read_ok = match read {
+                let mut follow_up_retries = None;
+                match read {
                     Ok(rows) => {
                         doc.install_buffer_rows(start, rows, elapsed);
-                        true
+                        if is_live_watch_tail {
+                            follow_up_retries = Some(1);
+                        }
                     }
                     Err(error) => {
+                        let source_changed =
+                            matches!(error, quarry_core::QuarryError::SourceChanged);
                         let msg = doc.diagnostic_error(error);
                         tab.notice = Some(AppMessage::error(msg));
-                        false
+                        if is_live_watch_tail
+                            && retries_remaining > 0
+                            && !source_changed
+                            && doc.is_live_watching()
+                            && doc.live_watch_tail_follow
+                            && !doc.filter_active()
+                        {
+                            doc.live_watch_viewport_dirty = true;
+                            follow_up_retries = Some(retries_remaining - 1);
+                        }
                     }
-                };
-                if is_live_watch_tail && read_ok && controller.is_document_active(doc_id) {
-                    let _ = controller.maybe_spawn_live_watch_tail_refresh(doc_id, cx);
+                }
+                if let Some(next_retries) = follow_up_retries
+                    && controller.is_document_active(doc_id)
+                {
+                    let _ = controller.maybe_spawn_live_watch_tail_refresh_with_retries(
+                        doc_id,
+                        next_retries,
+                        cx,
+                    );
                 }
                 cx.notify();
             });
