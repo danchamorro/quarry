@@ -388,6 +388,15 @@ impl StructuralIndex {
         self.complete = complete;
     }
 
+    /// Advances the committed byte frontier without adding a logical record (e.g., BOM-only files
+    /// finalized on clean Live Watch stop so `committed_record_end() == file_size`).
+    pub(crate) fn advance_committed_frontier_without_record(&mut self, offset: u64) {
+        if offset > self.last_record_end {
+            self.last_record_end = offset;
+            self.indexed_bytes = offset.saturating_sub(self.section_base);
+        }
+    }
+
     pub(crate) fn set_maximum_width(&mut self, maximum_width: usize) {
         self.maximum_width = self.maximum_width.max(maximum_width);
     }

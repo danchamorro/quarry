@@ -725,6 +725,44 @@ impl WorkbenchController {
         let Some(plan) = plan else {
             return;
         };
+        self.spawn_viewport_read_plan_with_seq(doc_id, seq, plan, cx);
+    }
+
+    fn spawn_viewport_read_plan(
+        &mut self,
+        doc_id: DocumentId,
+        plan: quarry_workbench::ViewportReadPlan,
+        cx: &mut Context<Self>,
+    ) {
+        let seq = {
+            let entry = self.viewport_read_seq.entry(doc_id).or_insert(0);
+            *entry = entry.wrapping_add(1);
+            *entry
+        };
+        self.spawn_viewport_read_plan_with_seq(doc_id, seq, plan, cx);
+    }
+
+    fn spawn_live_watch_viewport_refresh(&mut self, doc_id: DocumentId, cx: &mut Context<Self>) {
+        let plan = self
+            .scheduler
+            .tab_mut(doc_id)
+            .and_then(|t| t.document.as_mut())
+            .and_then(|doc| doc.take_live_watch_viewport_plan());
+        if let Some(plan) = plan {
+            self.spawn_viewport_read_plan(doc_id, plan, cx);
+        } else {
+            let entry = self.viewport_read_seq.entry(doc_id).or_insert(0);
+            *entry = entry.wrapping_add(1);
+        }
+    }
+
+    fn spawn_viewport_read_plan_with_seq(
+        &mut self,
+        doc_id: DocumentId,
+        seq: u64,
+        plan: quarry_workbench::ViewportReadPlan,
+        cx: &mut Context<Self>,
+    ) {
         let session = Arc::clone(&plan.session);
         let start = plan.start;
         cx.spawn(async move |this, cx| {
@@ -1394,11 +1432,11 @@ impl WorkbenchController {
         let Some(id) = self.scheduler.active_document(window) else {
             return Err(AppMessage::warning("Open a file first."));
         };
-        self.scheduler.start_live_watch_with_config(id, config)?;
-        {
-            let entry = self.viewport_read_seq.entry(id).or_insert(0);
-            *entry = entry.wrapping_add(1);
+        if let Some(doc) = self.scheduler.tab_mut(id).and_then(|t| t.document.as_mut()) {
+            doc.live_watch_async_viewport = true;
         }
+        self.scheduler.start_live_watch_with_config(id, config)?;
+        self.spawn_live_watch_viewport_refresh(id, cx);
         let backend = self
             .scheduler
             .tab(id)
@@ -1450,8 +1488,7 @@ impl WorkbenchController {
         };
         if changed {
             if follow {
-                let entry = self.viewport_read_seq.entry(id).or_insert(0);
-                *entry = entry.wrapping_add(1);
+                self.spawn_live_watch_viewport_refresh(id, cx);
             }
             let text = if follow {
                 "Following live tail.".to_owned()
@@ -1619,6 +1656,14 @@ impl WorkbenchController {
             .scheduler
             .activate_tab(window, id)
             .map_err(|e| e.to_string())?;
+        if let Some(plan) = self
+            .scheduler
+            .tab_mut(id)
+            .and_then(|t| t.document.as_mut())
+            .and_then(|doc| doc.take_live_watch_viewport_plan())
+        {
+            self.spawn_viewport_read_plan(id, plan, cx);
+        }
         cx.notify();
         Ok(outcome)
     }
@@ -1639,6 +1684,14 @@ impl WorkbenchController {
         if let Err(error) = self.scheduler.activate_tab(window, target) {
             self.set_window_message(window, Some(AppMessage::warning(error.to_string())), cx);
         } else {
+            if let Some(plan) = self
+                .scheduler
+                .tab_mut(target)
+                .and_then(|t| t.document.as_mut())
+                .and_then(|doc| doc.take_live_watch_viewport_plan())
+            {
+                self.spawn_viewport_read_plan(target, plan, cx);
+            }
             cx.notify();
         }
     }
@@ -4582,12 +4635,19 @@ impl WorkbenchController {
             .filter_map(|&win| self.scheduler.active_document(win))
             .collect();
         for doc_id in active_doc_ids {
+            let mut deferred_plan = None;
             if let Some(doc) = self
                 .scheduler
                 .tab_mut(doc_id)
                 .and_then(|t| t.document.as_mut())
-                && doc.whitespace.poll()
             {
+                if doc.whitespace.poll() {
+                    changed = true;
+                }
+                deferred_plan = doc.take_live_watch_viewport_plan();
+            }
+            if let Some(plan) = deferred_plan {
+                self.spawn_viewport_read_plan(doc_id, plan, cx);
                 changed = true;
             }
         }

@@ -975,3 +975,86 @@ fn live_watch_filter_replacement_discards_in_flight_page_read_from_previous_filt
     );
     let _ = scheduler.stop_live_watch(doc_id).unwrap();
 }
+
+#[test]
+fn live_watch_async_viewport_defers_tail_refresh_to_background_plan() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("async_tail_refresh.csv");
+    std::fs::write(&path, b"id,msg\n1,one\n2,two\n").unwrap();
+
+    let (mut scheduler, doc_id) = open_completed_scheduler(&path);
+    scheduler
+        .tab_mut(doc_id)
+        .unwrap()
+        .document
+        .as_mut()
+        .unwrap()
+        .live_watch_async_viewport = true;
+
+    scheduler
+        .start_live_watch_with_config(
+            doc_id,
+            WatchConfig {
+                poll_interval: Duration::from_millis(15),
+                cache_config: quarry_core::IndexCacheConfig::disabled(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    // Starting watch with `live_watch_async_viewport` defers the tail read to a background plan.
+    let initial_plan = scheduler
+        .tab_mut(doc_id)
+        .unwrap()
+        .document
+        .as_mut()
+        .unwrap()
+        .take_live_watch_viewport_plan()
+        .expect("startup tail refresh must produce a ViewportReadPlan");
+    assert!(initial_plan.live_watch_reader.is_some());
+    let rows = initial_plan.execute().unwrap();
+    scheduler
+        .tab_mut(doc_id)
+        .unwrap()
+        .document
+        .as_mut()
+        .unwrap()
+        .install_buffer_rows(initial_plan.start, rows, Duration::ZERO);
+
+    // Append a new row and poll -> must mark viewport dirty without reading synchronously.
+    let mut f = FsOpenOptions::new().append(true).open(&path).unwrap();
+    f.write_all(b"3,three\n").unwrap();
+    f.flush().unwrap();
+    scheduler
+        .tab(doc_id)
+        .unwrap()
+        .document
+        .as_ref()
+        .unwrap()
+        .live_watch
+        .as_ref()
+        .unwrap()
+        .nudge();
+
+    assert!(wait_until(Duration::from_secs(3), || {
+        let _ = scheduler.poll_all();
+        scheduler
+            .tab(doc_id)
+            .unwrap()
+            .document
+            .as_ref()
+            .unwrap()
+            .live_watch_viewport_dirty
+    }));
+    let plan = scheduler
+        .tab_mut(doc_id)
+        .unwrap()
+        .document
+        .as_mut()
+        .unwrap()
+        .take_live_watch_viewport_plan()
+        .expect("append tail refresh must produce a ViewportReadPlan");
+    let rows = plan.execute().unwrap();
+    assert_eq!(rows.last().unwrap().fields[0], b"3");
+    let _ = scheduler.stop_live_watch(doc_id).unwrap();
+}

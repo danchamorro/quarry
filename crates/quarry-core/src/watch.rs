@@ -562,7 +562,9 @@ impl TailScanner {
             final_end = Some(end);
         })?;
         if !has_final {
-            // e.g., BOM-only file
+            // e.g., BOM-only file: advance the structural frontier without adding a record so
+            // clean stop reconciles `committed_record_end() == file_size` and `is_complete() == true`.
+            index.advance_committed_frontier_without_record(self.scanner_consumed_bytes);
             self.committed_record_end = self.scanner_consumed_bytes;
             self.provisional_bytes.clear();
             return Ok(false);
@@ -3955,5 +3957,60 @@ mod tests {
             stopped.session.read_rows(&stopped.index, 0, 5),
             Err(QuarryError::InvalidOption(_))
         ));
+    }
+
+    #[test]
+    fn bom_only_append_finalizes_complete_index_on_clean_stop() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bom_only.csv");
+        std::fs::write(&path, b"").unwrap();
+
+        let (session, index) = open_and_index(&path, Some(Encoding::Utf8), HeaderMode::FirstRow);
+        assert!(index.is_complete());
+        assert_eq!(index.indexed_rows(), 0);
+
+        let watch = session
+            .start_live_watch(
+                &index,
+                None,
+                WatchConfig {
+                    poll_interval: Duration::from_millis(15),
+                    cache_config: IndexCacheConfig::disabled(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        let mut f = FsOpenOptions::new().append(true).open(&path).unwrap();
+        f.write_all(b"\xEF\xBB\xBF").unwrap();
+        f.flush().unwrap();
+        watch.nudge();
+
+        assert!(wait_until(Duration::from_secs(3), || {
+            watch.snapshot().observed_file_len == 3
+        }));
+
+        let stopped = watch.stop().unwrap();
+        assert_eq!(stopped.final_status, WatchStatus::Stopped);
+        assert!(stopped.index.is_complete());
+        assert_eq!(stopped.index.indexed_rows(), 0);
+        assert_eq!(stopped.index.committed_record_end(), 3);
+
+        // Restarting Live Watch on the reconciled BOM-only session + index must succeed.
+        let restarted = stopped
+            .session
+            .start_live_watch(
+                &stopped.index,
+                None,
+                WatchConfig {
+                    poll_interval: Duration::from_millis(15),
+                    cache_config: IndexCacheConfig::disabled(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let stopped2 = restarted.stop().unwrap();
+        assert_eq!(stopped2.final_status, WatchStatus::Stopped);
+        assert!(stopped2.index.is_complete());
     }
 }

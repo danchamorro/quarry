@@ -322,6 +322,8 @@ pub struct Document {
     live_watch_header_row: Option<Row>,
     pub live_watch_alert: Option<WatchAlert>,
     pub live_watch_tail_follow: bool,
+    pub live_watch_async_viewport: bool,
+    pub live_watch_viewport_dirty: bool,
     live_watch_last_ui_sync: Instant,
     live_watch_last_generation: u64,
     pub source_changed: bool,
@@ -627,6 +629,8 @@ impl Document {
             live_watch_header_row: None,
             live_watch_alert: None,
             live_watch_tail_follow: false,
+            live_watch_async_viewport: false,
+            live_watch_viewport_dirty: false,
             live_watch_last_ui_sync: Instant::now() - WATCH_REPAINT_THROTTLE,
             live_watch_last_generation: 0,
             source_changed: false,
@@ -2508,6 +2512,7 @@ impl Document {
         self.progress.columns_found = outcome.index.maximum_width();
         self.progress.done = outcome.index.is_complete();
         self.live_watch_tail_follow = false;
+        self.live_watch_viewport_dirty = false;
         self.live_watch_last_generation = outcome.snapshot.generation;
         self.live_watch_snapshot = Some(outcome.snapshot);
         self.live_watch_header_row = None;
@@ -2599,11 +2604,54 @@ impl Document {
             .data_start
             .saturating_add(max_viewport_start(available_data, self.visible_rows));
         self.viewport_start = target;
+        if self.live_watch_async_viewport {
+            self.live_watch_viewport_dirty = true;
+            return Ok(());
+        }
         if force_reload {
             self.buffered_rows.clear();
             self.whitespace.invalidate_rows();
         }
         self.load_buffer(target)
+    }
+
+    /// Takes any deferred unfiltered Live Watch viewport refresh as an off-UI-thread
+    /// [`ViewportReadPlan`], ensuring active-tab tail refreshes never perform disk I/O on the UI
+    /// thread and inactive watched tabs do not read from disk until activated.
+    pub fn take_live_watch_viewport_plan(&mut self) -> Option<ViewportReadPlan> {
+        if !self.live_watch_viewport_dirty {
+            return None;
+        }
+        self.live_watch_viewport_dirty = false;
+        if self.filter_active() {
+            return None;
+        }
+        let watch = self.live_watch.as_ref()?;
+        let available = self.available_rows();
+        if available <= self.data_start {
+            self.viewport_start = self.data_start;
+            self.buffered_rows.clear();
+            self.whitespace.invalidate_rows();
+            return None;
+        }
+        let capacity = self.visible_rows.saturating_add(2 * OVERSCAN_ROWS) as u64;
+        let last_start = available.saturating_sub(capacity).max(self.data_start);
+        let start = self
+            .viewport_start
+            .saturating_sub(OVERSCAN_ROWS as u64)
+            .max(self.data_start)
+            .min(last_start);
+        let count = available.saturating_sub(start).min(capacity) as usize;
+        if count == 0 {
+            return None;
+        }
+        Some(ViewportReadPlan {
+            session: Arc::clone(&self.session),
+            index: watch.index_snapshot(),
+            live_watch_reader: Some(watch.reader()),
+            start,
+            count,
+        })
     }
 
     /// Polls active Live Watch Mode, throttling steady-stream UI syncs to ~10 Hz while surfacing
@@ -2727,9 +2775,13 @@ impl Document {
                 self.schedule_filter_buffer(self.filter_viewport_start)?;
             }
         } else if rows_grew && self.buffered_rows.len() < self.visible_rows {
-            self.buffered_rows.clear();
-            self.whitespace.invalidate_rows();
-            self.load_buffer(self.viewport_start)?;
+            if self.live_watch_async_viewport {
+                self.live_watch_viewport_dirty = true;
+            } else {
+                self.buffered_rows.clear();
+                self.whitespace.invalidate_rows();
+                self.load_buffer(self.viewport_start)?;
+            }
         }
         Ok(true)
     }
