@@ -4956,21 +4956,14 @@ fn parse_size(value: &str) -> CliResult<u64> {
         .ok_or("size must be between 1 byte and u64::MAX")?;
 
     // Scale fractional digits with exact checked integer arithmetic (truncating only sub-byte
-    // remainders). With `multiplier <= 1024^4 < 2^41`, at most 18 fractional digits can affect
-    // whole bytes and `frac_val * multiplier < 10^31 << u128::MAX`.
-    let sig_frac = &frac_part[..frac_part.len().min(18)];
-    let frac_bytes = if sig_frac.is_empty() {
-        0
-    } else {
-        let frac_val = sig_frac
-            .parse::<u128>()
-            .map_err(|_| "size must be between 1 byte and u64::MAX")?;
-        let scale = 10_u128.pow(sig_frac.len() as u32);
-        frac_val
-            .checked_mul(multiplier)
-            .ok_or("size must be between 1 byte and u64::MAX")?
-            / scale
-    };
+    // remainders). Processing right-to-left preserves the exact floor `floor(frac * multiplier)`
+    // across arbitrarily many digits (e.g. `0.00000095367431640625MiB == 1 byte`) without ever
+    // overflowing `u128`, because `carry <= multiplier <= 1024^4`.
+    let mut frac_bytes: u128 = 0;
+    for digit in frac_part.bytes().rev() {
+        let cur = u128::from(digit - b'0') * multiplier + frac_bytes;
+        frac_bytes = cur / 10;
+    }
 
     let total = int_bytes
         .checked_add(frac_bytes)
@@ -7247,6 +7240,13 @@ mod tests {
             u64::MAX
         );
         assert_eq!(super::parse_size("1.5GB").unwrap(), 1_500_000_000);
+        // Binary fractions requiring >18 decimal digits (1 / 2^20 MiB == 1 byte) must stay exact.
+        assert_eq!(
+            super::parse_size("1.00000095367431640625MiB").unwrap(),
+            1_048_577
+        );
+        assert_eq!(super::parse_size("0.00000095367431640625MiB").unwrap(), 1);
+        assert_eq!(super::parse_size(".00000095367431640625MiB").unwrap(), 1);
         assert!(super::parse_size("18446744073709551616").is_err());
         assert!(super::parse_size("18446744073709551616.0B").is_err());
         assert!(super::parse_memory_budget("18446744073709551616").is_err());

@@ -833,31 +833,67 @@ fn omarchy_watch_paths(home: &Path) -> Vec<PathBuf> {
                     paths.insert(resolved_theme);
                 }
             }
-        } else if std::fs::symlink_metadata(&root).is_err()
-            && let Some(parent) = root.parent()
-            && let Ok(resolved_parent) = std::fs::canonicalize(parent)
-            && resolved_parent.is_dir()
-            && resolved_parent.starts_with(&canon_home)
-        {
-            paths.insert(resolved_parent);
+        } else if std::fs::symlink_metadata(&root).is_err() {
+            // Walk up to the nearest existing ancestor inside `canon_home` so newly created
+            // parents (e.g. `~/.local/state` appearing later) still wake the watcher.
+            let mut ancestor = root.parent();
+            while let Some(dir) = ancestor {
+                if let Ok(resolved_parent) = std::fs::canonicalize(dir)
+                    && resolved_parent.is_dir()
+                    && resolved_parent.starts_with(&canon_home)
+                {
+                    paths.insert(resolved_parent);
+                    break;
+                }
+                if dir == home {
+                    break;
+                }
+                ancestor = dir.parent();
+            }
         }
     }
 
     // Also watch the canonical parent directory of any allowlisted symlinked `colors.toml`,
-    // `theme.name`, or `theme.generation` target so direct edits or atomic renames in another
-    // allowlisted Omarchy root (e.g. `~/.local/share/omarchy/themes/custom/`) wake immediately.
+    // `theme.name`, or `theme.generation` target so direct edits, deletions, or atomic renames
+    // in another allowlisted Omarchy root (e.g. `~/.local/share/omarchy/themes/custom/`) wake
+    // immediately—including recovery when a symlinked target file is temporarily missing.
     for candidate in omarchy_candidate_color_files(home)
         .into_iter()
         .chain(omarchy_candidate_name_files(home))
         .chain(omarchy_candidate_generation_files(home))
     {
-        if let Ok(resolved) = std::fs::canonicalize(&candidate)
-            && is_within_allowed_roots(&resolved, &allowed_canon)
-            && let Some(parent) = resolved.parent()
-            && parent.is_dir()
-            && is_within_allowed_roots(parent, &allowed_canon)
+        if let Ok(resolved) = std::fs::canonicalize(&candidate) {
+            if is_within_allowed_roots(&resolved, &allowed_canon)
+                && let Some(parent) = resolved.parent()
+                && parent.is_dir()
+                && is_within_allowed_roots(parent, &allowed_canon)
+            {
+                paths.insert(parent.to_path_buf());
+            }
+        } else if std::fs::symlink_metadata(&candidate)
+            .is_ok_and(|meta| meta.file_type().is_symlink())
+            && let Ok(link_target) = std::fs::read_link(&candidate)
         {
-            paths.insert(parent.to_path_buf());
+            let target_path = if link_target.is_absolute() {
+                link_target
+            } else if let Some(link_dir) = candidate.parent() {
+                link_dir.join(link_target)
+            } else {
+                continue;
+            };
+            // Walk up from the broken symlink's target parent to the nearest existing allowlisted
+            // directory so recreating the target wakes the watcher cleanly.
+            let mut ancestor = target_path.parent();
+            while let Some(dir) = ancestor {
+                if let Ok(resolved_dir) = std::fs::canonicalize(dir)
+                    && resolved_dir.is_dir()
+                    && is_within_allowed_roots(&resolved_dir, &allowed_canon)
+                {
+                    paths.insert(resolved_dir);
+                    break;
+                }
+                ancestor = dir.parent();
+            }
         }
     }
 
@@ -1772,7 +1808,11 @@ cyan = "#449dab"
 
         let deadline = Instant::now() + Duration::from_secs(3);
         let updated = loop {
-            if let Some(theme) = watcher.take_update() {
+            if let Some(theme) = watcher.take_update()
+                && theme.warning.is_none()
+                && theme.source_label == "Omarchy (rose-pine-dawn)"
+                && theme.appearance == ThemeAppearance::Light
+            {
                 break theme;
             }
             assert!(
@@ -1784,7 +1824,13 @@ cyan = "#449dab"
         assert!(updated.warning.is_none());
         assert_eq!(updated.source_label, "Omarchy (rose-pine-dawn)");
         assert_eq!(updated.appearance, ThemeAppearance::Light);
-        assert!(notifications.load(Ordering::Acquire) >= 1);
+        while notifications.load(Ordering::Acquire) == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for OmarchyThemeWatcher on_change callback"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
 
         let drop_start = Instant::now();
         drop(watcher);

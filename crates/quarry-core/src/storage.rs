@@ -142,6 +142,7 @@ pub fn default_temp_dir_for_destination(destination: &Path) -> PathBuf {
     let parent = output_parent(destination).to_path_buf();
     #[cfg(target_os = "linux")]
     {
+        let system_temp = std::env::temp_dir();
         let tmpdir_env = std::env::var_os("TMPDIR")
             .filter(|v| !v.is_empty())
             .map(PathBuf::from);
@@ -151,8 +152,9 @@ pub fn default_temp_dir_for_destination(destination: &Path) -> PathBuf {
         let home = std::env::var_os("HOME")
             .filter(|v| !v.is_empty())
             .map(PathBuf::from);
-        resolve_default_temp_dir(
+        resolve_default_temp_dir_for_destination(
             parent,
+            system_temp,
             tmpdir_env,
             xdg_cache_home,
             home,
@@ -163,6 +165,36 @@ pub fn default_temp_dir_for_destination(destination: &Path) -> PathBuf {
     {
         parent
     }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn resolve_default_temp_dir_for_destination(
+    destination_parent: PathBuf,
+    system_temp: PathBuf,
+    tmpdir_env: Option<PathBuf>,
+    xdg_cache_home: Option<PathBuf>,
+    home: Option<PathBuf>,
+    is_ram_backed: impl Fn(&Path) -> bool,
+) -> PathBuf {
+    if !is_ram_backed(&destination_parent) {
+        return destination_parent;
+    }
+    // Destination is on a RAM-backed filesystem (e.g. `/tmp` or `/dev/shm`): route through the
+    // disk-backed default temp resolver so failed cache selection falls back to `system_temp`
+    // rather than spilling back onto a RAM-backed destination like `/dev/shm`.
+    if let Some(explicit) = tmpdir_env.filter(|p| p.is_absolute()) {
+        return explicit;
+    }
+    if let Some(cache_root) = xdg_cache_home
+        .filter(|p| p.is_absolute())
+        .or_else(|| home.filter(|p| p.is_absolute()).map(|h| h.join(".cache")))
+    {
+        let candidate = cache_root.join("quarry").join("tmp");
+        if ensure_private_cache_temp_dir(&cache_root).is_ok() && !is_ram_backed(&candidate) {
+            return candidate;
+        }
+    }
+    system_temp
 }
 
 #[cfg(target_os = "linux")]
@@ -1451,6 +1483,31 @@ mod tests {
                 "cache_root beneath a world-writable ancestor must be rejected"
             );
             fs::set_permissions(&shared_cache, fs::Permissions::from_mode(0o700)).unwrap();
+
+            // When a destination lives on a RAM-backed filesystem (e.g. `/dev/shm`) and cache
+            // selection fails, destination routing falls back to `system_temp`, not `/dev/shm`.
+            let fake_shm = dir.path().join("dev_shm");
+            let disk_tmp = dir.path().join("disk_tmp");
+            fs::create_dir_all(&fake_shm).unwrap();
+            fs::create_dir_all(&disk_tmp).unwrap();
+            let shm_fallback = super::resolve_default_temp_dir_for_destination(
+                fake_shm.clone(),
+                disk_tmp.clone(),
+                None,
+                None,
+                None,
+                |p| p == fake_shm,
+            );
+            assert_eq!(shm_fallback, disk_tmp);
+            let disk_kept = super::resolve_default_temp_dir_for_destination(
+                disk_tmp.clone(),
+                fake_tmp.clone(),
+                None,
+                Some(fake_xdg),
+                None,
+                |p| p == fake_shm || p == fake_tmp,
+            );
+            assert_eq!(disk_kept, disk_tmp);
         }
     }
 }

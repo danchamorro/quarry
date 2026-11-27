@@ -273,6 +273,12 @@ impl UiWakeup {
             wakeup: Arc::clone(self),
         }
     }
+
+    #[cfg(test)]
+    fn is_parked(&self) -> bool {
+        let state = self.state.lock().unwrap();
+        state.waker.is_some() && !state.signaled && !state.shutdown
+    }
 }
 
 struct UiWakeupFuture {
@@ -507,10 +513,14 @@ impl WorkbenchController {
                 .with_word_wrap_prefs(word_wrap_prefs)
         });
         cx.set_global(WorkbenchGlobal(entity.clone()));
+        Self::attach_coordinator(&entity, cx);
+        entity
+    }
 
+    fn attach_coordinator(entity: &Entity<Self>, cx: &mut App) {
         let wakeup = Arc::clone(&entity.read(cx).ui_wakeup);
         let observe_wakeup = Arc::clone(&wakeup);
-        cx.observe(&entity, move |this, cx| {
+        cx.observe(entity, move |this, cx| {
             let controller = this.read(cx);
             if controller.has_active_background_work() || controller.hud_targets_stale() {
                 observe_wakeup.notify();
@@ -553,8 +563,16 @@ impl WorkbenchController {
             }
         })
         .detach();
+    }
 
-        entity
+    #[cfg(test)]
+    pub fn start_coordinator_for_test(entity: &Entity<Self>, cx: &mut App) {
+        Self::attach_coordinator(entity, cx);
+    }
+
+    #[cfg(test)]
+    pub fn is_coordinator_parked(&self) -> bool {
+        self.ui_wakeup.is_parked()
     }
 
     #[cfg(test)]

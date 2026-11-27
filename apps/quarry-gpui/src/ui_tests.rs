@@ -5246,16 +5246,40 @@ fn idle_coordinator_wakes_for_filtered_edit_parks_on_duplicate_preview_and_updat
         crate::apply_light_theme(cx);
         bind_shortcuts(cx);
         install_menus(cx);
-        WorkbenchController::reset_for_test(
+        let entity = WorkbenchController::reset_for_test(
             cx,
             WorkbenchSchedulerConfig {
                 index_cache_enabled: false,
                 ..WorkbenchSchedulerConfig::default()
             },
-        )
+        );
+        WorkbenchController::start_coordinator_for_test(&entity, cx);
+        entity
     });
     let (handle, view) = open_test_window(cx, &controller);
     let win_id = cx.update(|cx| view.read(cx).window_id);
+
+    // Helper that drives ONLY the real spawned GPUI coordinator loop (without manually calling
+    // `poll_background` from the test) so we verify genuine wake and park transitions.
+    let wait_via_coordinator =
+        |cx: &mut TestAppContext, pred: &dyn Fn(&QuarryWindow, &App) -> bool| {
+            for _ in 0..200 {
+                cx.background_executor()
+                    .advance_clock(std::time::Duration::from_millis(32));
+                cx.run_until_parked();
+                let done = cx
+                    .update_window(handle.into(), |_, window, cx| {
+                        let _ = window;
+                        pred(view.read(cx), cx)
+                    })
+                    .unwrap();
+                if done {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            panic!("real GPUI coordinator did not reach expected state in time");
+        };
 
     // Open both files in separate directories and wait for indexing to settle cleanly.
     let (id_a, id_b) = cx.update(|cx| {
@@ -5289,9 +5313,10 @@ fn idle_coordinator_wakes_for_filtered_edit_parks_on_duplicate_preview_and_updat
             .unwrap();
         (id_a, id_b)
     });
-    wait_for_ui(cx, handle, &controller, &view, |q, _, cx| {
+    wait_via_coordinator(cx, &|q, cx| {
         q.snapshot(cx).is_some_and(|s| s.index_done)
             && !controller.read(cx).has_active_background_work()
+            && controller.read(cx).is_coordinator_parked()
     });
     assert!(
         cx.update(|cx| {
@@ -5319,15 +5344,15 @@ fn idle_coordinator_wakes_for_filtered_edit_parks_on_duplicate_preview_and_updat
     );
     let _ = id_b;
 
-    // Wait for tab A to settle cleanly.
-    wait_for_ui(cx, handle, &controller, &view, |q, _, cx| {
+    // Wait for tab A to settle and confirm the coordinator parks cleanly.
+    wait_via_coordinator(cx, &|q, cx| {
         q.snapshot(cx).is_some_and(|s| s.index_done)
             && !controller.read(cx).has_active_background_work()
+            && controller.read(cx).is_coordinator_parked()
     });
 
-    // Apply a filter on city == Boston (2 matching rows), wait until idle, then edit one matching
-    // cell and verify `has_active_background_work()` immediately turns `true` so a parked
-    // coordinator wakes and refreshes matches.
+    // Apply a filter on city == Boston (2 matching rows), wait until parked, then edit one
+    // matching cell and verify the parked coordinator wakes on its own and refreshes to 1 match.
     cx.update_window(handle.into(), |_, window, cx| {
         view.update(cx, |q, cx| {
             q.apply_quick_cell_filter(
@@ -5341,10 +5366,11 @@ fn idle_coordinator_wakes_for_filtered_edit_parks_on_duplicate_preview_and_updat
         });
     })
     .unwrap();
-    wait_for_ui(cx, handle, &controller, &view, |q, _, cx| {
+    wait_via_coordinator(cx, &|q, cx| {
         q.snapshot(cx)
             .is_some_and(|s| s.filter_active && s.filter_done && s.available_rows == 2)
             && !controller.read(cx).has_active_background_work()
+            && controller.read(cx).is_coordinator_parked()
     });
 
     let active_after_edit = cx.update(|cx| {
@@ -5359,15 +5385,16 @@ fn idle_coordinator_wakes_for_filtered_edit_parks_on_duplicate_preview_and_updat
         active_after_edit,
         "editing a cell while filtered must report active background work so a parked coordinator wakes to refresh matches"
     );
-    wait_for_ui(cx, handle, &controller, &view, |q, _, cx| {
+    wait_via_coordinator(cx, &|q, cx| {
         q.snapshot(cx)
             .is_some_and(|s| s.filter_active && s.filter_done && s.available_rows == 1)
             && !controller.read(cx).has_active_background_work()
+            && controller.read(cx).is_coordinator_parked()
     });
 
     // Clear filter, run Find Duplicates preview, and verify that once the confirmation modal is
-    // ready (`StructuralJob::DuplicatePreview`), `has_active_background_work()` returns `false`
-    // so the 32 ms coordinator timer parks while awaiting user input.
+    // ready (`StructuralJob::DuplicatePreview`), the real coordinator parks without polling while
+    // waiting on user confirmation.
     cx.update(|cx| {
         controller.update(cx, |c, cx| {
             c.clear_filter_active(win_id, cx).unwrap();
@@ -5381,10 +5408,11 @@ fn idle_coordinator_wakes_for_filtered_edit_parks_on_duplicate_preview_and_updat
             .unwrap();
         });
     });
-    wait_for_ui(cx, handle, &controller, &view, |q, _, cx| {
+    wait_via_coordinator(cx, &|q, cx| {
         q.snapshot(cx)
             .is_some_and(|s| s.duplicate_preview.is_some())
             && !controller.read(cx).has_active_background_work()
+            && controller.read(cx).is_coordinator_parked()
     });
     assert!(
         cx.update(|cx| {
@@ -5393,7 +5421,8 @@ fn idle_coordinator_wakes_for_filtered_edit_parks_on_duplicate_preview_and_updat
                 .active_snapshot(win_id)
                 .is_some_and(|s| s.duplicate_preview.is_some())
                 && !controller.read(cx).has_active_background_work()
+                && controller.read(cx).is_coordinator_parked()
         }),
-        "completed DuplicatePreview waiting on user confirmation must allow coordinator to park"
+        "completed DuplicatePreview waiting on user confirmation must park the real coordinator"
     );
 }

@@ -3128,19 +3128,12 @@ impl DirectoryWatch {
 
             *incomplete = false;
             let desired: BTreeSet<PathBuf> = paths.iter().cloned().collect();
-            let stale: Vec<(PathBuf, std::ffi::c_int)> = watches
-                .iter()
-                .filter(|(p, _)| !desired.contains(*p))
-                .map(|(p, &wd)| (p.clone(), wd))
-                .collect();
-            for (path, wd) in stale {
-                watches.remove(&path);
-                // SAFETY: `inotify_fd` is owned and `wd` came from `inotify_add_watch`.
-                unsafe {
-                    let _ = linux_sys::inotify_rm_watch(inotify_fd.raw(), wd);
-                }
-            }
+            let mut next_watches = std::collections::BTreeMap::new();
+            let mut retained_wds = BTreeSet::new();
 
+            // Register all desired paths first before retiring old descriptors so two paths
+            // sharing an inode (which receive the same watch descriptor on Linux) never lose
+            // their watch when one of them is retargeted or removed.
             for path in desired {
                 let Ok(c_path) = CString::new(path.as_os_str().as_bytes()) else {
                     *incomplete = true;
@@ -3151,24 +3144,24 @@ impl DirectoryWatch {
                     linux_sys::inotify_add_watch(inotify_fd.raw(), c_path.as_ptr(), WATCH_MASK)
                 };
                 if wd >= 0 {
-                    if let Some(prev_wd) = watches.insert(path, wd)
-                        && prev_wd != wd
-                    {
-                        // SAFETY: remove replaced watch descriptor for the same path.
-                        unsafe {
-                            let _ = linux_sys::inotify_rm_watch(inotify_fd.raw(), prev_wd);
-                        }
-                    }
+                    next_watches.insert(path, wd);
+                    retained_wds.insert(wd);
                 } else {
                     *incomplete = true;
-                    if let Some(old_wd) = watches.remove(&path) {
-                        // SAFETY: remove watch descriptor for a path that no longer exists.
-                        unsafe {
-                            let _ = linux_sys::inotify_rm_watch(inotify_fd.raw(), old_wd);
-                        }
+                }
+            }
+
+            let mut retired_wds = BTreeSet::new();
+            for &old_wd in watches.values() {
+                if !retained_wds.contains(&old_wd) && retired_wds.insert(old_wd) {
+                    // SAFETY: `inotify_fd` is owned and `old_wd` is no longer referenced by any
+                    // active watch in `next_watches`.
+                    unsafe {
+                        let _ = linux_sys::inotify_rm_watch(inotify_fd.raw(), old_wd);
                     }
                 }
             }
+            *watches = next_watches;
             watches.len()
         }
         #[cfg(not(all(
@@ -4681,6 +4674,9 @@ mod tests {
             );
             assert_eq!(watch.sync_paths(&paths), 2);
             assert!(!watch.has_incomplete_watches());
+            // Drain any queued `IN_IGNORED` events from removing/re-adding `theme` above so the
+            // swap assertion below observes the real directory swap rather than stale removal noise.
+            while watch.wait(Some(Duration::from_millis(30))) == DirectoryWatchEvent::Changed {}
             let staged = dir.path().join("next-theme");
             std::fs::create_dir_all(&staged).unwrap();
             std::fs::write(staged.join("colors.toml"), "mode = \"light\"\n").unwrap();
