@@ -1909,32 +1909,42 @@ fn try_render_grouped(
     tier: PrintTier,
 ) -> Option<String> {
     let compact = matches!(tier, PrintTier::Compact | PrintTier::CompactReordered);
-    let mut groups: Vec<(usize, usize, &[&FilterPredicate], &[&FilterPredicate])> = by_column
-        .iter()
-        .map(|(&column, (inclusions, exclusions))| {
-            (
-                column,
-                column + 1,
-                inclusions.as_slice(),
-                exclusions.as_slice(),
-            )
-        })
-        .collect();
-
-    if matches!(tier, PrintTier::CompactReordered) {
-        // Place groups ending with a non-word byte (`"` or `/`) before groups ending with a
-        // numeric digit so the final group avoids a trailing separator space before `AND`.
-        groups.sort_by_key(|&(column, _, inclusions, exclusions)| {
-            let ends_word = if exclusions.is_empty() {
-                inclusions
-                    .last()
-                    .is_some_and(|pred| predicate_ends_with_word_byte(pred))
-            } else {
-                false
-            };
-            (ends_word, column)
-        });
-    }
+    let groups: Vec<(usize, usize, &[&FilterPredicate], &[&FilterPredicate])> =
+        if matches!(tier, PrintTier::CompactReordered) {
+            // Split each column's inclusion OR-group and exclusion list into independent top-level
+            // AND clauses so exclusions (which always end with `"`) and text/regex inclusion groups
+            // can precede numeric-ending inclusion groups on the same or different columns.
+            let mut clauses = Vec::with_capacity(by_column.len() * 2);
+            for (&column, (inclusions, exclusions)) in by_column {
+                let one_based = column + 1;
+                if !exclusions.is_empty() {
+                    clauses.push((column, one_based, &[][..], exclusions.as_slice()));
+                }
+                if !inclusions.is_empty() {
+                    clauses.push((column, one_based, inclusions.as_slice(), &[][..]));
+                }
+            }
+            clauses.sort_by_key(|&(column, _, inclusions, exclusions)| {
+                let ends_word = exclusions.is_empty()
+                    && inclusions
+                        .last()
+                        .is_some_and(|pred| predicate_ends_with_word_byte(pred));
+                (ends_word, column, exclusions.is_empty())
+            });
+            clauses
+        } else {
+            by_column
+                .iter()
+                .map(|(&column, (inclusions, exclusions))| {
+                    (
+                        column,
+                        column + 1,
+                        inclusions.as_slice(),
+                        exclusions.as_slice(),
+                    )
+                })
+                .collect()
+        };
 
     // Choose each column's label in group order (respecting separator costs in compact tiers).
     let mut labels = Vec::with_capacity(groups.len());
@@ -2532,6 +2542,31 @@ mod tests {
             )
             .unwrap(),
             q_reorder
+        );
+
+        // 10. Same-column exclusion-first compact fallback (`#1!="<65,523 a's>"AND#1>1`):
+        //     emitting the exclusion before the numeric inclusion saves the space before `AND`.
+        let excl_prefix = "#1!=\"";
+        let excl_suffix = "\"AND#1>1";
+        let excl_fill = "a".repeat(MAX_FILTER_EXPR_BYTES - excl_prefix.len() - excl_suffix.len());
+        let exact_excl_first = format!("{excl_prefix}{excl_fill}{excl_suffix}");
+        assert_eq!(exact_excl_first.len(), MAX_FILTER_EXPR_BYTES);
+        let q_excl_first = parse_filter_expr(
+            &exact_excl_first,
+            &open_headerless,
+            CaseSensitivity::Sensitive,
+        )
+        .unwrap();
+        let printed_excl_first = print_filter_expr(&q_excl_first, &open_headerless).unwrap();
+        assert!(printed_excl_first.len() <= MAX_FILTER_EXPR_BYTES);
+        assert_eq!(
+            parse_filter_expr(
+                &printed_excl_first,
+                &open_headerless,
+                CaseSensitivity::Sensitive
+            )
+            .unwrap(),
+            q_excl_first
         );
     }
 
