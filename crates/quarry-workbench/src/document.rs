@@ -388,6 +388,7 @@ pub struct ActiveFilterRead {
     pub job: FilterReadJob,
     pub started: Instant,
     pub cancel_requested: bool,
+    pub tail_follow: bool,
 }
 
 type BookmarkOffsetBatch = Result<Option<Vec<(u64, u64)>>, QuarryError>;
@@ -2585,13 +2586,18 @@ impl Document {
     fn scroll_to_live_tail(&mut self, force_reload: bool) -> Result<(), String> {
         if self.filter_active() {
             let available = self.available_filter_rows();
-            let target = max_viewport_start(available, self.visible_rows);
-            self.filter_viewport_start = target;
-            if force_reload {
+            if available == 0 {
+                self.filter_viewport_start = 0;
                 self.filtered_rows.clear();
                 self.whitespace.invalidate_rows();
+                self.cancel_filter_read_for_navigation();
+                return Ok(());
             }
-            return self.schedule_filter_buffer(target);
+            let target = max_viewport_start(available, self.visible_rows);
+            self.filter_viewport_start = target;
+            // Preserve the current filtered buffer while the background tail read refreshes so
+            // sustained matching appends never blank the grid or starve completed reads.
+            return self.schedule_filter_buffer_inner(target, true);
         }
         let available_data = self.available_data_rows();
         if available_data == 0 {
@@ -2770,9 +2776,7 @@ impl Document {
             if live_filter_query_changed
                 || (matches_grew && self.filtered_rows.len() < self.visible_rows)
             {
-                self.filtered_rows.clear();
-                self.whitespace.invalidate_rows();
-                self.schedule_filter_buffer(self.filter_viewport_start)?;
+                self.schedule_filter_buffer_inner(self.filter_viewport_start, true)?;
             }
         } else if rows_grew && self.buffered_rows.len() < self.visible_rows {
             if self.live_watch_async_viewport {
@@ -3545,8 +3549,14 @@ impl Document {
             .take()
             .expect("completed filter read should be active");
         let desired = self.filter_read_window(self.filter_viewport_start);
+        let install_coalesced_live = active.tail_follow
+            && !active.cancel_requested
+            && self.filter_active()
+            && self.is_live_watching();
         match active.job.wait() {
-            Ok(FilterReadOutcome::Complete(rows)) if desired == Some(active.window) => {
+            Ok(FilterReadOutcome::Complete(rows))
+                if desired == Some(active.window) || install_coalesced_live =>
+            {
                 let loaded_columns = rows.iter().map(|row| row.fields.len()).max().unwrap_or(0);
                 if loaded_columns > self.total_columns {
                     self.ensure_column_count(loaded_columns);
@@ -3568,7 +3578,10 @@ impl Document {
                     && desired.is_some_and(|window| window != active.window)
                 {
                     self.pending_filter_read = desired;
-                    let _ = self.schedule_filter_buffer(self.filter_viewport_start);
+                    let _ = self.schedule_filter_buffer_inner(
+                        self.filter_viewport_start,
+                        self.is_live_watching() && self.live_watch_tail_follow,
+                    );
                 } else {
                     self.pending_filter_read = None;
                 }
@@ -3579,7 +3592,10 @@ impl Document {
         if self.filter_waiting_for_page() {
             return Ok(());
         }
-        self.schedule_filter_buffer(self.filter_viewport_start)
+        self.schedule_filter_buffer_inner(
+            self.filter_viewport_start,
+            self.is_live_watching() && self.live_watch_tail_follow,
+        )
     }
 
     pub fn start_filtered_export(&mut self, destination: PathBuf) -> Result<(), AppMessage> {
@@ -5764,6 +5780,14 @@ impl Document {
     }
 
     pub fn schedule_filter_buffer(&mut self, viewport_start: u64) -> Result<(), String> {
+        self.schedule_filter_buffer_inner(viewport_start, false)
+    }
+
+    fn schedule_filter_buffer_inner(
+        &mut self,
+        viewport_start: u64,
+        is_tail_follow: bool,
+    ) -> Result<(), String> {
         let Some(window) = self.filter_read_window(viewport_start) else {
             self.cancel_filter_read_for_navigation();
             self.filter_buffer_start = 0;
@@ -5797,6 +5821,10 @@ impl Document {
         if let Some(active) = self.filter_read.as_mut() {
             if active.window == window && !active.cancel_requested {
                 self.pending_filter_read = None;
+            } else if is_tail_follow && active.tail_follow && !active.cancel_requested {
+                // Keep one live-watch filtered tail read in flight and coalesce subsequent tail
+                // window updates instead of cancelling and discarding completed results.
+                self.pending_filter_read = Some(window);
             } else {
                 if !active.cancel_requested {
                     active.job.cancel();
@@ -5807,10 +5835,18 @@ impl Document {
             return Ok(());
         }
 
-        self.start_filter_read(window)
+        self.start_filter_read_with_mode(window, is_tail_follow)
     }
 
     pub fn start_filter_read(&mut self, window: FilterReadWindow) -> Result<(), String> {
+        self.start_filter_read_with_mode(window, false)
+    }
+
+    fn start_filter_read_with_mode(
+        &mut self,
+        window: FilterReadWindow,
+        tail_follow: bool,
+    ) -> Result<(), String> {
         self.pending_filter_read = None;
         let job = if let Some(watch) = &self.live_watch {
             watch
@@ -5837,6 +5873,7 @@ impl Document {
             job,
             started: Instant::now(),
             cancel_requested: false,
+            tail_follow,
         });
         Ok(())
     }

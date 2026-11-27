@@ -1174,3 +1174,100 @@ fn stop_live_watch_preserves_field_limit_on_static_and_filtered_reloads() {
         "post-stop filtered reader must preserve field cap; got {filtered_err:?}"
     );
 }
+
+#[test]
+fn live_watch_filtered_tail_coalesces_sustained_appends_without_blanking_grid() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("filtered_tail_stream.csv");
+    let mut initial = String::from("id,level\n");
+    for i in 1..=200 {
+        initial.push_str(&format!("{i},WARN\n"));
+    }
+    std::fs::write(&path, &initial).unwrap();
+
+    let (mut scheduler, doc_id) = open_completed_scheduler(&path);
+    scheduler
+        .start_live_watch_with_config(
+            doc_id,
+            WatchConfig {
+                poll_interval: Duration::from_millis(15),
+                cache_config: quarry_core::IndexCacheConfig::disabled(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    let query = FilterQuery::single(1, FilterOperator::Equals, b"WARN".to_vec());
+    scheduler
+        .tab_mut(doc_id)
+        .unwrap()
+        .document
+        .as_mut()
+        .unwrap()
+        .start_filter(query)
+        .unwrap();
+    assert!(wait_until(Duration::from_secs(3), || {
+        let _ = scheduler.poll_all();
+        let doc = scheduler.tab(doc_id).unwrap().document.as_ref().unwrap();
+        doc.live_watch_filter_attach.is_none() && !doc.filtered_rows.is_empty()
+    }));
+
+    // Append one matching row before each of 10 consecutive scheduler polls (mirroring a steady
+    // writer outpacing poll ticks). Buffered and visible filtered rows must never drop to zero.
+    let mut writer = FsOpenOptions::new().append(true).open(&path).unwrap();
+    for step in 1..=10 {
+        let id = 200 + step;
+        writeln!(writer, "{id},WARN").unwrap();
+        writer.flush().unwrap();
+        scheduler
+            .tab(doc_id)
+            .unwrap()
+            .document
+            .as_ref()
+            .unwrap()
+            .live_watch
+            .as_ref()
+            .unwrap()
+            .nudge();
+        let expected_matches = 200 + step as u64;
+        assert!(wait_until(Duration::from_secs(3), || {
+            scheduler
+                .tab(doc_id)
+                .unwrap()
+                .document
+                .as_ref()
+                .unwrap()
+                .live_watch
+                .as_ref()
+                .unwrap()
+                .snapshot()
+                .filter_matches_found
+                == Some(expected_matches)
+        }));
+        // Give any in-flight filtered read a moment to finish before `poll_all()` runs
+        // `poll_live_watch()` ahead of `poll_filter_read()`, reproducing the exact ordering bug.
+        thread::sleep(Duration::from_millis(20));
+        assert!(scheduler.poll_all().is_empty());
+        let doc = scheduler.tab(doc_id).unwrap().document.as_ref().unwrap();
+        assert!(
+            !doc.filtered_rows.is_empty(),
+            "step {step}: filtered_rows must not be cleared or starved during sustained appends"
+        );
+        assert!(
+            !doc.visible_filter_rows().is_empty(),
+            "step {step}: visible_filter_rows must remain populated during sustained appends"
+        );
+    }
+
+    // Once appends stop, the final coalesced read settles on match 210.
+    assert!(wait_until(Duration::from_secs(3), || {
+        let _ = scheduler.poll_all();
+        let doc = scheduler.tab(doc_id).unwrap().document.as_ref().unwrap();
+        doc.filter_read.is_none()
+            && doc
+                .filtered_rows
+                .last()
+                .is_some_and(|row| row.fields[0].as_slice() == b"210")
+    }));
+    let _ = scheduler.stop_live_watch(doc_id).unwrap();
+}
