@@ -1231,6 +1231,38 @@ expressions are available in the CLI via `quarry search --regex --query PATTERN`
   and at most 16 regex predicates per compound filter query. Empty, malformed,
   or oversized patterns fail immediately with a clear error.
 
+### Filter expressions (`--where`)
+
+In the CLI, `quarry filter` and `quarry export` accept `--where EXPR` (mutually
+exclusive with `--column`/`--operator`/`--value`/`--and`) to express any
+representable filter query in one readable string:
+
+```sh
+quarry export orders.csv --output filtered.csv \
+  --where 'state == "TX" OR state == "FL" AND [order total] BETWEEN 10 AND 100 AND code =~ /^ERR-\d+$/'
+```
+
+- **Exact grammar:** Expressions represent a conjunction (`AND`) of per-column
+  groups, where `OR` combines alternative inclusion rules on the **same column**
+  and `!=` excludes exact text values on that column. Cross-column `OR`,
+  parentheses, `NOT`, `!=` inside `OR`, and unrepresentable same-column `AND`
+  (such as `amount > 1 AND amount < 5`) are rejected explicitly with a byte
+  position and reason. Inclusive range pairs (`amount >= 10 AND amount <= 100`)
+  fold automatically into `amount BETWEEN 10 AND 100`.
+- **Column references:** Use bare header names (`state`), bracketed names for
+  headers containing spaces, punctuation, or keywords (`[order total]`, `[and]`,
+  escape a literal `]` as `]]`), or 1-based `#N` column indices (`#1`, `#142`).
+  Duplicate/ambiguous header names are rejected explicitly (never "first match
+  wins") with the matching `#N` indices.
+- **Exact text vs. numeric comparisons:** Text operators (`==`, `!=`,
+  `CONTAINS`, and `=~` / `regex`) require double-quoted strings (`"..."`,
+  supporting `\"`, `\\`, `\n`, `\r`, `\t`, and `\xHH`; `=~` also accepts
+  `/pattern/` literals). Numeric operators (`>`, `>=`, `<`, `<=`, and
+  `BETWEEN lower AND upper`) require unquoted numbers (`100`, `-12.5`, `1e3`)
+  and never coerce quoted strings. Pass `--ignore-case` to enable
+  case-insensitive matching (ASCII case folding for literal text operators,
+  Unicode simple case folding for `=~`).
+
 The duplicate dialog starts with **Match case** off each time. Search inside the
 **Columns** popover is always case-insensitive. Split matches its separator
 exactly, while Combine inserts its separator literally. Neither has a case

@@ -8,6 +8,7 @@ mod destination;
 mod encoding;
 mod export;
 mod filter;
+mod filter_expr;
 mod index;
 mod inspection;
 mod join;
@@ -71,6 +72,10 @@ pub use export::{
 pub use filter::{
     FilterEdits, FilterIndex, FilterJob, FilterMatch, FilterOperator, FilterPredicate,
     FilterProgress, FilterQuery, FilterReadJob, FilterReadOutcome, FilterReadProgress,
+};
+pub use filter_expr::{
+    FilterColumnSchema, FilterExprError, FilterExprSpan, MAX_FILTER_EXPR_BYTES,
+    MAX_FILTER_EXPR_PREDICATES, parse_filter_expr, print_filter_expr,
 };
 #[cfg(any(test, debug_assertions))]
 #[doc(hidden)]
@@ -1048,6 +1053,24 @@ impl Session {
         self.section
             .as_ref()
             .and_then(|meta| meta.header_row.as_ref())
+    }
+
+    /// Returns the column schema (header names when present) for parsing and printing
+    /// exact [`FilterQuery`] expressions against this session.
+    pub fn filter_column_schema(&self) -> FilterColumnSchema<'_> {
+        let headers: &[Vec<u8>] = if self.dialect.has_header {
+            if self.section_is_interior() {
+                self.section_header_row()
+                    .map_or(&[], |row| row.fields.as_slice())
+            } else {
+                self.first_rows
+                    .first()
+                    .map_or(&[], |row| row.fields.as_slice())
+            }
+        } else {
+            &[]
+        };
+        FilterColumnSchema::with_headers(headers, None)
     }
 
     /// Active half-open byte range `[start, end)` viewed by this session (`[0, file_size)` for
