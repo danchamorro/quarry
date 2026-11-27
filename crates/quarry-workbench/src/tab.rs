@@ -217,7 +217,8 @@ impl WorkbenchTab {
         )
     }
 
-    /// True when the tab's document owns any active background read or write worker.
+    /// True when the tab's document owns any active background read or write worker,
+    /// including a pending duplicate-removal confirmation modal (used for edit blocking and dormancy).
     pub fn document_busy(&self) -> bool {
         self.document.as_ref().is_some_and(|document| {
             document.job.is_some()
@@ -228,19 +229,51 @@ impl WorkbenchTab {
                 || document.search_job.is_some()
                 || document.is_filter_scanning()
                 || document.filter_rows_loading()
+                || document.filter_refresh_pending
                 || document.save_job.is_some()
                 || document.export_job.is_some()
                 || document.structural_job.is_some()
         })
     }
 
-    /// Returns `true` when this tab has any active background job, Live Watch session, or
-    /// whitespace inspection worker requiring periodic UI polling.
+    /// True when this tab owns an actively running background job (excluding a completed
+    /// `DuplicatePreview` that is simply waiting on user confirmation).
+    pub fn has_running_document_job(&self) -> bool {
+        self.document.as_ref().is_some_and(|document| {
+            document.job.is_some()
+                || document.bookmark_offset_job.is_some()
+                || document.bookmark_offset_refresh_pending
+                || document.section_verify_job.is_some()
+                || document.decompressing()
+                || document.search_job.is_some()
+                || document.is_filter_scanning()
+                || document.filter_rows_loading()
+                || document.filter_refresh_pending
+                || document.save_job.is_some()
+                || document.export_job.is_some()
+                || document
+                    .structural_job
+                    .as_ref()
+                    .is_some_and(|job| !matches!(job, StructuralJob::DuplicatePreview { .. }))
+        })
+    }
+
+    /// Returns `true` when this tab has any running background job or Live Watch session
+    /// requiring periodic UI polling (independent of active-tab whitespace harvesting).
     pub fn has_background_activity(&self) -> bool {
-        self.document_busy()
+        self.has_running_document_job()
             || self.document.as_ref().is_some_and(|document| {
-                document.is_live_watching() || document.whitespace.is_busy()
+                document.is_live_watching() || document.live_watch_viewport_dirty
             })
+    }
+
+    /// Returns `true` when this tab has an active whitespace inspection batch waiting to be polled.
+    /// Callers should check this only for visible/active tabs because hidden tabs do not poll
+    /// whitespace batches until re-activated.
+    pub fn has_active_whitespace_work(&self) -> bool {
+        self.document
+            .as_ref()
+            .is_some_and(|document| document.whitespace.is_busy())
     }
 
     /// Counts document file operations and structural analysis against the global write limit.

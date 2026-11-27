@@ -102,8 +102,8 @@ pub fn check_storage(
 /// On Linux, `/tmp` is frequently mounted on RAM-backed `tmpfs` (e.g., Omarchy, Arch, Fedora),
 /// which would silently consume RAM during multi-GB sorts or decompression. When `TMPDIR` is not
 /// explicitly set and the system temp directory is RAM-backed (`tmpfs`/`ramfs`), Quarry prefers
-/// a private disk-backed folder under `$XDG_CACHE_HOME/quarry/tmp` (or `$HOME/.cache/quarry/tmp`),
-/// falling back to `std::env::temp_dir()` if unavailable.
+/// a private (`0700`) disk-backed folder under `$XDG_CACHE_HOME/quarry/tmp` (or
+/// `$HOME/.cache/quarry/tmp`), falling back to `std::env::temp_dir()` if unavailable.
 pub fn default_temp_dir() -> PathBuf {
     #[cfg(target_os = "linux")]
     {
@@ -128,6 +128,40 @@ pub fn default_temp_dir() -> PathBuf {
     #[cfg(not(target_os = "linux"))]
     {
         std::env::temp_dir()
+    }
+}
+
+/// Returns the default temporary run directory for an operation writing to `destination`.
+///
+/// Normally temporary runs live beside `destination` so multi-GB sorts targeting an external
+/// drive stay on that drive. On Linux, when `destination`'s parent directory is mounted on a
+/// RAM-backed filesystem (`tmpfs`/`ramfs`) and `TMPDIR` is not explicitly set, Quarry routes
+/// temporary runs to [`default_temp_dir`] (the private disk-backed cache scratch folder) while
+/// keeping final output staging beside `destination`.
+pub fn default_temp_dir_for_destination(destination: &Path) -> PathBuf {
+    let parent = output_parent(destination).to_path_buf();
+    #[cfg(target_os = "linux")]
+    {
+        let tmpdir_env = std::env::var_os("TMPDIR")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from);
+        let xdg_cache_home = std::env::var_os("XDG_CACHE_HOME")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from);
+        let home = std::env::var_os("HOME")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from);
+        resolve_default_temp_dir(
+            parent,
+            tmpdir_env,
+            xdg_cache_home,
+            home,
+            is_ram_backed_filesystem,
+        )
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        parent
     }
 }
 
@@ -161,65 +195,119 @@ fn resolve_default_temp_dir(
     else {
         return system_temp;
     };
-    let quarry_dir = cache_root.join("quarry");
-    let candidate = quarry_dir.join("tmp");
-    if ensure_private_cache_temp_dir(&cache_root, &quarry_dir, &candidate).is_ok()
-        && !is_ram_backed(&candidate)
-    {
+    let candidate = cache_root.join("quarry").join("tmp");
+    if ensure_private_cache_temp_dir(&cache_root).is_ok() && !is_ram_backed(&candidate) {
         return candidate;
     }
     system_temp
 }
 
-#[cfg(any(target_os = "linux", test))]
-fn ensure_private_cache_temp_dir(
-    cache_root: &Path,
-    quarry_dir: &Path,
-    candidate: &Path,
-) -> io::Result<()> {
-    fs::create_dir_all(cache_root)?;
-    for dir in [quarry_dir, candidate] {
-        match fs::symlink_metadata(dir) {
-            Ok(meta) => {
-                if meta.file_type().is_symlink() || !meta.is_dir() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "cache temp directory cannot be a symlink or non-directory",
-                    ));
-                }
-                #[cfg(unix)]
-                if meta.uid() != rustix::process::geteuid().as_raw() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::PermissionDenied,
-                        "cache temp directory must be owned by the current user",
-                    ));
-                }
+#[cfg(all(unix, any(target_os = "linux", test)))]
+fn open_or_create_private_subdir(
+    parent: &rustix::fd::OwnedFd,
+    name: &str,
+    require_owner_only: bool,
+) -> io::Result<rustix::fd::OwnedFd> {
+    use rustix::fs::{Mode, OFlags};
+
+    match rustix::fs::mkdirat(parent, name, Mode::RWXU) {
+        Ok(()) => {}
+        Err(rustix::io::Errno::EXIST) => {}
+        Err(err) => return Err(io::Error::from(err)),
+    }
+
+    let fd = rustix::fs::openat(
+        parent,
+        name,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(io::Error::from)?;
+
+    let stat = rustix::fs::fstat(&fd).map_err(io::Error::from)?;
+    if stat.st_uid != rustix::process::geteuid().as_raw() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "cache temp directory must be owned by the current user",
+        ));
+    }
+    let perm = stat.st_mode & 0o777;
+    if require_owner_only {
+        if perm != 0o700 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "cache temp directory must have private writable mode 0700",
+            ));
+        }
+    } else if (perm & 0o022) != 0 || (perm & 0o500) != 0o500 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "cache parent directory must be owner-searchable and not group/world writable",
+        ));
+    }
+    Ok(fd)
+}
+
+#[cfg(all(unix, any(target_os = "linux", test)))]
+fn verify_dir_fd_writable(dir_fd: &rustix::fd::OwnedFd) -> io::Result<()> {
+    use rustix::fs::{AtFlags, Mode, OFlags};
+
+    for _ in 0..32 {
+        let id = NEXT_PROBE.fetch_add(1, Ordering::Relaxed);
+        let probe_name = format!(".quarry-tmp-probe-{}-{id}", std::process::id());
+        match rustix::fs::openat(
+            dir_fd,
+            probe_name.as_str(),
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::from_raw_mode(0o600),
+        ) {
+            Ok(probe_fd) => {
+                let mut probe_file = File::from(probe_fd);
+                let written = probe_file.write_all(&[0]);
+                drop(probe_file);
+                let removed = rustix::fs::unlinkat(dir_fd, probe_name.as_str(), AtFlags::empty())
+                    .map_err(io::Error::from);
+                written?;
+                removed?;
+                return Ok(());
             }
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {
-                let mut builder = fs::DirBuilder::new();
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::DirBuilderExt;
-                    builder.mode(0o700);
-                }
-                match builder.create(dir) {
-                    Ok(()) => {}
-                    Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
-                        let meta = fs::symlink_metadata(dir)?;
-                        if meta.file_type().is_symlink() || !meta.is_dir() {
-                            return Err(io::Error::new(
-                                io::ErrorKind::InvalidInput,
-                                "cache temp directory cannot be a symlink or non-directory",
-                            ));
-                        }
-                    }
-                    Err(err) => return Err(err),
-                }
-            }
-            Err(err) => return Err(err),
+            Err(rustix::io::Errno::EXIST) => continue,
+            Err(err) => return Err(io::Error::from(err)),
         }
     }
-    Ok(())
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "could not reserve a private cache temp probe",
+    ))
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn ensure_private_cache_temp_dir(cache_root: &Path) -> io::Result<()> {
+    fs::create_dir_all(cache_root)?;
+    #[cfg(unix)]
+    {
+        use rustix::fs::{CWD, Mode, OFlags};
+
+        let root_fd = rustix::fs::openat(
+            CWD,
+            cache_root,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(io::Error::from)?;
+        let quarry_fd = open_or_create_private_subdir(&root_fd, "quarry", false)?;
+        let tmp_fd = open_or_create_private_subdir(&quarry_fd, "tmp", true)?;
+        verify_dir_fd_writable(&tmp_fd)?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let candidate = cache_root.join("quarry").join("tmp");
+        fs::create_dir_all(&candidate)?;
+        inspect_storage(&candidate)
+            .map(|_| ())
+            .map_err(|err| io::Error::other(err.to_string()))
+    }
 }
 
 /// Strictly validate a user-selected scratch directory before use or persistence:
@@ -1201,9 +1289,13 @@ mod tests {
         );
         assert_eq!(all_ram, fake_tmp);
 
-        // Symlinked cache target is rejected and falls back safely.
+        // Symlinked cache target, overly permissive existing mode (0755), read-only mode (0500),
+        // and group-writable parent (0770) are rejected and fall back safely, while a valid
+        // pre-existing 0700 directory is accepted.
         #[cfg(unix)]
         {
+            use std::os::unix::fs::PermissionsExt;
+
             let link_root = dir.path().join("link_cache");
             let link_quarry = link_root.join("quarry");
             fs::create_dir_all(&link_quarry).unwrap();
@@ -1218,6 +1310,64 @@ mod tests {
                 |p| p == fake_tmp,
             );
             assert_eq!(rejected, fake_tmp);
+
+            let open_root = dir.path().join("perm_0755_cache");
+            let open_tmp = open_root.join("quarry").join("tmp");
+            fs::create_dir_all(&open_tmp).unwrap();
+            fs::set_permissions(&open_tmp, fs::Permissions::from_mode(0o755)).unwrap();
+            let rejected_0755 = super::resolve_default_temp_dir(
+                fake_tmp.clone(),
+                None,
+                Some(open_root.clone()),
+                None,
+                |p| p == fake_tmp,
+            );
+            assert_eq!(
+                rejected_0755, fake_tmp,
+                "pre-existing 0755 quarry/tmp must not be treated as private"
+            );
+
+            // Pre-existing 0500 (read-only) quarry/tmp must be rejected before spills fail.
+            fs::set_permissions(&open_tmp, fs::Permissions::from_mode(0o500)).unwrap();
+            let rejected_0500 = super::resolve_default_temp_dir(
+                fake_tmp.clone(),
+                None,
+                Some(open_root.clone()),
+                None,
+                |p| p == fake_tmp,
+            );
+            assert_eq!(
+                rejected_0500, fake_tmp,
+                "pre-existing 0500 quarry/tmp must be rejected as unwritable"
+            );
+
+            // Restoring 0700 makes the pre-existing directory acceptable again.
+            fs::set_permissions(&open_tmp, fs::Permissions::from_mode(0o700)).unwrap();
+            let accepted_0700 = super::resolve_default_temp_dir(
+                fake_tmp.clone(),
+                None,
+                Some(open_root.clone()),
+                None,
+                |p| p == fake_tmp,
+            );
+            assert_eq!(accepted_0700, open_tmp);
+
+            // Group-writable quarry parent (0770) must be rejected.
+            let gw_quarry = open_root.join("quarry");
+            fs::set_permissions(&gw_quarry, fs::Permissions::from_mode(0o770)).unwrap();
+            let rejected_parent = super::resolve_default_temp_dir(
+                fake_tmp.clone(),
+                None,
+                Some(open_root),
+                None,
+                |p| p == fake_tmp,
+            );
+            assert_eq!(
+                rejected_parent, fake_tmp,
+                "group-writable quarry parent must be rejected"
+            );
+            // Restore 0700 so TempDir cleanup always succeeds cleanly.
+            fs::set_permissions(&gw_quarry, fs::Permissions::from_mode(0o700)).unwrap();
         }
     }
 }

@@ -113,7 +113,8 @@ Your chosen theme preference (`system`, `light`, `dark`, or `omarchy`) is persis
 
 On Omarchy, Arch, and many systemd Linux desktops, `/tmp` is mounted as a RAM-backed `tmpfs`. To preserve Quarry's bounded-RAM guarantees during multi-GB sorts, duplicate scans, and gzip decompression:
 
-- When `TMPDIR` is not explicitly set and `/tmp` is `tmpfs`/`ramfs`, both the desktop app and `quarry` CLI automatically use a private (`0700`) disk-backed directory under `$XDG_CACHE_HOME/quarry/tmp` (defaulting to `~/.cache/quarry/tmp`).
+- When `TMPDIR` is not explicitly set and the system temp directory (`/tmp`)—or a CLI command's destination directory—is mounted on `tmpfs`/`ramfs`, both the desktop app and `quarry` CLI automatically use a private (`0700`) disk-backed directory under `$XDG_CACHE_HOME/quarry/tmp` (defaulting to `~/.cache/quarry/tmp`), falling back safely to the system temp directory if a private writable cache folder cannot be verified.
+- For CLI `sort-save-as` and `duplicates --output`, temporary spill runs stay beside the output when the destination is already on a disk-backed volume, and route to `$XDG_CACHE_HOME/quarry/tmp` when the destination is on `tmpfs`/`ramfs` (final output staging still stays beside the destination for atomic replacement).
 - You can override this at any time via **File → Temporary Storage…** in the desktop app, or `--temp-dir` / `TMPDIR` in the CLI.
 
 ---

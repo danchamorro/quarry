@@ -1524,13 +1524,8 @@ fn duplicates_command(args: Vec<String>) -> CliResult<()> {
     let output = destination
         .clone()
         .unwrap_or_else(|| analysis_directory.as_ref().unwrap().join("candidate.csv"));
-    let temporary_directory = temporary_directory.unwrap_or_else(|| {
-        output
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."))
-            .to_path_buf()
-    });
+    let temporary_directory = temporary_directory
+        .unwrap_or_else(|| quarry_core::default_temp_dir_for_destination(&output));
     let result = (|| -> CliResult<()> {
         let spec = DuplicateSpec {
             target,
@@ -2035,13 +2030,8 @@ fn sort_save_as_command(args: Vec<String>) -> CliResult<()> {
         data_rows,
         &SortPlan::from(spec),
     );
-    let temporary_directory = temporary_directory.unwrap_or_else(|| {
-        destination
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."))
-            .to_path_buf()
-    });
+    let temporary_directory = temporary_directory
+        .unwrap_or_else(|| quarry_core::default_temp_dir_for_destination(&destination));
     println!(
         "Temporary working location: {}",
         temporary_directory.display()
@@ -4917,25 +4907,45 @@ fn parse_delimiter(value: &str) -> CliResult<u8> {
 }
 
 fn parse_size(value: &str) -> CliResult<u64> {
-    let split = value
+    let trimmed = value.trim();
+    let split = trimmed
         .find(|character: char| !character.is_ascii_digit() && character != '.')
-        .unwrap_or(value.len());
-    let number: f64 = value[..split].parse()?;
-    let unit = value[split..].trim().to_ascii_uppercase();
-    let multiplier = match unit.as_str() {
-        "" | "B" => 1_f64,
-        "KB" => 1_000_f64,
-        "MB" => 1_000_000_f64,
-        "GB" => 1_000_000_000_f64,
-        "TB" => 1_000_000_000_000_f64,
-        "KIB" => 1024_f64,
-        "MIB" => 1024_f64.powi(2),
-        "GIB" => 1024_f64.powi(3),
-        "TIB" => 1024_f64.powi(4),
+        .unwrap_or(trimmed.len());
+    let number_str = &trimmed[..split];
+    if number_str.is_empty() {
+        return Err("size must start with a positive number".into());
+    }
+    let unit = trimmed[split..].trim().to_ascii_uppercase();
+    let multiplier: u128 = match unit.as_str() {
+        "" | "B" => 1,
+        "KB" => 1_000,
+        "MB" => 1_000_000,
+        "GB" => 1_000_000_000,
+        "TB" => 1_000_000_000_000,
+        "KIB" => 1024,
+        "MIB" => 1024_u128.pow(2),
+        "GIB" => 1024_u128.pow(3),
+        "TIB" => 1024_u128.pow(4),
         _ => return Err(format!("unsupported size unit {unit:?}").into()),
     };
-    let bytes = number * multiplier;
-    if !bytes.is_finite() || bytes < 1.0 || bytes > u64::MAX as f64 {
+    if !number_str.contains('.') {
+        let count = number_str
+            .parse::<u128>()
+            .map_err(|_| "size must be between 1 byte and u64::MAX")?;
+        let total = count
+            .checked_mul(multiplier)
+            .ok_or("size must be between 1 byte and u64::MAX")?;
+        if total == 0 || total > u128::from(u64::MAX) {
+            return Err("size must be between 1 byte and u64::MAX".into());
+        }
+        return Ok(total as u64);
+    }
+    let number: f64 = number_str.parse()?;
+    let bytes = number * (multiplier as f64);
+    // `u64::MAX as f64` rounds up to 2^64 (18446744073709551616.0); require strictly less
+    // so fractional inputs never saturate silently to `u64::MAX`.
+    const TWO_POW_64: f64 = 18_446_744_073_709_551_616.0;
+    if !bytes.is_finite() || bytes < 1.0 || bytes >= TWO_POW_64 {
         return Err("size must be between 1 byte and u64::MAX".into());
     }
     Ok(bytes as u64)
@@ -7191,6 +7201,20 @@ mod tests {
             512 * 1024 * 1024
         );
         assert_eq!(super::parse_memory_budget("1048576").unwrap(), 1_048_576);
+        // Exact integer byte counts > 2^53 must not lose precision through f64,
+        // and u64::MAX + 1 must fail instead of saturating to u64::MAX.
+        assert_eq!(
+            super::parse_size("9007199254740993").unwrap(),
+            9_007_199_254_740_993
+        );
+        assert_eq!(super::parse_size("18446744073709551615").unwrap(), u64::MAX);
+        assert!(super::parse_size("18446744073709551616").is_err());
+        assert!(super::parse_memory_budget("18446744073709551616").is_err());
+        #[cfg(target_pointer_width = "64")]
+        assert_eq!(
+            super::parse_memory_budget("9007199254740993").unwrap(),
+            9_007_199_254_740_993
+        );
         let bad_budget = super::parse_memory_budget("abc").unwrap_err().to_string();
         assert!(
             bad_budget.contains("--memory-budget"),

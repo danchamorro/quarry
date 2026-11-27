@@ -511,7 +511,8 @@ impl WorkbenchController {
         let wakeup = Arc::clone(&entity.read(cx).ui_wakeup);
         let observe_wakeup = Arc::clone(&wakeup);
         cx.observe(&entity, move |this, cx| {
-            if this.read(cx).has_active_background_work() {
+            let controller = this.read(cx);
+            if controller.has_active_background_work() || controller.hud_targets_stale() {
                 observe_wakeup.notify();
             }
         })
@@ -672,8 +673,13 @@ impl WorkbenchController {
             return None;
         }
         self.system_appearance = appearance;
-        if let Some(watcher) = &self.omarchy_watcher {
+        if self.theme_prefs.preference == ThemePreference::Omarchy
+            && let Some(watcher) = &self.omarchy_watcher
+        {
+            // Route polarity changes through the Omarchy watcher so they honor the same
+            // 400 ms swap grace window and stay synchronized with `last_published`.
             watcher.set_system_appearance(appearance);
+            return None;
         }
         let resolved = resolve_theme(
             self.theme_prefs.preference,
@@ -1902,6 +1908,7 @@ impl WorkbenchController {
             (owner, first_id)
         };
         self.window_messages.remove(&target_window);
+        let _ = self.sync_resource_hud();
         cx.notify();
         Ok((owner_window, active_id))
     }
@@ -1917,6 +1924,7 @@ impl WorkbenchController {
             .activate_tab(window, id)
             .map_err(|e| e.to_string())?;
         let _ = self.maybe_spawn_live_watch_tail_refresh(id, cx);
+        let _ = self.sync_resource_hud();
         cx.notify();
         Ok(outcome)
     }
@@ -1938,6 +1946,7 @@ impl WorkbenchController {
             self.set_window_message(window, Some(AppMessage::warning(error.to_string())), cx);
         } else {
             let _ = self.maybe_spawn_live_watch_tail_refresh(target, cx);
+            let _ = self.sync_resource_hud();
             cx.notify();
         }
     }
@@ -1952,6 +1961,7 @@ impl WorkbenchController {
             .scheduler
             .move_tab_to_window(id, target_window)
             .map_err(|e| e.to_string())?;
+        let _ = self.sync_resource_hud();
         cx.notify();
         Ok(outcome)
     }
@@ -4653,14 +4663,14 @@ impl WorkbenchController {
                 self.scheduler.tabs_in_window(window).into_iter().any(|id| {
                     self.scheduler
                         .tab(id)
-                        .is_some_and(WorkbenchTab::document_busy)
+                        .is_some_and(WorkbenchTab::has_running_document_job)
                 })
             })
     }
 
-    /// Returns `true` whenever any workflow, document job, Live Watch session, or whitespace
-    /// inspection batch requires active 32 ms background polling. When `false`, the GPUI
-    /// coordinator parks with zero timers and zero main-thread wake-ups until signalled.
+    /// Returns `true` whenever any workflow, running document job, Live Watch session, or active
+    /// tab whitespace inspection batch requires active 32 ms background polling. When `false`,
+    /// the GPUI coordinator parks with zero timers and zero main-thread wake-ups until signalled.
     pub fn has_active_background_work(&self) -> bool {
         self.combine.busy()
             || self.join.running_operation()
@@ -4669,17 +4679,44 @@ impl WorkbenchController {
             || self.cache_clear_worker.is_some()
             || self.storage_check_worker.is_some()
             || self.scheduler.windows().into_iter().any(|window| {
+                let active_id = self.scheduler.active_document(window);
                 self.scheduler.tabs_in_window(window).into_iter().any(|id| {
-                    self.scheduler
-                        .tab(id)
-                        .is_some_and(WorkbenchTab::has_background_activity)
+                    self.scheduler.tab(id).is_some_and(|tab| {
+                        tab.has_background_activity()
+                            || (active_id == Some(id) && tab.has_active_whitespace_work())
+                    })
                 })
             })
+    }
+
+    fn desired_hud_targets(&self) -> ResourceHudTargets {
+        let document_dirs: BTreeSet<PathBuf> = self
+            .scheduler
+            .windows()
+            .into_iter()
+            .filter_map(|window| self.active_document(window))
+            .filter_map(|doc| doc.logical_path.parent().map(Path::to_path_buf))
+            .collect();
+        ResourceHudTargets {
+            document_dirs,
+            scratch_dir: self.scheduler.working_directory().to_path_buf(),
+        }
+    }
+
+    /// Returns `true` when the active window document directories or scratch directory have
+    /// changed since the last HUD target sync, so a parked coordinator wakes once to refresh.
+    pub fn hud_targets_stale(&self) -> bool {
+        self.desired_hud_targets() != self.hud_targets
     }
 
     #[cfg(test)]
     pub fn resource_hud_sample(&self) -> &ResourceHudSample {
         &self.hud_sample
+    }
+
+    #[cfg(test)]
+    pub fn resource_hud_targets(&self) -> &ResourceHudTargets {
+        &self.hud_targets
     }
 
     /// Resolve the window-specific volume readings (active document volume + scratch volume)
@@ -4752,15 +4789,7 @@ impl WorkbenchController {
     fn sync_resource_hud(&mut self) -> bool {
         let mut changed = false;
         let windows = self.scheduler.windows();
-        let document_dirs: BTreeSet<PathBuf> = windows
-            .iter()
-            .filter_map(|&window| self.active_document(window))
-            .filter_map(|doc| doc.logical_path.parent().map(Path::to_path_buf))
-            .collect();
-        let next_targets = ResourceHudTargets {
-            document_dirs,
-            scratch_dir: self.scheduler.working_directory().to_path_buf(),
-        };
+        let next_targets = self.desired_hud_targets();
         if next_targets != self.hud_targets {
             self.hud_targets = next_targets.clone();
             self.hud_sampler.set_targets(next_targets);
