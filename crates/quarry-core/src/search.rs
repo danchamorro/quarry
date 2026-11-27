@@ -35,7 +35,7 @@ pub enum SearchMode {
 
 enum SearchMatcher {
     Literal {
-        matcher: ByteMatcher,
+        matcher: Box<ByteMatcher>,
         has_quote: bool,
     },
     Regex(regex::bytes::Regex),
@@ -53,7 +53,7 @@ impl SearchMatcher {
                     return Err(QuarryError::InvalidOption("search query must not be empty"));
                 }
                 Ok(Self::Literal {
-                    matcher: ByteMatcher::new(needle, case_sensitivity),
+                    matcher: Box::new(ByteMatcher::new(needle, case_sensitivity)),
                     has_quote: needle.contains(&b'"'),
                 })
             }
