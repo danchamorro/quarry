@@ -218,8 +218,8 @@ fn decimal_digits(mut value: usize) -> usize {
     digits
 }
 
-fn index_label_len(column: usize) -> usize {
-    1 + decimal_digits(column.saturating_add(1))
+fn index_label_len(one_based: usize) -> usize {
+    1 + decimal_digits(one_based)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1328,7 +1328,7 @@ fn is_range_pair(a: FilterOperator, b: FilterOperator) -> bool {
 
 #[derive(Clone, Copy)]
 enum ColumnLabel<'a> {
-    Index { column: usize, len: usize },
+    Index { one_based: usize, len: usize },
     Bare(&'a str),
     Bracketed { name: &'a str, len: usize },
 }
@@ -1351,7 +1351,7 @@ impl<'a> ColumnLabel<'a> {
 
     fn last_byte(self) -> u8 {
         match self {
-            Self::Index { column, .. } => b'0' + (((column + 1) % 10) as u8),
+            Self::Index { one_based, .. } => b'0' + ((one_based % 10) as u8),
             Self::Bracketed { .. } => b']',
             Self::Bare(name) => *name.as_bytes().last().unwrap(),
         }
@@ -1359,9 +1359,9 @@ impl<'a> ColumnLabel<'a> {
 
     fn write_to(self, out: &mut String) {
         match self {
-            Self::Index { column, .. } => {
+            Self::Index { one_based, .. } => {
                 use std::fmt::Write;
-                let _ = write!(out, "#{}", column + 1);
+                let _ = write!(out, "#{one_based}");
             }
             Self::Bare(name) => out.push_str(name),
             Self::Bracketed { name, .. } => {
@@ -1547,16 +1547,75 @@ enum PrintTier {
     PrettyHeaders,
     PrettyIndex,
     Compact,
+    CompactReordered,
+}
+
+fn measure_group_with_label(
+    col_label: ColumnLabel<'_>,
+    inclusions: &[&FilterPredicate],
+    exclusions: &[&FilterPredicate],
+    prev_clause_last: Option<u8>,
+    compact: bool,
+    expand_between: bool,
+) -> (usize, Option<u8>) {
+    let mut len = 0usize;
+    let mut prev_clause = prev_clause_last;
+    if !inclusions.is_empty() {
+        if let Some(prev) = prev_clause {
+            len = len.saturating_add(emit_joiner(
+                prev,
+                "AND",
+                col_label.first_byte(),
+                compact,
+                None,
+            ));
+        }
+        let mut prev_or_last: Option<u8> = None;
+        for pred in inclusions {
+            if let Some(prev) = prev_or_last {
+                len = len.saturating_add(emit_joiner(
+                    prev,
+                    "OR",
+                    col_label.first_byte(),
+                    compact,
+                    None,
+                ));
+            }
+            let (pred_len, last) = emit_predicate(pred, col_label, compact, expand_between, None);
+            len = len.saturating_add(pred_len);
+            prev_or_last = Some(last);
+        }
+        prev_clause = prev_or_last;
+    }
+    for exc in exclusions {
+        if let Some(prev) = prev_clause {
+            len = len.saturating_add(emit_joiner(
+                prev,
+                "AND",
+                col_label.first_byte(),
+                compact,
+                None,
+            ));
+        }
+        let (pred_len, last) = emit_predicate(exc, col_label, compact, false, None);
+        len = len.saturating_add(pred_len);
+        prev_clause = Some(last);
+    }
+    (len, prev_clause)
 }
 
 fn choose_column_label<'a>(
     schema: &FilterColumnSchema<'a>,
     column: usize,
+    one_based: usize,
+    inclusions: &[&FilterPredicate],
+    exclusions: &[&FilterPredicate],
+    prev_clause_last: Option<u8>,
     tier: PrintTier,
 ) -> ColumnLabel<'a> {
-    let idx_len = index_label_len(column);
+    let idx_len = index_label_len(one_based);
     let idx_label = ColumnLabel::Index {
-        column,
+        one_based,
         len: idx_len,
     };
     match tier {
@@ -1577,17 +1636,41 @@ fn choose_column_label<'a>(
                 idx_label
             }
         }
-        PrintTier::Compact => {
+        PrintTier::Compact | PrintTier::CompactReordered => {
+            // A header label can only beat or tie `#N` in compact mode (including separator
+            // savings such as `[a-]CONTAINS"..."` vs `#100 CONTAINS"..."`) if its formatted
+            // length is at most `idx_len + 1`.
             if let Some((name, formatted_len, is_bare)) =
-                schema.preferred_header_label(column, idx_len.saturating_sub(1))
+                schema.preferred_header_label(column, idx_len.saturating_add(1))
             {
-                if is_bare {
+                let candidate = if is_bare {
                     ColumnLabel::Bare(name)
                 } else {
                     ColumnLabel::Bracketed {
                         name,
                         len: formatted_len,
                     }
+                };
+                let (idx_cost, _) = measure_group_with_label(
+                    idx_label,
+                    inclusions,
+                    exclusions,
+                    prev_clause_last,
+                    true,
+                    false,
+                );
+                let (cand_cost, _) = measure_group_with_label(
+                    candidate,
+                    inclusions,
+                    exclusions,
+                    prev_clause_last,
+                    true,
+                    false,
+                );
+                if cand_cost < idx_cost {
+                    candidate
+                } else {
+                    idx_label
                 }
             } else {
                 idx_label
@@ -1808,91 +1891,117 @@ fn emit_joiner(
     len
 }
 
+fn predicate_ends_with_word_byte(predicate: &FilterPredicate) -> bool {
+    matches!(
+        predicate.operator,
+        FilterOperator::GreaterThan
+            | FilterOperator::GreaterThanOrEqual
+            | FilterOperator::LessThan
+            | FilterOperator::LessThanOrEqual
+            | FilterOperator::Between
+    )
+}
+
 fn try_render_grouped(
     by_column: &BTreeMap<usize, (Vec<&FilterPredicate>, Vec<&FilterPredicate>)>,
     schema: &FilterColumnSchema<'_>,
     total_predicates: usize,
     tier: PrintTier,
 ) -> Option<String> {
-    let compact = matches!(tier, PrintTier::Compact);
-    let mut spare_atoms = MAX_FILTER_EXPR_PREDICATES.saturating_sub(total_predicates);
-    let mut expand_flags: Vec<bool> = Vec::new();
+    let compact = matches!(tier, PrintTier::Compact | PrintTier::CompactReordered);
+    let mut groups: Vec<(usize, usize, &[&FilterPredicate], &[&FilterPredicate])> = by_column
+        .iter()
+        .map(|(&column, (inclusions, exclusions))| {
+            (
+                column,
+                column + 1,
+                inclusions.as_slice(),
+                exclusions.as_slice(),
+            )
+        })
+        .collect();
+
+    if matches!(tier, PrintTier::CompactReordered) {
+        // Place groups ending with a non-word byte (`"` or `/`) before groups ending with a
+        // numeric digit so the final group avoids a trailing separator space before `AND`.
+        groups.sort_by_key(|&(column, _, inclusions, exclusions)| {
+            let ends_word = if exclusions.is_empty() {
+                inclusions
+                    .last()
+                    .is_some_and(|pred| predicate_ends_with_word_byte(pred))
+            } else {
+                false
+            };
+            (ends_word, column)
+        });
+    }
+
+    // Choose each column's label in group order (respecting separator costs in compact tiers).
+    let mut labels = Vec::with_capacity(groups.len());
+    let mut prev_clause_last: Option<u8> = None;
+    for &(column, one_based, inclusions, exclusions) in &groups {
+        let label = choose_column_label(
+            schema,
+            column,
+            one_based,
+            inclusions,
+            exclusions,
+            prev_clause_last,
+            tier,
+        );
+        let (_, next_last) = measure_group_with_label(
+            label,
+            inclusions,
+            exclusions,
+            prev_clause_last,
+            compact,
+            false,
+        );
+        labels.push(label);
+        prev_clause_last = next_last;
+    }
+
+    // In compact tiers, greedily spend `spare_atoms` on single-inclusion `Between` expansions
+    // that save the most bytes first (deterministic ascending group-index tie-breaker).
+    let mut expand_group = vec![false; groups.len()];
     if compact {
-        expand_flags.reserve(total_predicates);
+        let spare_atoms = MAX_FILTER_EXPR_PREDICATES.saturating_sub(total_predicates);
+        if spare_atoms > 0 {
+            let mut candidates: Vec<(usize, usize)> = Vec::new();
+            for (group_idx, &(_, _, inclusions, _)) in groups.iter().enumerate() {
+                if inclusions.len() == 1 && inclusions[0].operator == FilterOperator::Between {
+                    let label = labels[group_idx];
+                    let (between_len, _) = emit_predicate(inclusions[0], label, true, false, None);
+                    let (expanded_len, _) = emit_predicate(inclusions[0], label, true, true, None);
+                    if expanded_len < between_len {
+                        candidates.push((between_len - expanded_len, group_idx));
+                    }
+                }
+            }
+            candidates.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+            for &(_, group_idx) in candidates.iter().take(spare_atoms) {
+                expand_group[group_idx] = true;
+            }
+        }
     }
 
     // Pass 1: measure exact total byte length without allocating the output string.
     let mut total_len = 0usize;
     let mut prev_clause_last: Option<u8> = None;
-
-    for (&column, (inclusions, exclusions)) in by_column {
-        let col_label = choose_column_label(schema, column, tier);
-        if !inclusions.is_empty() {
-            if let Some(prev) = prev_clause_last {
-                total_len = total_len.saturating_add(emit_joiner(
-                    prev,
-                    "AND",
-                    col_label.first_byte(),
-                    compact,
-                    None,
-                ));
-            }
-            let single_inclusion = inclusions.len() == 1;
-            let mut prev_or_last: Option<u8> = None;
-            for pred in inclusions {
-                if let Some(prev) = prev_or_last {
-                    total_len = total_len.saturating_add(emit_joiner(
-                        prev,
-                        "OR",
-                        col_label.first_byte(),
-                        compact,
-                        None,
-                    ));
-                }
-                let expand = if compact
-                    && single_inclusion
-                    && pred.operator == FilterOperator::Between
-                    && spare_atoms > 0
-                {
-                    let (between_len, _) = emit_predicate(pred, col_label, true, false, None);
-                    let (expanded_len, _) = emit_predicate(pred, col_label, true, true, None);
-                    if expanded_len < between_len {
-                        spare_atoms -= 1;
-                        true
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                };
-                if compact {
-                    expand_flags.push(expand);
-                }
-                let (pred_len, last) = emit_predicate(pred, col_label, compact, expand, None);
-                total_len = total_len.saturating_add(pred_len);
-                prev_or_last = Some(last);
-                if total_len > MAX_FILTER_EXPR_BYTES {
-                    return None;
-                }
-            }
-            prev_clause_last = prev_or_last;
-        }
-        for exc in exclusions {
-            if let Some(prev) = prev_clause_last {
-                total_len = total_len.saturating_add(emit_joiner(
-                    prev,
-                    "AND",
-                    col_label.first_byte(),
-                    compact,
-                    None,
-                ));
-            }
-            let (pred_len, last) = emit_predicate(exc, col_label, compact, false, None);
-            total_len = total_len.saturating_add(pred_len);
-            prev_clause_last = Some(last);
-            if total_len > MAX_FILTER_EXPR_BYTES {
-                return None;
-            }
+    for (group_idx, &(_, _, inclusions, exclusions)) in groups.iter().enumerate() {
+        let col_label = labels[group_idx];
+        let (group_len, next_last) = measure_group_with_label(
+            col_label,
+            inclusions,
+            exclusions,
+            prev_clause_last,
+            compact,
+            expand_group[group_idx],
+        );
+        total_len = total_len.saturating_add(group_len);
+        prev_clause_last = next_last;
+        if total_len > MAX_FILTER_EXPR_BYTES {
+            return None;
         }
     }
 
@@ -1903,10 +2012,8 @@ fn try_render_grouped(
     // Pass 2: allocate exact bounded capacity and render directly.
     let mut out = String::with_capacity(total_len);
     let mut prev_clause_last: Option<u8> = None;
-    let mut expand_idx = 0usize;
-
-    for (&column, (inclusions, exclusions)) in by_column {
-        let col_label = choose_column_label(schema, column, tier);
+    for (group_idx, &(_, _, inclusions, exclusions)) in groups.iter().enumerate() {
+        let col_label = labels[group_idx];
         if !inclusions.is_empty() {
             if let Some(prev) = prev_clause_last {
                 emit_joiner(prev, "AND", col_label.first_byte(), compact, Some(&mut out));
@@ -1916,14 +2023,13 @@ fn try_render_grouped(
                 if let Some(prev) = prev_or_last {
                     emit_joiner(prev, "OR", col_label.first_byte(), compact, Some(&mut out));
                 }
-                let expand = if compact {
-                    let flag = expand_flags[expand_idx];
-                    expand_idx += 1;
-                    flag
-                } else {
-                    false
-                };
-                let (_, last) = emit_predicate(pred, col_label, compact, expand, Some(&mut out));
+                let (_, last) = emit_predicate(
+                    pred,
+                    col_label,
+                    compact,
+                    expand_group[group_idx],
+                    Some(&mut out),
+                );
                 prev_or_last = Some(last);
             }
             prev_clause_last = prev_or_last;
@@ -1947,8 +2053,8 @@ fn try_render_grouped(
 /// Column groups are emitted in ascending column order, with each column's inclusion predicates
 /// joined by `OR` and exclusions (`!=`) and separate columns joined by `AND`. Every expression
 /// accepted by [`parse_filter_expr`] prints to a valid, bounded expression that round-trips
-/// losslessly through [`parse_filter_expr`]. Oversized or empty legacy queries return an explicit
-/// [`FilterExprError`] without allocating unbounded output.
+/// losslessly through [`parse_filter_expr`]. Oversized, incomplete, or empty queries return an
+/// explicit [`FilterExprError`] without allocating unbounded output.
 pub fn print_filter_expr(
     query: &FilterQuery,
     schema: &FilterColumnSchema<'_>,
@@ -1972,6 +2078,18 @@ pub fn print_filter_expr(
     let mut by_column: BTreeMap<usize, (Vec<&FilterPredicate>, Vec<&FilterPredicate>)> =
         BTreeMap::new();
     for predicate in &query.predicates {
+        if predicate.column.checked_add(1).is_none() {
+            return Err(FilterExprError::new(
+                FilterExprSpan::new(0, 0),
+                "column index overflows 1-based #N representation",
+            ));
+        }
+        if predicate.operator == FilterOperator::Between && predicate.upper_bound.is_none() {
+            return Err(FilterExprError::new(
+                FilterExprSpan::new(0, 0),
+                "BETWEEN predicate is missing an upper bound",
+            ));
+        }
         let entry = by_column.entry(predicate.column).or_default();
         if predicate.operator == FilterOperator::NotEquals {
             entry.1.push(predicate);
@@ -1985,6 +2103,7 @@ pub fn print_filter_expr(
         PrintTier::PrettyHeaders,
         PrintTier::PrettyIndex,
         PrintTier::Compact,
+        PrintTier::CompactReordered,
     ] {
         if let Some(rendered) = try_render_grouped(&by_column, schema, total_predicates, tier) {
             return Ok(rendered);
@@ -2319,6 +2438,100 @@ mod tests {
                 .unwrap_err()
                 .message
                 .contains("no predicates")
+        );
+
+        // 6. Reject `column: usize::MAX` (overflows 1-based `#N`) and `Between` without upper_bound.
+        let overflow_col = FilterQuery::single(usize::MAX, FilterOperator::Equals, b"x".to_vec());
+        assert!(
+            print_filter_expr(&overflow_col, &headerless)
+                .unwrap_err()
+                .message
+                .contains("overflows")
+        );
+
+        let missing_upper = FilterQuery::single(0, FilterOperator::Between, b"1".to_vec());
+        assert!(
+            print_filter_expr(&missing_upper, &headerless)
+                .unwrap_err()
+                .message
+                .contains("upper bound")
+        );
+
+        // 7. Compact label separator cost: column 100 named `a-` (`[a-]CONTAINS"..."`, no space needed
+        //    vs `#100 CONTAINS"..."` which needs a space) fits exactly at MAX_FILTER_EXPR_BYTES.
+        let mut hundred_hdrs: Vec<Vec<u8>> =
+            (1..=99).map(|i| format!("col{i}").into_bytes()).collect();
+        hundred_hdrs.push(b"a-".to_vec());
+        let hundred_schema = FilterColumnSchema::with_headers(&hundred_hdrs, Some(100));
+        let br_prefix = "[a-]CONTAINS\"";
+        let br_fill = "q".repeat(MAX_FILTER_EXPR_BYTES - br_prefix.len() - suffix.len());
+        let exact_bracket = format!("{br_prefix}{br_fill}{suffix}");
+        assert_eq!(exact_bracket.len(), MAX_FILTER_EXPR_BYTES);
+        let q_bracket =
+            parse_filter_expr(&exact_bracket, &hundred_schema, CaseSensitivity::Sensitive).unwrap();
+        let printed_bracket = print_filter_expr(&q_bracket, &hundred_schema).unwrap();
+        assert!(printed_bracket.len() <= MAX_FILTER_EXPR_BYTES);
+        assert_eq!(
+            parse_filter_expr(
+                &printed_bracket,
+                &hundred_schema,
+                CaseSensitivity::Sensitive
+            )
+            .unwrap(),
+            q_bracket
+        );
+
+        // 8. Greedy spare-atom allocation picks the `Between` expansion saving the most bytes.
+        let open_headerless = FilterColumnSchema::headerless(None);
+        let prefix_len: usize = "#1 BETWEEN-2 AND-1 AND#2>=1 AND#2<=2 AND".len()
+            + (0..252)
+                .map(|i| format!("#3==\"{i}\"OR").len())
+                .sum::<usize>();
+        let pad_len = MAX_FILTER_EXPR_BYTES - prefix_len - "#3==\"\"".len();
+        let full_greedy = format!(
+            "#1 BETWEEN-2 AND-1 AND#2>=1 AND#2<=2 AND{}#3==\"{}\"",
+            (0..252)
+                .map(|i| format!("#3==\"{i}\"OR"))
+                .collect::<String>(),
+            "p".repeat(pad_len)
+        );
+        // Ensure exact 64 KiB input with 256 input atoms (1 + 2 + 253 = 256).
+        assert_eq!(full_greedy.len(), MAX_FILTER_EXPR_BYTES);
+        let q_greedy =
+            parse_filter_expr(&full_greedy, &open_headerless, CaseSensitivity::Sensitive).unwrap();
+        let printed_greedy = print_filter_expr(&q_greedy, &open_headerless).unwrap();
+        assert!(printed_greedy.len() <= MAX_FILTER_EXPR_BYTES);
+        assert_eq!(
+            parse_filter_expr(
+                &printed_greedy,
+                &open_headerless,
+                CaseSensitivity::Sensitive
+            )
+            .unwrap(),
+            q_greedy
+        );
+
+        // 9. Reordered compact fallback preserves a 65,536-byte headerless expression where the
+        //    string-ending group preceded the numeric-ending group (`#2=="..."AND#1>1`).
+        let reorder_suffix = "\"AND#1>1";
+        let reorder_prefix = "#2==\"";
+        let reorder_fill =
+            "r".repeat(MAX_FILTER_EXPR_BYTES - reorder_prefix.len() - reorder_suffix.len());
+        let exact_reorder = format!("{reorder_prefix}{reorder_fill}{reorder_suffix}");
+        assert_eq!(exact_reorder.len(), MAX_FILTER_EXPR_BYTES);
+        let q_reorder =
+            parse_filter_expr(&exact_reorder, &open_headerless, CaseSensitivity::Sensitive)
+                .unwrap();
+        let printed_reorder = print_filter_expr(&q_reorder, &open_headerless).unwrap();
+        assert!(printed_reorder.len() <= MAX_FILTER_EXPR_BYTES);
+        assert_eq!(
+            parse_filter_expr(
+                &printed_reorder,
+                &open_headerless,
+                CaseSensitivity::Sensitive
+            )
+            .unwrap(),
+            q_reorder
         );
     }
 
@@ -2662,6 +2875,7 @@ mod tests {
                                     "accepted `{expr}` printed `{canonical}` failed reparse: {e}"
                                 )
                             });
+                    assert_eq!(reparsed, q);
                     assert_eq!(print_filter_expr(&reparsed, &schema).unwrap(), canonical);
                 }
                 Err(err) => {
@@ -2722,6 +2936,7 @@ mod tests {
                             "mutated accepted `{expr}` printed `{canonical}` failed reparse: {e}"
                         )
                     });
+                    assert_eq!(reparsed, q);
                     assert_eq!(print_filter_expr(&reparsed, &schema).unwrap(), canonical);
                 }
                 Err(err) => {
