@@ -234,6 +234,15 @@ impl WorkbenchTab {
         })
     }
 
+    /// Returns `true` when this tab has any active background job, Live Watch session, or
+    /// whitespace inspection worker requiring periodic UI polling.
+    pub fn has_background_activity(&self) -> bool {
+        self.document_busy()
+            || self.document.as_ref().is_some_and(|document| {
+                document.is_live_watching() || document.whitespace.is_busy()
+            })
+    }
+
     /// Counts document file operations and structural analysis against the global write limit.
     /// A completed duplicate preview does not occupy a write slot.
     pub fn document_writing(&self) -> bool {

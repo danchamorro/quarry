@@ -9,6 +9,9 @@
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 /// Unpremultiplied 8-bit sRGB color with alpha channel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -789,6 +792,190 @@ pub fn resolve_theme_for_current_user(
     resolve_theme(preference, system_appearance, home.as_deref())
 }
 
+const OMARCHY_EVENT_DEBOUNCE: Duration = Duration::from_millis(30);
+const OMARCHY_EVENT_MAX_COALESCE: Duration = Duration::from_millis(150);
+const OMARCHY_SWAP_GRACE_WINDOW: Duration = Duration::from_millis(400);
+const OMARCHY_GRACE_RETRY_STEP: Duration = Duration::from_millis(60);
+
+fn omarchy_watch_paths(home: &Path) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    let canon_home = std::fs::canonicalize(home).ok();
+    let allowed_canon = canon_home
+        .as_deref()
+        .map(omarchy_allowed_roots)
+        .unwrap_or_default();
+    for root in omarchy_allowed_roots(home) {
+        if root.exists() {
+            paths.push(root.clone());
+            let current = root.join("current");
+            if current.exists() {
+                paths.push(current.clone());
+                let theme = current.join("theme");
+                if theme.exists() {
+                    paths.push(theme.clone());
+                    // If `current/theme` is a symlink within the allowlisted Omarchy roots,
+                    // watch its canonical target directory too so direct edits are observed.
+                    if let Ok(resolved) = std::fs::canonicalize(&theme)
+                        && allowed_canon.iter().any(|base| resolved.starts_with(base))
+                        && resolved != theme
+                    {
+                        paths.push(resolved);
+                    }
+                }
+            }
+        } else if let Some(parent) = root.parent()
+            && parent.exists()
+        {
+            paths.push(parent.to_path_buf());
+        }
+    }
+    paths
+}
+
+/// Event-driven background watcher for live Omarchy theme changes.
+///
+/// Uses Linux `inotify` (via [`quarry_core::DirectoryWatch`]) so idle windows wake zero times per
+/// second, rebinds watches across `omarchy-theme-set`'s `rm -rf current/theme && mv` swap, and
+/// retains the last good Omarchy palette across the brief mid-swap gap before falling back.
+pub struct OmarchyThemeWatcher {
+    pending: Arc<Mutex<Option<ResolvedTheme>>>,
+    system_appearance: Arc<Mutex<ThemeAppearance>>,
+    wakeup: Option<quarry_core::DirectoryWatchWakeup>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl OmarchyThemeWatcher {
+    pub fn start(
+        home: PathBuf,
+        system_appearance: ThemeAppearance,
+        initial_theme: ResolvedTheme,
+        on_change: Arc<dyn Fn() + Send + Sync>,
+    ) -> Self {
+        let pending = Arc::new(Mutex::new(None));
+        let shared_appearance = Arc::new(Mutex::new(system_appearance));
+        let Some(mut watch) = quarry_core::DirectoryWatch::new() else {
+            return Self {
+                pending,
+                system_appearance: shared_appearance,
+                wakeup: None,
+                handle: None,
+            };
+        };
+        let wakeup = watch.wakeup_handle();
+        let worker_pending = Arc::clone(&pending);
+        let worker_appearance = Arc::clone(&shared_appearance);
+        let handle = thread::Builder::new()
+            .name("quarry-omarchy-theme".into())
+            .spawn(move || {
+                let mut last_published = initial_theme;
+                let mut grace_deadline: Option<Instant> = None;
+                loop {
+                    let watched = watch.sync_paths(&omarchy_watch_paths(&home));
+                    let timeout = if let Some(deadline) = grace_deadline {
+                        Some(
+                            deadline
+                                .saturating_duration_since(Instant::now())
+                                .min(OMARCHY_GRACE_RETRY_STEP)
+                                .max(Duration::from_millis(10)),
+                        )
+                    } else if watch.is_event_driven() {
+                        if watched > 0 {
+                            None
+                        } else {
+                            Some(Duration::from_secs(5))
+                        }
+                    } else {
+                        Some(Duration::from_secs(1))
+                    };
+
+                    match watch.wait(timeout) {
+                        quarry_core::DirectoryWatchEvent::Stopped => return,
+                        quarry_core::DirectoryWatchEvent::Changed => {
+                            let _ = watch.sync_paths(&omarchy_watch_paths(&home));
+                            let coalesce_deadline = Instant::now() + OMARCHY_EVENT_MAX_COALESCE;
+                            loop {
+                                let remaining =
+                                    coalesce_deadline.saturating_duration_since(Instant::now());
+                                if remaining.is_zero() {
+                                    break;
+                                }
+                                match watch.wait(Some(remaining.min(OMARCHY_EVENT_DEBOUNCE))) {
+                                    quarry_core::DirectoryWatchEvent::Stopped => return,
+                                    quarry_core::DirectoryWatchEvent::Changed => {
+                                        let _ = watch.sync_paths(&omarchy_watch_paths(&home));
+                                    }
+                                    quarry_core::DirectoryWatchEvent::Timeout => break,
+                                }
+                            }
+                        }
+                        quarry_core::DirectoryWatchEvent::Timeout => {}
+                    }
+
+                    let appearance = *worker_appearance.lock().unwrap();
+                    let resolved = resolve_theme(ThemePreference::Omarchy, appearance, Some(&home));
+                    if resolved.warning.is_none() {
+                        grace_deadline = None;
+                        if resolved != last_published {
+                            *worker_pending.lock().unwrap() = Some(resolved.clone());
+                            last_published = resolved;
+                            on_change();
+                        }
+                    } else if last_published.warning.is_none() {
+                        // Retain the last good palette across `omarchy-theme-set`'s brief
+                        // `rm -rf current/theme && mv` gap before surfacing a fallback warning.
+                        let now = Instant::now();
+                        let deadline =
+                            *grace_deadline.get_or_insert_with(|| now + OMARCHY_SWAP_GRACE_WINDOW);
+                        if now >= deadline {
+                            grace_deadline = None;
+                            if resolved != last_published {
+                                *worker_pending.lock().unwrap() = Some(resolved.clone());
+                                last_published = resolved;
+                                on_change();
+                            }
+                        }
+                    } else {
+                        grace_deadline = None;
+                        if resolved != last_published {
+                            *worker_pending.lock().unwrap() = Some(resolved.clone());
+                            last_published = resolved;
+                            on_change();
+                        }
+                    }
+                }
+            })
+            .ok();
+
+        Self {
+            pending,
+            system_appearance: shared_appearance,
+            wakeup: Some(wakeup),
+            handle,
+        }
+    }
+
+    /// Updates the fallback system polarity used if the Omarchy theme fails to resolve.
+    pub fn set_system_appearance(&self, appearance: ThemeAppearance) {
+        *self.system_appearance.lock().unwrap() = appearance;
+    }
+
+    /// Returns and clears the latest resolved theme change observed off-thread, if any.
+    pub fn take_update(&self) -> Option<ResolvedTheme> {
+        self.pending.lock().unwrap().take()
+    }
+}
+
+impl Drop for OmarchyThemeWatcher {
+    fn drop(&mut self) {
+        if let Some(wakeup) = self.wakeup.take() {
+            wakeup.signal_stop();
+        }
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
 fn parse_hex_color(value: &str) -> Option<Rgba> {
     let raw = value.trim().trim_matches('"').trim_matches('\'');
     let hex = raw
@@ -1473,6 +1660,85 @@ cyan = "#449dab"
         assert_eq!(
             content, "original\n",
             "retained root directory handle must remain bound to original inode after ancestor swap"
+        );
+    }
+
+    #[test]
+    fn omarchy_theme_watcher_follows_dir_swap_and_holds_last_good_palette_across_gap() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let home = tempfile::tempdir().unwrap();
+        let current = home.path().join(".local/state/omarchy/current");
+        let theme_dir = current.join("theme");
+        std::fs::create_dir_all(&theme_dir).unwrap();
+        std::fs::write(current.join("theme.name"), "tokyo-night\n").unwrap();
+        std::fs::write(current.join("theme.generation"), "1\n").unwrap();
+        std::fs::write(
+            theme_dir.join("colors.toml"),
+            "mode = \"dark\"\nbackground = \"#1a1b26\"\nforeground = \"#c0caf5\"\naccent = \"#7aa2f7\"\n",
+        )
+        .unwrap();
+
+        let initial = resolve_theme(
+            ThemePreference::Omarchy,
+            ThemeAppearance::Dark,
+            Some(home.path()),
+        );
+        assert!(initial.warning.is_none());
+        assert_eq!(initial.source_label, "Omarchy (tokyo-night)");
+
+        let notifications = Arc::new(AtomicUsize::new(0));
+        let notify_counter = Arc::clone(&notifications);
+        let watcher = OmarchyThemeWatcher::start(
+            home.path().to_path_buf(),
+            ThemeAppearance::Dark,
+            initial,
+            Arc::new(move || {
+                notify_counter.fetch_add(1, Ordering::AcqRel);
+            }),
+        );
+
+        // Simulate `omarchy-theme-set`: remove `current/theme`, pause briefly in the gap, then
+        // move `next-theme` into `current/theme` and update `theme.generation` / `theme.name`.
+        let staged = home.path().join(".local/state/omarchy/next-theme");
+        std::fs::create_dir_all(&staged).unwrap();
+        std::fs::write(
+            staged.join("colors.toml"),
+            "mode = \"light\"\nbackground = \"#faf4ed\"\nforeground = \"#575279\"\naccent = \"#286983\"\n",
+        )
+        .unwrap();
+        std::fs::remove_dir_all(&theme_dir).unwrap();
+        thread::sleep(Duration::from_millis(60));
+        // During the brief swap gap, watcher must not flash a fallback warning.
+        assert!(
+            watcher.take_update().is_none(),
+            "watcher must retain last good palette across brief rm -rf && mv gap"
+        );
+        std::fs::rename(&staged, &theme_dir).unwrap();
+        std::fs::write(current.join("theme.generation"), "2\n").unwrap();
+        std::fs::write(current.join("theme.name"), "rose-pine-dawn\n").unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let updated = loop {
+            if let Some(theme) = watcher.take_update() {
+                break theme;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for OmarchyThemeWatcher update"
+            );
+            thread::sleep(Duration::from_millis(15));
+        };
+        assert!(updated.warning.is_none());
+        assert_eq!(updated.source_label, "Omarchy (rose-pine-dawn)");
+        assert_eq!(updated.appearance, ThemeAppearance::Light);
+        assert!(notifications.load(Ordering::Acquire) >= 1);
+
+        let drop_start = Instant::now();
+        drop(watcher);
+        assert!(
+            drop_start.elapsed() < Duration::from_secs(1),
+            "dropping OmarchyThemeWatcher must stop promptly"
         );
     }
 }

@@ -2375,12 +2375,14 @@ mod linux_sys {
     pub const IN_CLOEXEC: c_int = O_CLOEXEC;
     pub const IN_MODIFY: u32 = 0x0000_0002;
     pub const IN_ATTRIB: u32 = 0x0000_0004;
+    pub const IN_CLOSE_WRITE: u32 = 0x0000_0008;
     pub const IN_MOVED_FROM: u32 = 0x0000_0040;
     pub const IN_MOVED_TO: u32 = 0x0000_0080;
     pub const IN_CREATE: u32 = 0x0000_0100;
     pub const IN_DELETE: u32 = 0x0000_0200;
     pub const IN_DELETE_SELF: u32 = 0x0000_0400;
     pub const IN_MOVE_SELF: u32 = 0x0000_0800;
+    pub const IN_IGNORED: u32 = 0x0000_8000;
     pub const POLLIN: c_short = 0x0001;
 
     #[repr(C)]
@@ -2404,6 +2406,7 @@ mod linux_sys {
         pub fn pipe2(fds: *mut c_int, flags: c_int) -> c_int;
         pub fn inotify_init1(flags: c_int) -> c_int;
         pub fn inotify_add_watch(fd: c_int, pathname: *const c_char, mask: u32) -> c_int;
+        pub fn inotify_rm_watch(fd: c_int, wd: c_int) -> c_int;
         pub fn poll(fds: *mut PollFd, nfds: usize, timeout: c_int) -> c_int;
         pub fn read(fd: c_int, buf: *mut c_void, count: usize) -> isize;
         pub fn write(fd: c_int, buf: *const c_void, count: usize) -> isize;
@@ -2834,6 +2837,328 @@ impl OsNotifier {
                 let was_woken = *woken;
                 *woken = false;
                 u64::from(was_woken)
+            }
+        }
+    }
+}
+
+/// Outcome returned by [`DirectoryWatch::wait`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirectoryWatchEvent {
+    Changed,
+    Timeout,
+    Stopped,
+}
+
+/// Thread-safe stop handle for [`DirectoryWatch`].
+#[derive(Clone)]
+pub struct DirectoryWatchWakeup {
+    stopped: Arc<AtomicBool>,
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    wake_write: Arc<Mutex<Option<OwnedRawFd>>>,
+    #[cfg(not(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )))]
+    cond: Arc<(Mutex<bool>, Condvar)>,
+}
+
+impl DirectoryWatchWakeup {
+    /// Signals the associated [`DirectoryWatch`] to stop waiting and exit promptly.
+    pub fn signal_stop(&self) {
+        self.stopped.store(true, Ordering::Release);
+        #[cfg(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))]
+        if let Some(fd) = self.wake_write.lock().unwrap().as_ref() {
+            write_wakeup_byte(fd);
+        }
+        #[cfg(not(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )))]
+        {
+            let (lock, cvar) = &*self.cond;
+            *lock.lock().unwrap() = true;
+            cvar.notify_all();
+        }
+    }
+}
+
+/// Event-driven directory/file watcher backed by Linux `inotify` (zero idle wake-ups via blocking
+/// `poll`) with a Condvar-based fallback on non-Linux platforms.
+pub struct DirectoryWatch {
+    stopped: Arc<AtomicBool>,
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    inotify_fd: OwnedRawFd,
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    wake_read: OwnedRawFd,
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    wake_write: Arc<Mutex<Option<OwnedRawFd>>>,
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    watches: std::collections::BTreeMap<PathBuf, std::ffi::c_int>,
+    #[cfg(not(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )))]
+    cond: Arc<(Mutex<bool>, Condvar)>,
+}
+
+impl DirectoryWatch {
+    /// Creates a new directory watcher. Returns `None` if the OS watcher cannot be initialized.
+    pub fn new() -> Option<Self> {
+        #[cfg(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))]
+        {
+            let (wake_read, wake_write) = create_wakeup_pipe().ok()?;
+            // SAFETY: `inotify_init1` takes only flags and returns a new FD or -1.
+            let raw_fd =
+                unsafe { linux_sys::inotify_init1(linux_sys::IN_NONBLOCK | linux_sys::IN_CLOEXEC) };
+            if raw_fd < 0 {
+                return None;
+            }
+            Some(Self {
+                stopped: Arc::new(AtomicBool::new(false)),
+                inotify_fd: OwnedRawFd(raw_fd),
+                wake_read,
+                wake_write: Arc::new(Mutex::new(Some(wake_write))),
+                watches: std::collections::BTreeMap::new(),
+            })
+        }
+        #[cfg(not(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )))]
+        {
+            Some(Self {
+                stopped: Arc::new(AtomicBool::new(false)),
+                cond: Arc::new((Mutex::new(false), Condvar::new())),
+            })
+        }
+    }
+
+    /// Returns `true` when backed by native kernel `inotify` events (so `wait(None)` blocks
+    /// indefinitely with zero idle wake-ups).
+    pub fn is_event_driven(&self) -> bool {
+        cfg!(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))
+    }
+
+    /// Returns a cloneable stop handle that wakes `wait()` immediately from another thread.
+    pub fn wakeup_handle(&self) -> DirectoryWatchWakeup {
+        DirectoryWatchWakeup {
+            stopped: Arc::clone(&self.stopped),
+            #[cfg(all(
+                target_os = "linux",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            ))]
+            wake_write: Arc::clone(&self.wake_write),
+            #[cfg(not(all(
+                target_os = "linux",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            )))]
+            cond: Arc::clone(&self.cond),
+        }
+    }
+
+    /// Synchronizes the watched path set so every existing path in `paths` is registered (and
+    /// replaced/recreated directories are re-bound cleanly). Returns the number of active watches.
+    pub fn sync_paths(&mut self, paths: &[PathBuf]) -> usize {
+        #[cfg(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))]
+        {
+            use std::collections::BTreeSet;
+            use std::ffi::CString;
+            use std::os::unix::ffi::OsStrExt;
+
+            const WATCH_MASK: u32 = linux_sys::IN_CLOSE_WRITE
+                | linux_sys::IN_MODIFY
+                | linux_sys::IN_ATTRIB
+                | linux_sys::IN_MOVED_FROM
+                | linux_sys::IN_MOVED_TO
+                | linux_sys::IN_CREATE
+                | linux_sys::IN_DELETE
+                | linux_sys::IN_DELETE_SELF
+                | linux_sys::IN_MOVE_SELF;
+
+            let desired: BTreeSet<PathBuf> = paths.iter().cloned().collect();
+            let stale: Vec<(PathBuf, std::ffi::c_int)> = self
+                .watches
+                .iter()
+                .filter(|(p, _)| !desired.contains(*p))
+                .map(|(p, &wd)| (p.clone(), wd))
+                .collect();
+            for (path, wd) in stale {
+                self.watches.remove(&path);
+                // SAFETY: `inotify_fd` is owned and `wd` came from `inotify_add_watch`.
+                unsafe {
+                    let _ = linux_sys::inotify_rm_watch(self.inotify_fd.raw(), wd);
+                }
+            }
+
+            for path in desired {
+                let Ok(c_path) = CString::new(path.as_os_str().as_bytes()) else {
+                    continue;
+                };
+                // SAFETY: `c_path` is NUL-terminated and `inotify_fd` is owned.
+                let wd = unsafe {
+                    linux_sys::inotify_add_watch(self.inotify_fd.raw(), c_path.as_ptr(), WATCH_MASK)
+                };
+                if wd >= 0 {
+                    if let Some(prev_wd) = self.watches.insert(path, wd)
+                        && prev_wd != wd
+                    {
+                        // SAFETY: remove replaced watch descriptor for the same path.
+                        unsafe {
+                            let _ = linux_sys::inotify_rm_watch(self.inotify_fd.raw(), prev_wd);
+                        }
+                    }
+                } else if let Some(old_wd) = self.watches.remove(&path) {
+                    // SAFETY: remove watch descriptor for a path that no longer exists.
+                    unsafe {
+                        let _ = linux_sys::inotify_rm_watch(self.inotify_fd.raw(), old_wd);
+                    }
+                }
+            }
+            self.watches.len()
+        }
+        #[cfg(not(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )))]
+        {
+            paths.iter().filter(|p| p.exists()).count()
+        }
+    }
+
+    /// Waits for filesystem changes, stop notification, or optional `timeout`.
+    /// Passing `None` on Linux blocks until a kernel event or stop signal arrives.
+    pub fn wait(&mut self, timeout: Option<Duration>) -> DirectoryWatchEvent {
+        if self.stopped.load(Ordering::Acquire) {
+            return DirectoryWatchEvent::Stopped;
+        }
+        #[cfg(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))]
+        {
+            let timeout_ms = match timeout {
+                None => -1 as std::ffi::c_int,
+                Some(dur) => dur.as_millis().min(std::ffi::c_int::MAX as u128) as std::ffi::c_int,
+            };
+            let mut pfds = [
+                linux_sys::PollFd {
+                    fd: self.inotify_fd.raw(),
+                    events: linux_sys::POLLIN,
+                    revents: 0,
+                },
+                linux_sys::PollFd {
+                    fd: self.wake_read.raw(),
+                    events: linux_sys::POLLIN,
+                    revents: 0,
+                },
+            ];
+            let rc = loop {
+                // SAFETY: `pfds` is a valid 2-element `PollFd` array with owned FDs.
+                let rc = unsafe { linux_sys::poll(pfds.as_mut_ptr(), pfds.len(), timeout_ms) };
+                if rc < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                    if self.stopped.load(Ordering::Acquire) {
+                        return DirectoryWatchEvent::Stopped;
+                    }
+                    continue;
+                }
+                break rc;
+            };
+            if self.stopped.load(Ordering::Acquire) {
+                drain_wakeup_pipe(&self.wake_read);
+                return DirectoryWatchEvent::Stopped;
+            }
+            if rc <= 0 {
+                return DirectoryWatchEvent::Timeout;
+            }
+            if (pfds[1].revents & linux_sys::POLLIN) != 0 {
+                drain_wakeup_pipe(&self.wake_read);
+                if self.stopped.load(Ordering::Acquire) {
+                    return DirectoryWatchEvent::Stopped;
+                }
+            }
+            if (pfds[0].revents & linux_sys::POLLIN) != 0 {
+                let mut buf = [0u8; 4096];
+                let hdr_size = std::mem::size_of::<linux_sys::InotifyEvent>();
+                let mut saw_event = false;
+                loop {
+                    // SAFETY: non-blocking read into stack buffer from owned inotify FD.
+                    let n = unsafe {
+                        linux_sys::read(self.inotify_fd.raw(), buf.as_mut_ptr().cast(), buf.len())
+                    };
+                    if n <= 0 {
+                        break;
+                    }
+                    let mut pos = 0usize;
+                    let len = n as usize;
+                    while pos + hdr_size <= len {
+                        // SAFETY: reading an `InotifyEvent` header inside `buf[..len]`.
+                        let ev = unsafe {
+                            std::ptr::read_unaligned(
+                                buf.as_ptr().add(pos).cast::<linux_sys::InotifyEvent>(),
+                            )
+                        };
+                        saw_event = true;
+                        if (ev.mask & linux_sys::IN_IGNORED) != 0 {
+                            self.watches.retain(|_, &mut wd| wd != ev.wd);
+                        }
+                        let step = hdr_size.saturating_add(ev.len as usize);
+                        if step == 0 {
+                            break;
+                        }
+                        pos = pos.saturating_add(step);
+                    }
+                }
+                if saw_event {
+                    return DirectoryWatchEvent::Changed;
+                }
+            }
+            DirectoryWatchEvent::Timeout
+        }
+        #[cfg(not(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )))]
+        {
+            let wait_dur = timeout.unwrap_or(Duration::from_secs(1));
+            let (lock, cvar) = &*self.cond;
+            let mut signaled = lock.lock().unwrap();
+            if !*signaled && !self.stopped.load(Ordering::Acquire) {
+                let (guard, _) = cvar.wait_timeout(signaled, wait_dur).unwrap();
+                signaled = guard;
+            }
+            *signaled = false;
+            if self.stopped.load(Ordering::Acquire) {
+                DirectoryWatchEvent::Stopped
+            } else {
+                DirectoryWatchEvent::Timeout
             }
         }
     }
@@ -4163,5 +4488,45 @@ mod tests {
             start_drop.elapsed() < Duration::from_secs(2),
             "dropping LiveWatchJob during a large burst must abort reconciliation promptly"
         );
+    }
+
+    #[test]
+    fn directory_watch_wakes_on_swap_and_stops_promptly() {
+        let dir = tempfile::tempdir().unwrap();
+        let current = dir.path().join("current");
+        let theme = current.join("theme");
+        std::fs::create_dir_all(&theme).unwrap();
+        std::fs::write(theme.join("colors.toml"), "mode = \"dark\"\n").unwrap();
+
+        let mut watch = DirectoryWatch::new().expect("directory watch available");
+        let wakeup = watch.wakeup_handle();
+        let paths = vec![current.clone(), theme.clone()];
+        assert!(watch.sync_paths(&paths) >= 1);
+
+        if watch.is_event_driven() {
+            let staged = dir.path().join("next-theme");
+            std::fs::create_dir_all(&staged).unwrap();
+            std::fs::write(staged.join("colors.toml"), "mode = \"light\"\n").unwrap();
+
+            let mover = thread::spawn(move || {
+                thread::sleep(Duration::from_millis(30));
+                std::fs::remove_dir_all(&theme).unwrap();
+                std::fs::rename(&staged, &theme).unwrap();
+            });
+            let ev = watch.wait(Some(Duration::from_secs(3)));
+            mover.join().unwrap();
+            assert_eq!(ev, DirectoryWatchEvent::Changed);
+            assert!(watch.sync_paths(&paths) >= 1);
+        }
+
+        let stopper = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(25));
+            wakeup.signal_stop();
+        });
+        let started = Instant::now();
+        let stop_ev = watch.wait(Some(Duration::from_secs(3)));
+        stopper.join().unwrap();
+        assert_eq!(stop_ev, DirectoryWatchEvent::Stopped);
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 }

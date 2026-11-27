@@ -318,6 +318,11 @@ impl Cache {
         self.job.is_some() || !self.requested.is_empty()
     }
 
+    /// Returns `true` when background whitespace inspection work is queued or running.
+    pub fn is_busy(&self) -> bool {
+        self.job.is_some() || !self.requests.is_empty()
+    }
+
     /// Harvests any completed background inspection batch and starts the next queued batch.
     /// Returns `true` when new summaries were stored and the view should repaint.
     pub fn poll(&mut self) -> bool {

@@ -21,14 +21,14 @@ use quarry_workbench::{
     AppMessage, CombineWorkflow, CommandContext, CommandId, CommandResolution,
     DEFAULT_NOFILE_TARGET, DelimiterMode, Document, DocumentId, EffectiveWordWrap, FailedOpen,
     GridSelection, HudAnnouncement, HudAnnouncementTracker, HudIndexPhase, InspectWorkflow,
-    JOIN_INPUT_RESERVED, JoinWorkflow, MessageSeverity, Palette, ResidencyState, ResolvedTheme,
-    ResourceHudSample, ResourceHudSampler, ResourceHudTargets, SchedulerError, SelectionModifiers,
-    StoragePreferences, StructuralDialog, StructuralJob, ThemeAppearance, ThemePreference,
-    ThemePreferences, WakeOutcome, WindowId, WordWrapPreferences, WordWrapToggleOutcome,
-    WorkbenchScheduler, WorkbenchSchedulerConfig, WorkbenchTab, clear_index_cache_summary,
-    evaluate_command, inspect_temporary_storage, materialization_progress,
-    omarchy_theme_fingerprint, resolve_theme, resolve_word_wrap, select_column, sort_progress,
-    whitespace,
+    JOIN_INPUT_RESERVED, JoinWorkflow, MessageSeverity, OmarchyThemeWatcher, Palette,
+    ResidencyState, ResolvedTheme, ResourceHudSample, ResourceHudSampler, ResourceHudTargets,
+    SchedulerError, SelectionModifiers, StoragePreferences, StructuralDialog, StructuralJob,
+    ThemeAppearance, ThemePreference, ThemePreferences, WakeOutcome, WindowId, WordWrapPreferences,
+    WordWrapToggleOutcome, WorkbenchScheduler, WorkbenchSchedulerConfig, WorkbenchTab,
+    clear_index_cache_summary, evaluate_command, inspect_temporary_storage,
+    materialization_progress, omarchy_theme_fingerprint, resolve_theme, resolve_word_wrap,
+    select_column, whitespace,
 };
 
 /// Shared global concurrency cap across document saves, exports, structural edits, decompressions,
@@ -223,6 +223,83 @@ struct WorkbenchGlobal(Entity<WorkbenchController>);
 
 impl Global for WorkbenchGlobal {}
 
+#[derive(Default)]
+struct UiWakeupState {
+    signaled: bool,
+    shutdown: bool,
+    waker: Option<std::task::Waker>,
+}
+
+/// Zero-dependency `Future`-based wakeup primitive allowing the GPUI background coordinator loop
+/// to sleep with zero timers, zero extra threads, and zero main-thread wake-ups while idle,
+/// waking immediately when background work starts, the Resource HUD changes, or an `inotify`
+/// Omarchy theme change arrives.
+struct UiWakeup {
+    state: std::sync::Mutex<UiWakeupState>,
+}
+
+impl UiWakeup {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            state: std::sync::Mutex::new(UiWakeupState::default()),
+        })
+    }
+
+    fn notify(&self) {
+        let waker = {
+            let mut state = self.state.lock().unwrap();
+            state.signaled = true;
+            state.waker.take()
+        };
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+
+    fn shutdown(&self) {
+        let waker = {
+            let mut state = self.state.lock().unwrap();
+            state.shutdown = true;
+            state.signaled = true;
+            state.waker.take()
+        };
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+
+    fn wait(self: &Arc<Self>) -> UiWakeupFuture {
+        UiWakeupFuture {
+            wakeup: Arc::clone(self),
+        }
+    }
+}
+
+struct UiWakeupFuture {
+    wakeup: Arc<UiWakeup>,
+}
+
+impl std::future::Future for UiWakeupFuture {
+    type Output = bool;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<bool> {
+        let mut state = self.wakeup.state.lock().unwrap();
+        if state.shutdown {
+            state.signaled = false;
+            return std::task::Poll::Ready(false);
+        }
+        if state.signaled {
+            state.signaled = false;
+            return std::task::Poll::Ready(true);
+        }
+        state.waker = Some(cx.waker().clone());
+        std::task::Poll::Pending
+    }
+}
+
 type StorageCheckOutcome = Result<(StorageSpace, u64), String>;
 type StorageCheckWorker = (u64, JoinHandle<StorageCheckOutcome>);
 
@@ -243,6 +320,8 @@ pub struct WorkbenchController {
     theme_error: Option<String>,
     omarchy_last_check: Instant,
     omarchy_fingerprint: Option<String>,
+    omarchy_watcher: Option<OmarchyThemeWatcher>,
+    ui_wakeup: Arc<UiWakeup>,
     combine: Box<CombineWorkflow>,
     join: Box<JoinWorkflow>,
     inspect: Box<InspectWorkflow>,
@@ -333,8 +412,26 @@ impl WorkbenchController {
             document_dirs: BTreeSet::new(),
             scratch_dir: working_dir.clone(),
         };
-        let hud_sampler = ResourceHudSampler::start(hud_targets.clone());
+        let ui_wakeup = UiWakeup::new();
+        let hud_wakeup = Arc::clone(&ui_wakeup);
+        let hud_sampler = ResourceHudSampler::start_with_notify(
+            hud_targets.clone(),
+            Arc::new(move || hud_wakeup.notify()),
+        );
         let hud_sample = hud_sampler.snapshot();
+        let omarchy_watcher = if theme_prefs.preference == ThemePreference::Omarchy {
+            theme_home.clone().map(|home| {
+                let theme_wakeup = Arc::clone(&ui_wakeup);
+                OmarchyThemeWatcher::start(
+                    home,
+                    system_appearance,
+                    resolved_theme.clone(),
+                    Arc::new(move || theme_wakeup.notify()),
+                )
+            })
+        } else {
+            None
+        };
         Self {
             scheduler,
             storage_prefs,
@@ -345,6 +442,8 @@ impl WorkbenchController {
             theme_error: None,
             omarchy_last_check: Instant::now(),
             omarchy_fingerprint,
+            omarchy_watcher,
+            ui_wakeup,
             combine: Box::default(),
             join: Box::new(JoinWorkflow::new(working_dir.clone())),
             inspect: Box::new(InspectWorkflow::new(
@@ -409,28 +508,48 @@ impl WorkbenchController {
         });
         cx.set_global(WorkbenchGlobal(entity.clone()));
 
+        let wakeup = Arc::clone(&entity.read(cx).ui_wakeup);
+        let observe_wakeup = Arc::clone(&wakeup);
+        cx.observe(&entity, move |this, cx| {
+            if this.read(cx).has_active_background_work() {
+                observe_wakeup.notify();
+            }
+        })
+        .detach();
+
         let poll_entity = entity.clone();
+        let loop_wakeup = Arc::clone(&wakeup);
         cx.spawn(async move |cx| {
             loop {
-                cx.background_executor()
-                    .timer(Duration::from_millis(32))
-                    .await;
-                let keep_going = cx.update(|cx| {
+                let action = cx.update(|cx| {
                     if Self::try_global(cx).is_none() {
-                        return false;
+                        return None;
                     }
-                    let omarchy_update = poll_entity.update(cx, |this, cx| {
+                    let (busy, omarchy_update) = poll_entity.update(cx, |this, cx| {
                         this.poll_background(cx);
-                        this.poll_omarchy_theme(cx)
+                        let update = this.take_omarchy_theme_update(cx);
+                        let busy = this.has_active_background_work();
+                        this.hud_sampler.set_idle(!busy);
+                        (busy, update)
                     });
                     if let Some(resolved) = omarchy_update {
                         crate::apply_resolved_theme(&resolved, cx);
                         cx.refresh_windows();
                     }
-                    true
+                    Some(busy)
                 });
-                if !keep_going {
-                    break;
+                match action {
+                    None => break,
+                    Some(true) => {
+                        cx.background_executor()
+                            .timer(Duration::from_millis(32))
+                            .await;
+                    }
+                    Some(false) => {
+                        if !loop_wakeup.wait().await {
+                            break;
+                        }
+                    }
                 }
             }
         })
@@ -529,6 +648,19 @@ impl WorkbenchController {
             } else {
                 None
             };
+        self.omarchy_watcher = if preference == ThemePreference::Omarchy {
+            self.theme_home.clone().map(|home| {
+                let theme_wakeup = Arc::clone(&self.ui_wakeup);
+                OmarchyThemeWatcher::start(
+                    home,
+                    self.system_appearance,
+                    resolved.clone(),
+                    Arc::new(move || theme_wakeup.notify()),
+                )
+            })
+        } else {
+            None
+        };
         cx.notify();
         Ok(resolved)
     }
@@ -542,6 +674,9 @@ impl WorkbenchController {
             return None;
         }
         self.system_appearance = appearance;
+        if let Some(watcher) = &self.omarchy_watcher {
+            watcher.set_system_appearance(appearance);
+        }
         let resolved = resolve_theme(
             self.theme_prefs.preference,
             self.system_appearance,
@@ -556,7 +691,34 @@ impl WorkbenchController {
         }
     }
 
+    /// Consumes any event-driven Omarchy theme update resolved off-thread by `OmarchyThemeWatcher`.
+    pub fn take_omarchy_theme_update(&mut self, cx: &mut Context<Self>) -> Option<ResolvedTheme> {
+        if self.theme_prefs.preference != ThemePreference::Omarchy {
+            return None;
+        }
+        let resolved = self.omarchy_watcher.as_ref()?.take_update()?;
+        self.omarchy_last_check = Instant::now();
+        self.omarchy_fingerprint = if resolved.warning.is_none() {
+            self.theme_home
+                .as_deref()
+                .and_then(omarchy_theme_fingerprint)
+        } else {
+            None
+        };
+        if resolved != self.resolved_theme {
+            self.resolved_theme = resolved.clone();
+            cx.notify();
+            Some(resolved)
+        } else {
+            None
+        }
+    }
+
+    #[allow(dead_code)]
     pub fn poll_omarchy_theme(&mut self, cx: &mut Context<Self>) -> Option<ResolvedTheme> {
+        if let Some(updated) = self.take_omarchy_theme_update(cx) {
+            return Some(updated);
+        }
         if self.theme_prefs.preference != ThemePreference::Omarchy {
             return None;
         }
@@ -1092,8 +1254,13 @@ impl WorkbenchController {
         source_col: usize,
         raw_len: usize,
     ) -> Option<whitespace::Summary> {
-        self.active_document_mut(window)?
-            .inspect_cell_whitespace(source_row, source_col, raw_len)
+        let summary = self
+            .active_document_mut(window)?
+            .inspect_cell_whitespace(source_row, source_col, raw_len);
+        if summary.is_none() {
+            self.ui_wakeup.notify();
+        }
+        summary
     }
 
     /// Queries the active document's bounded async whitespace cache for a header's full raw bytes.
@@ -1103,8 +1270,13 @@ impl WorkbenchController {
         source_col: usize,
         raw_len: usize,
     ) -> Option<whitespace::Summary> {
-        self.active_document_mut(window)?
-            .inspect_header_whitespace(source_col, raw_len)
+        let summary = self
+            .active_document_mut(window)?
+            .inspect_header_whitespace(source_col, raw_len);
+        if summary.is_none() {
+            self.ui_wakeup.notify();
+        }
+        summary
     }
 
     /// Returns a human-readable explanation of the full value's whitespace for tooltips and a11y.
@@ -4438,7 +4610,7 @@ impl WorkbenchController {
         self.storage_prefs
             .set_scratch_directory(None)
             .map_err(|e| e.to_string())?;
-        let default_dir = std::env::temp_dir();
+        let default_dir = quarry_core::default_temp_dir();
         self.scheduler
             .set_working_directory(default_dir.clone(), false);
         self.join.temporary = default_dir.clone();
@@ -4484,6 +4656,25 @@ impl WorkbenchController {
                     self.scheduler
                         .tab(id)
                         .is_some_and(WorkbenchTab::document_busy)
+                })
+            })
+    }
+
+    /// Returns `true` whenever any workflow, document job, Live Watch session, or whitespace
+    /// inspection batch requires active 32 ms background polling. When `false`, the GPUI
+    /// coordinator parks with zero timers and zero main-thread wake-ups until signalled.
+    pub fn has_active_background_work(&self) -> bool {
+        self.combine.busy()
+            || self.join.running_operation()
+            || self.inspect.busy()
+            || self.inspect.recovering()
+            || self.cache_clear_worker.is_some()
+            || self.storage_check_worker.is_some()
+            || self.scheduler.windows().into_iter().any(|window| {
+                self.scheduler.tabs_in_window(window).into_iter().any(|id| {
+                    self.scheduler
+                        .tab(id)
+                        .is_some_and(WorkbenchTab::has_background_activity)
                 })
             })
     }
@@ -4577,7 +4768,7 @@ impl WorkbenchController {
             self.hud_sampler.set_targets(next_targets);
         }
         let latest = self.hud_sampler.snapshot();
-        if latest != self.hud_sample {
+        if !latest.metrics_eq(&self.hud_sample) {
             self.hud_sample = latest;
             changed = true;
         }
@@ -4896,5 +5087,50 @@ impl WorkbenchController {
         if changed {
             cx.notify();
         }
+    }
+}
+
+impl Drop for WorkbenchController {
+    fn drop(&mut self) {
+        self.ui_wakeup.shutdown();
+    }
+}
+
+#[cfg(test)]
+mod wakeup_tests {
+    use super::UiWakeup;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Context, Poll, Wake, Waker};
+
+    struct CountWaker(AtomicUsize);
+    impl Wake for CountWaker {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    #[test]
+    fn ui_wakeup_parks_until_notified_and_exits_on_shutdown() {
+        let wakeup = UiWakeup::new();
+        let counter = Arc::new(CountWaker(AtomicUsize::new(0)));
+        let waker = Waker::from(Arc::clone(&counter));
+        let mut cx = Context::from_waker(&waker);
+
+        let mut fut = wakeup.wait();
+        assert_eq!(Pin::new(&mut fut).poll(&mut cx), Poll::Pending);
+        assert_eq!(counter.0.load(Ordering::Acquire), 0);
+
+        wakeup.notify();
+        assert_eq!(counter.0.load(Ordering::Acquire), 1);
+        assert_eq!(Pin::new(&mut fut).poll(&mut cx), Poll::Ready(true));
+
+        let mut fut2 = wakeup.wait();
+        assert_eq!(Pin::new(&mut fut2).poll(&mut cx), Poll::Pending);
+        wakeup.shutdown();
+        assert_eq!(counter.0.load(Ordering::Acquire), 2);
+        assert_eq!(Pin::new(&mut fut2).poll(&mut cx), Poll::Ready(false));
     }
 }

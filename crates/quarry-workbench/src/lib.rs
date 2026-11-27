@@ -64,11 +64,11 @@ pub use tab::{
     filter_query_from_rules,
 };
 pub use theme::{
-    ACCENT, CONTROL_RADIUS, DARK, GRID_FONT_SIZE, LIGHT, MAX_OMARCHY_THEME_BYTES, Palette,
-    ResolvedTheme, Rgba, ThemeAppearance, ThemePreference, ThemePreferences, WINDOW_RADIUS,
-    contrast_ratio, load_omarchy_theme_from_home, looks_numeric, omarchy_allowed_roots,
-    omarchy_theme_fingerprint, palette_meets_wcag_aa, relative_luminance, resolve_theme,
-    resolve_theme_for_current_user, source_looks_numeric,
+    ACCENT, CONTROL_RADIUS, DARK, GRID_FONT_SIZE, LIGHT, MAX_OMARCHY_THEME_BYTES,
+    OmarchyThemeWatcher, Palette, ResolvedTheme, Rgba, ThemeAppearance, ThemePreference,
+    ThemePreferences, WINDOW_RADIUS, contrast_ratio, load_omarchy_theme_from_home, looks_numeric,
+    omarchy_allowed_roots, omarchy_theme_fingerprint, palette_meets_wcag_aa, relative_luminance,
+    resolve_theme, resolve_theme_for_current_user, source_looks_numeric,
 };
 pub use word_wrap::{
     DEFAULT_WORD_WRAP_AUTO_DISABLE_BYTES, EffectiveWordWrap, MAX_CACHED_WRAP_ROWS,

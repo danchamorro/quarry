@@ -97,6 +97,131 @@ pub fn check_storage(
     inspect_storage(directory)?.require(additional_required_bytes)
 }
 
+/// Returns the default temporary scratch directory for large spills and gzip decompression.
+///
+/// On Linux, `/tmp` is frequently mounted on RAM-backed `tmpfs` (e.g., Omarchy, Arch, Fedora),
+/// which would silently consume RAM during multi-GB sorts or decompression. When `TMPDIR` is not
+/// explicitly set and the system temp directory is RAM-backed (`tmpfs`/`ramfs`), Quarry prefers
+/// a private disk-backed folder under `$XDG_CACHE_HOME/quarry/tmp` (or `$HOME/.cache/quarry/tmp`),
+/// falling back to `std::env::temp_dir()` if unavailable.
+pub fn default_temp_dir() -> PathBuf {
+    #[cfg(target_os = "linux")]
+    {
+        let system_temp = std::env::temp_dir();
+        let tmpdir_env = std::env::var_os("TMPDIR")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from);
+        let xdg_cache_home = std::env::var_os("XDG_CACHE_HOME")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from);
+        let home = std::env::var_os("HOME")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from);
+        resolve_default_temp_dir(
+            system_temp,
+            tmpdir_env,
+            xdg_cache_home,
+            home,
+            is_ram_backed_filesystem,
+        )
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        std::env::temp_dir()
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn is_ram_backed_filesystem(path: &Path) -> bool {
+    const TMPFS_MAGIC: u64 = 0x0102_1994;
+    const RAMFS_MAGIC: u64 = 0x8584_58f6;
+    let Ok(stat) = rustix::fs::statfs(path) else {
+        return false;
+    };
+    matches!(stat.f_type as u64, TMPFS_MAGIC | RAMFS_MAGIC)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn resolve_default_temp_dir(
+    system_temp: PathBuf,
+    tmpdir_env: Option<PathBuf>,
+    xdg_cache_home: Option<PathBuf>,
+    home: Option<PathBuf>,
+    is_ram_backed: impl Fn(&Path) -> bool,
+) -> PathBuf {
+    if let Some(explicit) = tmpdir_env.filter(|p| p.is_absolute()) {
+        return explicit;
+    }
+    if !is_ram_backed(&system_temp) {
+        return system_temp;
+    }
+    let Some(cache_root) = xdg_cache_home
+        .filter(|p| p.is_absolute())
+        .or_else(|| home.filter(|p| p.is_absolute()).map(|h| h.join(".cache")))
+    else {
+        return system_temp;
+    };
+    let quarry_dir = cache_root.join("quarry");
+    let candidate = quarry_dir.join("tmp");
+    if ensure_private_cache_temp_dir(&cache_root, &quarry_dir, &candidate).is_ok()
+        && !is_ram_backed(&candidate)
+    {
+        return candidate;
+    }
+    system_temp
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn ensure_private_cache_temp_dir(
+    cache_root: &Path,
+    quarry_dir: &Path,
+    candidate: &Path,
+) -> io::Result<()> {
+    fs::create_dir_all(cache_root)?;
+    for dir in [quarry_dir, candidate] {
+        match fs::symlink_metadata(dir) {
+            Ok(meta) => {
+                if meta.file_type().is_symlink() || !meta.is_dir() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "cache temp directory cannot be a symlink or non-directory",
+                    ));
+                }
+                #[cfg(unix)]
+                if meta.uid() != rustix::process::geteuid().as_raw() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "cache temp directory must be owned by the current user",
+                    ));
+                }
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                let mut builder = fs::DirBuilder::new();
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::DirBuilderExt;
+                    builder.mode(0o700);
+                }
+                match builder.create(dir) {
+                    Ok(()) => {}
+                    Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+                        let meta = fs::symlink_metadata(dir)?;
+                        if meta.file_type().is_symlink() || !meta.is_dir() {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                "cache temp directory cannot be a symlink or non-directory",
+                            ));
+                        }
+                    }
+                    Err(err) => return Err(err),
+                }
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(())
+}
+
 /// Strictly validate a user-selected scratch directory before use or persistence:
 /// must be an existing absolute directory, must not traverse or target a symlink / reparse point,
 /// must be owned by the current user, and must support private temporary storage creation.
@@ -1001,6 +1126,98 @@ mod tests {
             fs::create_dir(&nested).unwrap();
             assert!(super::validate_scratch_directory(&link.join("child")).is_err());
             assert!(super::validate_scratch_directory(&nested).is_ok());
+        }
+    }
+
+    #[test]
+    fn resolve_default_temp_dir_prefers_private_xdg_cache_when_system_temp_is_ram_backed() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake_tmp = dir.path().join("tmpfs_tmp");
+        let fake_xdg = dir.path().join("xdg_cache");
+        let fake_home = dir.path().join("home");
+        fs::create_dir(&fake_tmp).unwrap();
+
+        // Disk-backed system temp is kept directly.
+        let disk_kept = super::resolve_default_temp_dir(
+            fake_tmp.clone(),
+            None,
+            Some(fake_xdg.clone()),
+            Some(fake_home.clone()),
+            |_| false,
+        );
+        assert_eq!(disk_kept, fake_tmp);
+
+        // Explicit TMPDIR always wins even when system temp is RAM-backed.
+        let explicit_dir = dir.path().join("explicit_tmpdir");
+        let honored = super::resolve_default_temp_dir(
+            fake_tmp.clone(),
+            Some(explicit_dir.clone()),
+            Some(fake_xdg.clone()),
+            Some(fake_home.clone()),
+            |_| true,
+        );
+        assert_eq!(honored, explicit_dir);
+
+        // RAM-backed /tmp falls over to private $XDG_CACHE_HOME/quarry/tmp.
+        let chosen_xdg = super::resolve_default_temp_dir(
+            fake_tmp.clone(),
+            None,
+            Some(fake_xdg.clone()),
+            Some(fake_home.clone()),
+            |p| p == fake_tmp,
+        );
+        assert_eq!(chosen_xdg, fake_xdg.join("quarry").join("tmp"));
+        assert!(chosen_xdg.is_dir());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&chosen_xdg).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
+
+        // Unset or relative XDG_CACHE_HOME falls over to $HOME/.cache/quarry/tmp.
+        let chosen_home = super::resolve_default_temp_dir(
+            fake_tmp.clone(),
+            None,
+            Some(PathBuf::from("relative/cache")),
+            Some(fake_home.clone()),
+            |p| p == fake_tmp,
+        );
+        assert_eq!(
+            chosen_home,
+            fake_home.join(".cache").join("quarry").join("tmp")
+        );
+        assert!(chosen_home.is_dir());
+
+        // If the cache dir is also RAM-backed, fall back to system temp.
+        let all_ram = super::resolve_default_temp_dir(
+            fake_tmp.clone(),
+            None,
+            Some(fake_xdg.clone()),
+            Some(fake_home.clone()),
+            |_| true,
+        );
+        assert_eq!(all_ram, fake_tmp);
+
+        // Symlinked cache target is rejected and falls back safely.
+        #[cfg(unix)]
+        {
+            let link_root = dir.path().join("link_cache");
+            let link_quarry = link_root.join("quarry");
+            fs::create_dir_all(&link_quarry).unwrap();
+            let decoy = dir.path().join("decoy");
+            fs::create_dir(&decoy).unwrap();
+            std::os::unix::fs::symlink(&decoy, link_quarry.join("tmp")).unwrap();
+            let rejected = super::resolve_default_temp_dir(
+                fake_tmp.clone(),
+                None,
+                Some(link_root),
+                None,
+                |p| p == fake_tmp,
+            );
+            assert_eq!(rejected, fake_tmp);
         }
     }
 }

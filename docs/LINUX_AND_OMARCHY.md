@@ -104,10 +104,17 @@ When **View → Theme → Omarchy** is selected:
 
 - Quarry reads the active Omarchy theme from your local Omarchy directories (`~/.config/omarchy`, `~/.local/share/omarchy`, and `~/.local/state/omarchy`).
 - Symlink targets are validated against that allowlist (preventing symlink-escape reads outside Omarchy's local theme directories), and theme files are capped at **64 KiB**.
-- Quarry derives a full WCAG-checked semantic palette (canvas, chrome, zebra rows, selection, accent, and status indicators) from the active Omarchy palette and watches for theme generation updates so switching Omarchy themes updates open Quarry windows live.
+- Quarry derives a full WCAG-checked semantic palette (canvas, chrome, zebra rows, selection, accent, and status indicators) from the active Omarchy palette and watches Omarchy's theme directories using Linux `inotify` (with zero idle polling wake-ups and a brief grace window across `omarchy-theme-set`'s directory swap) so switching Omarchy themes updates open Quarry windows immediately without flashing a fallback palette.
 - If no Omarchy theme is installed on a non-Omarchy Linux desktop, Quarry falls back cleanly to its built-in **Dark** palette.
 
-Your chosen theme preference (`system`, `light`, `dark`, or `omarchy`) is persisted locally under `$XDG_CONFIG_HOME/quarry/theme.pref` (defaulting to `~/.config/quarry/theme.pref`).
+Your chosen theme preference (`system`, `light`, `dark`, or `omarchy`) is persisted locally under `$XDG_CONFIG_HOME/quarry/theme-preferences` (defaulting to `~/.config/quarry/theme-preferences`).
+
+## Temporary Scratch Storage on Linux (`tmpfs`)
+
+On Omarchy, Arch, and many systemd Linux desktops, `/tmp` is mounted as a RAM-backed `tmpfs`. To preserve Quarry's bounded-RAM guarantees during multi-GB sorts, duplicate scans, and gzip decompression:
+
+- When `TMPDIR` is not explicitly set and `/tmp` is `tmpfs`/`ramfs`, both the desktop app and `quarry` CLI automatically use a private (`0700`) disk-backed directory under `$XDG_CACHE_HOME/quarry/tmp` (defaulting to `~/.cache/quarry/tmp`).
+- You can override this at any time via **File → Temporary Storage…** in the desktop app, or `--temp-dir` / `TMPDIR` in the CLI.
 
 ---
 

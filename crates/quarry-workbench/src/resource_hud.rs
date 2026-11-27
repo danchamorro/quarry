@@ -60,6 +60,16 @@ impl Default for ResourceHudSample {
 }
 
 impl ResourceHudSample {
+    /// Returns `true` when two samples carry identical user-visible memory and volume metrics
+    /// (ignoring `sampled_at`), so idle UI loops do not wake or repaint on unchanged readings.
+    pub fn metrics_eq(&self, other: &Self) -> bool {
+        self.memory == other.memory
+            && self.scratch_volume == other.scratch_volume
+            && self.scratch_failed == other.scratch_failed
+            && self.document_volumes == other.document_volumes
+            && self.volumes == other.volumes
+    }
+
     /// Resolve the deduplicated volume list for a specific window's active document directory
     /// together with a flag indicating whether any required volume reading is missing/failed.
     pub fn volumes_for(&self, document_dir: Option<&Path>) -> (Vec<VolumeSpaceSample>, bool) {
@@ -125,7 +135,7 @@ impl Default for ResourceHudTargets {
     fn default() -> Self {
         Self {
             document_dirs: BTreeSet::new(),
-            scratch_dir: std::env::temp_dir(),
+            scratch_dir: quarry_core::default_temp_dir(),
         }
     }
 }
@@ -228,9 +238,13 @@ pub fn sample_resource_hud(targets: &ResourceHudTargets) -> ResourceHudSample {
     sample
 }
 
+/// Idle sampling interval used while no background jobs or Live Watch sessions are active.
+pub const IDLE_HUD_SAMPLE_INTERVAL: Duration = Duration::from_secs(2);
+
 struct SamplerState {
     targets: ResourceHudTargets,
     targets_changed: bool,
+    idle: bool,
     shutdown: bool,
 }
 
@@ -245,16 +259,39 @@ impl ResourceHudSampler {
     /// Start a background HUD sampler enforcing at least `interval` (clamped to `>= 500 ms`
     /// in production so sampling stays `<= 2 Hz`).
     pub fn start(initial_targets: ResourceHudTargets) -> Self {
-        Self::start_with_interval(initial_targets, DEFAULT_HUD_SAMPLE_INTERVAL)
+        Self::start_with_interval_and_notify(initial_targets, DEFAULT_HUD_SAMPLE_INTERVAL, None)
+    }
+
+    /// Start a background HUD sampler that invokes `on_change` whenever sampled memory or volume
+    /// metrics actually change (ignoring `sampled_at`), allowing idle UI threads to stay asleep.
+    pub fn start_with_notify(
+        initial_targets: ResourceHudTargets,
+        on_change: Arc<dyn Fn() + Send + Sync>,
+    ) -> Self {
+        Self::start_with_interval_and_notify(
+            initial_targets,
+            DEFAULT_HUD_SAMPLE_INTERVAL,
+            Some(on_change),
+        )
     }
 
     pub fn start_with_interval(initial_targets: ResourceHudTargets, interval: Duration) -> Self {
-        let interval = interval.max(DEFAULT_HUD_SAMPLE_INTERVAL);
+        Self::start_with_interval_and_notify(initial_targets, interval, None)
+    }
+
+    fn start_with_interval_and_notify(
+        initial_targets: ResourceHudTargets,
+        interval: Duration,
+        on_change: Option<Arc<dyn Fn() + Send + Sync>>,
+    ) -> Self {
+        let active_interval = interval.max(DEFAULT_HUD_SAMPLE_INTERVAL);
+        let idle_interval = active_interval.max(IDLE_HUD_SAMPLE_INTERVAL);
         let latest = Arc::new(Mutex::new(ResourceHudSample::default()));
         let state = Arc::new((
             Mutex::new(SamplerState {
                 targets: initial_targets,
                 targets_changed: true,
+                idle: false,
                 shutdown: false,
             }),
             Condvar::new(),
@@ -274,15 +311,20 @@ impl ResourceHudSampler {
                             if guard.shutdown {
                                 return;
                             }
+                            let current_interval = if guard.idle {
+                                idle_interval
+                            } else {
+                                active_interval
+                            };
                             let due = match last_sample {
                                 None => true,
-                                Some(prev) => prev.elapsed() >= interval,
+                                Some(prev) => prev.elapsed() >= current_interval,
                             };
                             if due {
                                 guard.targets_changed = false;
                                 break guard.targets.clone();
                             }
-                            let remaining = interval
+                            let remaining = current_interval
                                 .saturating_sub(last_sample.unwrap().elapsed())
                                 .max(Duration::from_millis(10));
                             let (next, _) = cvar.wait_timeout(guard, remaining).unwrap();
@@ -291,7 +333,15 @@ impl ResourceHudSampler {
                     };
                     let sample = sample_resource_hud(&targets);
                     last_sample = Some(sample.sampled_at);
-                    *worker_latest.lock().unwrap() = sample;
+                    let changed = {
+                        let mut slot = worker_latest.lock().unwrap();
+                        let changed = !slot.metrics_eq(&sample);
+                        *slot = sample;
+                        changed
+                    };
+                    if changed && let Some(cb) = &on_change {
+                        cb();
+                    }
                 }
             })
             .ok();
@@ -311,6 +361,18 @@ impl ResourceHudSampler {
             guard.targets = targets;
             guard.targets_changed = true;
             cvar.notify_one();
+        }
+    }
+
+    /// Switches between active (`>= 500 ms`) and idle (`>= 2 s`) background sampling cadence.
+    pub fn set_idle(&self, idle: bool) {
+        let (lock, cvar) = &*self.state;
+        let mut guard = lock.lock().unwrap();
+        if guard.idle != idle {
+            guard.idle = idle;
+            if !idle {
+                cvar.notify_one();
+            }
         }
     }
 
