@@ -28,7 +28,7 @@ use quarry_workbench::{
     WordWrapToggleOutcome, WorkbenchScheduler, WorkbenchSchedulerConfig, WorkbenchTab,
     clear_index_cache_summary, evaluate_command, inspect_temporary_storage,
     materialization_progress, omarchy_theme_fingerprint, resolve_theme, resolve_word_wrap,
-    select_column, whitespace,
+    select_column, sort_progress, whitespace,
 };
 
 /// Shared global concurrency cap across document saves, exports, structural edits, decompressions,
