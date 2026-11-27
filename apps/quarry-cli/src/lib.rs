@@ -65,6 +65,10 @@ pub fn run(args: impl IntoIterator<Item = String>) -> CliResult<()> {
         Some("duplicates") => duplicates_command(args.collect()),
         Some("clear-index-cache") => clear_index_cache_command(args.collect()),
         Some("generate") => generate_command(args.collect()),
+        Some("version" | "--version" | "-V") => {
+            println!("quarry {}", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
         Some("help" | "--help" | "-h") | None => {
             print_help();
             Ok(())
@@ -261,31 +265,33 @@ fn print_help() {
          --join COLUMNS SEPARATOR) \
          [--output-header NAME]... [--cancel-after-bytes N] \
          [--cache-state unknown|cold|warm]\n  \
-           quarry sort-save-as <SOURCE> <DESTINATION> [--column N] \
-         [--order asc|desc] [--mode text|natural|number|date|characters|words|shuffle|reverse] \
+           quarry sort-save-as <SOURCE> <DESTINATION> (--column N --order asc|desc | --mode shuffle|reverse) \
+         [--mode text|natural|number|date|characters|words|shuffle|reverse] \
          [--ignore-case] [--date-format ymd|mdy|dmy|datetime|rfc3339] \
          [--seed N] [--delimiter ,] [--header auto|first-row|none] \
-         [--temp-dir DIRECTORY] [--threads N] [--memory-budget BYTES] \
+         [--temp-dir DIRECTORY] [--threads N] [--memory-budget SIZE] \
          [--cancel-after-bytes N] [--cache-state unknown|cold|warm]\n  \
            quarry suggest-date-format <FILE> --column N [--max-rows N] [--max-bytes N] \
          [--delimiter ,] [--header auto|first-row|none] \
          [--temp-dir DIRECTORY] [--max-decompressed-bytes N]\n  \
            quarry duplicates <FILE> (--columns 1,2 | --all-fields) [--match-case] [--output FILE] \
-         [--temp-dir DIRECTORY] \
+         [--temp-dir DIRECTORY] [--threads N] [--memory-budget SIZE] \
          [--delimiter ,] [--header auto|first-row|none] \
          [--cancel-after-bytes N] [--cache-state unknown|cold|warm]\n  \
            quarry convert-utf8 <FILE> --output FILE [--edit DATA_ROW COLUMN VALUE]... \
          [--temp-dir DIRECTORY] [--max-decompressed-bytes N]\n  \
            quarry clear-index-cache [--index-cache-dir DIRECTORY]\n  \
            quarry generate --size 10GB --columns 40 --delimiter , \
-         --output FILE [--seed 1]\n\n\
+         --output FILE [--seed 1]\n  \
+           quarry --version\n\n\
          Commands that read an input file accept --encoding auto|utf8|utf16le|utf16be|windows1252|latin1; generate does not.\n\
          Parallel engine commands accept --threads N (default: available_parallelism - 1).\n\
+         --memory-budget accepts byte counts or size suffixes (for example 512MB, 512MiB, 1GB).\n\
          Indexing commands (open, viewport, search) accept --no-index-cache and --index-cache-dir DIRECTORY.\n\
          Auto detects Unicode BOMs and otherwise uses UTF-8; no legacy guessing.\n\n\
          Compressed input: inspect, open, viewport, search, filter, export, and convert-utf8 read gzip (.gz) files.\n\
          Quarry decompresses the file once into a private temporary copy and indexes it in the same pass.\n\
-         The copy goes in --temp-dir (default: the system temporary folder) and is removed when the command ends.\n\
+         The copy goes in --temp-dir (default: the system temporary folder, or $XDG_CACHE_HOME/quarry/tmp on Linux when /tmp is tmpfs) and is removed when the command ends.\n\
          --max-decompressed-bytes caps the copy (for example 512MB, 1GB, or a byte count).\n\
          open --no-wait reads only the first rows and writes no temporary file.\n\
          Compressed files are read-only: edit-save-as, replace-all-save-as, transform-save-as, sort-save-as,\n\
@@ -310,6 +316,16 @@ fn parse_threads(raw: &str) -> CliResult<usize> {
         return Err("--threads must be at least 1".into());
     }
     Ok(threads)
+}
+
+fn parse_memory_budget(raw: &str) -> CliResult<usize> {
+    let bytes = parse_size(raw).map_err(|err| format!("invalid --memory-budget {raw:?}: {err}"))?;
+    let budget = usize::try_from(bytes)
+        .map_err(|_| format!("--memory-budget {raw:?} exceeds addressable memory"))?;
+    if budget == 0 {
+        return Err("--memory-budget must be non-zero".into());
+    }
+    Ok(budget)
 }
 
 fn parse_index_cache_dir(args: &[String], cursor: &mut usize) -> CliResult<PathBuf> {
@@ -1429,11 +1445,11 @@ fn duplicates_command(args: Vec<String>) -> CliResult<()> {
                 threads = Some(parse_threads(value(&args, &mut cursor, "--threads")?)?);
             }
             "--memory-budget" => {
-                memory_budget_bytes =
-                    Some(value(&args, &mut cursor, "--memory-budget")?.parse::<usize>()?);
-                if memory_budget_bytes == Some(0) {
-                    return Err("--memory-budget must be non-zero".into());
-                }
+                memory_budget_bytes = Some(parse_memory_budget(value(
+                    &args,
+                    &mut cursor,
+                    "--memory-budget",
+                )?)?);
             }
             option if option.starts_with('-') => {
                 return Err(format!("unknown option {option:?}").into());
@@ -1491,7 +1507,7 @@ fn duplicates_command(args: Vec<String>) -> CliResult<()> {
             .as_nanos();
         let root = temporary_directory
             .clone()
-            .unwrap_or_else(std::env::temp_dir);
+            .unwrap_or_else(quarry_core::default_temp_dir);
         check_storage(&root, 0)?;
         let directory = root.join(format!("quarry-duplicates-{}-{suffix}", std::process::id()));
         let builder = &mut std::fs::DirBuilder::new();
@@ -1508,13 +1524,8 @@ fn duplicates_command(args: Vec<String>) -> CliResult<()> {
     let output = destination
         .clone()
         .unwrap_or_else(|| analysis_directory.as_ref().unwrap().join("candidate.csv"));
-    let temporary_directory = temporary_directory.unwrap_or_else(|| {
-        output
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."))
-            .to_path_buf()
-    });
+    let temporary_directory = temporary_directory
+        .unwrap_or_else(|| quarry_core::default_temp_dir_for_destination(&output));
     let result = (|| -> CliResult<()> {
         let spec = DuplicateSpec {
             target,
@@ -1916,11 +1927,11 @@ fn sort_save_as_command(args: Vec<String>) -> CliResult<()> {
                 threads = Some(parse_threads(value(&args, &mut cursor, "--threads")?)?);
             }
             "--memory-budget" => {
-                memory_budget_bytes =
-                    Some(value(&args, &mut cursor, "--memory-budget")?.parse::<usize>()?);
-                if memory_budget_bytes == Some(0) {
-                    return Err("--memory-budget must be non-zero".into());
-                }
+                memory_budget_bytes = Some(parse_memory_budget(value(
+                    &args,
+                    &mut cursor,
+                    "--memory-budget",
+                )?)?);
             }
             option if option.starts_with('-') => {
                 return Err(format!("unknown option {option:?}").into());
@@ -1940,7 +1951,9 @@ fn sort_save_as_command(args: Vec<String>) -> CliResult<()> {
         return Err("--date-format is only supported with --mode date".into());
     }
     let column = if mode.uses_column() {
-        column.ok_or("sort-save-as requires --column")?
+        column.ok_or(
+            "sort-save-as requires --column for this sort mode (omit only with --mode shuffle|reverse)",
+        )?
     } else {
         column.unwrap_or(1)
     };
@@ -1948,7 +1961,9 @@ fn sort_save_as_command(args: Vec<String>) -> CliResult<()> {
         return Err("sort column must be at least 1".into());
     }
     let direction = if mode.uses_column() {
-        direction.ok_or("sort-save-as requires --order")?
+        direction.ok_or(
+            "sort-save-as requires --order asc|desc for this sort mode (omit only with --mode shuffle|reverse)",
+        )?
     } else {
         if direction == Some(SortDirection::Descending) {
             return Err("shuffle and reverse do not accept descending order".into());
@@ -2015,13 +2030,8 @@ fn sort_save_as_command(args: Vec<String>) -> CliResult<()> {
         data_rows,
         &SortPlan::from(spec),
     );
-    let temporary_directory = temporary_directory.unwrap_or_else(|| {
-        destination
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."))
-            .to_path_buf()
-    });
+    let temporary_directory = temporary_directory
+        .unwrap_or_else(|| quarry_core::default_temp_dir_for_destination(&destination));
     println!(
         "Temporary working location: {}",
         temporary_directory.display()
@@ -4366,8 +4376,11 @@ impl CompressedArgs {
     }
 
     fn config(&self) -> CompressedOpenConfig {
-        let mut config =
-            CompressedOpenConfig::new(self.temp_dir.clone().unwrap_or_else(std::env::temp_dir));
+        let mut config = CompressedOpenConfig::new(
+            self.temp_dir
+                .clone()
+                .unwrap_or_else(quarry_core::default_temp_dir),
+        );
         config.max_decompressed_bytes = self.max_decompressed_bytes;
         config
     }
@@ -4894,28 +4907,71 @@ fn parse_delimiter(value: &str) -> CliResult<u8> {
 }
 
 fn parse_size(value: &str) -> CliResult<u64> {
-    let split = value
+    let trimmed = value.trim();
+    let split = trimmed
         .find(|character: char| !character.is_ascii_digit() && character != '.')
-        .unwrap_or(value.len());
-    let number: f64 = value[..split].parse()?;
-    let unit = value[split..].trim().to_ascii_uppercase();
-    let multiplier = match unit.as_str() {
-        "" | "B" => 1_f64,
-        "KB" => 1_000_f64,
-        "MB" => 1_000_000_f64,
-        "GB" => 1_000_000_000_f64,
-        "TB" => 1_000_000_000_000_f64,
-        "KIB" => 1024_f64,
-        "MIB" => 1024_f64.powi(2),
-        "GIB" => 1024_f64.powi(3),
-        "TIB" => 1024_f64.powi(4),
+        .unwrap_or(trimmed.len());
+    let number_str = &trimmed[..split];
+    if number_str.is_empty() {
+        return Err("size must start with a positive number".into());
+    }
+    let unit = trimmed[split..].trim().to_ascii_uppercase();
+    let multiplier: u128 = match unit.as_str() {
+        "" | "B" => 1,
+        "KB" => 1_000,
+        "MB" => 1_000_000,
+        "GB" => 1_000_000_000,
+        "TB" => 1_000_000_000_000,
+        "KIB" => 1024,
+        "MIB" => 1024_u128.pow(2),
+        "GIB" => 1024_u128.pow(3),
+        "TIB" => 1024_u128.pow(4),
         _ => return Err(format!("unsupported size unit {unit:?}").into()),
     };
-    let bytes = number * multiplier;
-    if !bytes.is_finite() || bytes < 1.0 || bytes > u64::MAX as f64 {
+
+    let (int_part, frac_part) = match number_str.split_once('.') {
+        Some((int_p, frac_p)) => {
+            if frac_p.contains('.') || (int_p.is_empty() && frac_p.is_empty()) {
+                return Err("invalid decimal size".into());
+            }
+            (int_p, frac_p)
+        }
+        None => (number_str, ""),
+    };
+    if !int_part.bytes().all(|b| b.is_ascii_digit())
+        || !frac_part.bytes().all(|b| b.is_ascii_digit())
+    {
+        return Err("invalid numeric size".into());
+    }
+
+    let int_val: u128 = if int_part.is_empty() {
+        0
+    } else {
+        int_part
+            .parse::<u128>()
+            .map_err(|_| "size must be between 1 byte and u64::MAX")?
+    };
+    let int_bytes = int_val
+        .checked_mul(multiplier)
+        .ok_or("size must be between 1 byte and u64::MAX")?;
+
+    // Scale fractional digits with exact checked integer arithmetic (truncating only sub-byte
+    // remainders). Processing right-to-left preserves the exact floor `floor(frac * multiplier)`
+    // across arbitrarily many digits (e.g. `0.00000095367431640625MiB == 1 byte`) without ever
+    // overflowing `u128`, because `carry <= multiplier <= 1024^4`.
+    let mut frac_bytes: u128 = 0;
+    for digit in frac_part.bytes().rev() {
+        let cur = u128::from(digit - b'0') * multiplier + frac_bytes;
+        frac_bytes = cur / 10;
+    }
+
+    let total = int_bytes
+        .checked_add(frac_bytes)
+        .ok_or("size must be between 1 byte and u64::MAX")?;
+    if total == 0 || total > u128::from(u64::MAX) {
         return Err("size must be between 1 byte and u64::MAX".into());
     }
-    Ok(bytes as u64)
+    Ok(total as u64)
 }
 
 fn render_field(field: &[u8]) -> String {
@@ -5073,7 +5129,7 @@ mod tests {
         ];
         let candidate_directories = || {
             let prefix = format!("quarry-duplicates-{}-", std::process::id());
-            fs::read_dir(std::env::temp_dir())
+            fs::read_dir(quarry_core::default_temp_dir())
                 .unwrap()
                 .map(|entry| entry.unwrap().file_name())
                 .filter(|name| name.to_string_lossy().starts_with(&prefix))
@@ -6199,11 +6255,11 @@ mod tests {
             ),
             (
                 vec!["source.csv", "sorted.csv"],
-                "sort-save-as requires --column",
+                "sort-save-as requires --column for this sort mode (omit only with --mode shuffle|reverse)",
             ),
             (
                 vec!["source.csv", "sorted.csv", "--column", "1"],
-                "sort-save-as requires --order",
+                "sort-save-as requires --order asc|desc for this sort mode (omit only with --mode shuffle|reverse)",
             ),
             (
                 vec![
@@ -7153,6 +7209,111 @@ mod tests {
             "first-row".into(),
         ])
         .unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn cli_version_and_memory_budget_size_suffixes_and_sort_error_clarity() {
+        assert!(super::run(vec!["--version".into()]).is_ok());
+        assert!(super::run(vec!["-V".into()]).is_ok());
+        assert!(super::run(vec!["version".into()]).is_ok());
+
+        assert_eq!(super::parse_memory_budget("512MB").unwrap(), 512_000_000);
+        assert_eq!(
+            super::parse_memory_budget("512MiB").unwrap(),
+            512 * 1024 * 1024
+        );
+        assert_eq!(super::parse_memory_budget("1048576").unwrap(), 1_048_576);
+        // Exact integer byte counts > 2^53 must not lose precision through f64,
+        // and u64::MAX + 1 must fail instead of saturating to u64::MAX.
+        assert_eq!(
+            super::parse_size("9007199254740993").unwrap(),
+            9_007_199_254_740_993
+        );
+        assert_eq!(
+            super::parse_size("9007199254740993.0B").unwrap(),
+            9_007_199_254_740_993
+        );
+        assert_eq!(super::parse_size("18446744073709551615").unwrap(), u64::MAX);
+        assert_eq!(
+            super::parse_size("18446744073709551615.0B").unwrap(),
+            u64::MAX
+        );
+        assert_eq!(super::parse_size("1.5GB").unwrap(), 1_500_000_000);
+        // Binary fractions requiring >18 decimal digits (1 / 2^20 MiB == 1 byte) must stay exact.
+        assert_eq!(
+            super::parse_size("1.00000095367431640625MiB").unwrap(),
+            1_048_577
+        );
+        assert_eq!(super::parse_size("0.00000095367431640625MiB").unwrap(), 1);
+        assert_eq!(super::parse_size(".00000095367431640625MiB").unwrap(), 1);
+        assert!(super::parse_size("18446744073709551616").is_err());
+        assert!(super::parse_size("18446744073709551616.0B").is_err());
+        assert!(super::parse_memory_budget("18446744073709551616").is_err());
+        assert!(super::parse_memory_budget("18446744073709551616.0B").is_err());
+        #[cfg(target_pointer_width = "64")]
+        {
+            assert_eq!(
+                super::parse_memory_budget("9007199254740993").unwrap(),
+                9_007_199_254_740_993
+            );
+            assert_eq!(
+                super::parse_memory_budget("9007199254740993.0B").unwrap(),
+                9_007_199_254_740_993
+            );
+            assert_eq!(
+                super::parse_memory_budget("18446744073709551615.0B").unwrap(),
+                usize::MAX
+            );
+        }
+        let bad_budget = super::parse_memory_budget("abc").unwrap_err().to_string();
+        assert!(
+            bad_budget.contains("--memory-budget"),
+            "error must name --memory-budget; got {bad_budget}"
+        );
+
+        let dir = std::env::temp_dir().join(format!(
+            "quarry-cli-227-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("src.csv");
+        let dst = dir.join("dst.csv");
+        fs::write(&src, b"k,v\nb,2\na,1\n").unwrap();
+
+        // Missing --order in default text mode gives an explicit error mentioning shuffle/reverse.
+        let missing_order = super::run(vec![
+            "sort-save-as".into(),
+            src.display().to_string(),
+            dst.display().to_string(),
+            "--column".into(),
+            "1".into(),
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(missing_order.contains("--order"));
+        assert!(missing_order.contains("shuffle"));
+
+        // --memory-budget 512MB works end-to-end on sort-save-as.
+        super::run(vec![
+            "sort-save-as".into(),
+            src.display().to_string(),
+            dst.display().to_string(),
+            "--column".into(),
+            "1".into(),
+            "--order".into(),
+            "asc".into(),
+            "--header".into(),
+            "first-row".into(),
+            "--memory-budget".into(),
+            "512MB".into(),
+        ])
+        .unwrap();
+        assert_eq!(fs::read_to_string(&dst).unwrap(), "k,v\na,1\nb,2\n");
         fs::remove_dir_all(&dir).unwrap();
     }
 }

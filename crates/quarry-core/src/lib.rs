@@ -132,15 +132,16 @@ pub use source_stamp::{
 pub use source_stamp::{acquire_macos_install_lock, acquire_macos_install_lock_at};
 pub use splice::{SpliceDiskPreflight, SpliceSaveSummary, SpliceStrategy};
 pub use storage::{
-    StorageSpace, available_disk_space, check_storage, estimate_duplicate_target_temporary_bytes,
+    StorageSpace, available_disk_space, check_storage, default_temp_dir,
+    default_temp_dir_for_destination, estimate_duplicate_target_temporary_bytes,
     estimate_duplicate_temporary_bytes, estimate_edited_output_bytes,
     estimate_edited_output_bytes_from_values, inspect_storage, restrict_private_file,
     validate_scratch_directory,
 };
 pub use watch::{
-    DEFAULT_WATCH_POLL_INTERVAL, LiveWatchFilterJob, LiveWatchJob, LiveWatchReader,
-    NETWORK_WATCH_POLL_INTERVAL, WatchAlert, WatchBackend, WatchConfig, WatchProvisionalTail,
-    WatchSnapshot, WatchStatus, WatchStopOutcome,
+    DEFAULT_WATCH_POLL_INTERVAL, DirectoryWatch, DirectoryWatchEvent, DirectoryWatchWakeup,
+    LiveWatchFilterJob, LiveWatchJob, LiveWatchReader, NETWORK_WATCH_POLL_INTERVAL, WatchAlert,
+    WatchBackend, WatchConfig, WatchProvisionalTail, WatchSnapshot, WatchStatus, WatchStopOutcome,
 };
 
 const DEFAULT_SAMPLE_BYTES: usize = 1024 * 1024;

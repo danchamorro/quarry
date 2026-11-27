@@ -568,7 +568,7 @@ impl Default for WorkbenchSchedulerConfig {
             max_hydrated_tabs: DEFAULT_MAX_HYDRATED_TABS,
             max_dirty_overlay_bytes: DEFAULT_MAX_DIRTY_OVERLAY_BYTES,
             max_process_fds: MAX_PROCESS_FD_BUDGET,
-            working_directory: std::env::temp_dir(),
+            working_directory: quarry_core::default_temp_dir(),
             custom_working_directory: false,
             index_cache_enabled: true,
             defer_gzip_decompression: false,
