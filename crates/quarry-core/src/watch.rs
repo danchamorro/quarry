@@ -7,6 +7,7 @@
 //! copytruncate / rename rotation (`tail -f` drain + "Open new file"), and evaluates active
 //! filters incrementally on appended rows only.
 
+use std::collections::VecDeque;
 use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -221,7 +222,7 @@ struct TailScanner {
     observed_file_len: u64,
     scanner_consumed_bytes: u64,
     committed_record_end: u64,
-    seam_bytes: Vec<u8>,
+    seam_bytes: VecDeque<u8>,
     last_verified_stamp: SourceStamp,
 }
 
@@ -302,7 +303,8 @@ impl TailScanner {
                     current_len: start + read as u64,
                 });
             }
-            if observed != self.seam_bytes {
+            let (front, back) = self.seam_bytes.as_slices();
+            if &observed[..front.len()] != front || &observed[front.len()..] != back {
                 return Ok(SeamCheck::Rewritten);
             }
         }
@@ -437,6 +439,11 @@ impl TailScanner {
         };
 
         // Process each newly terminated record in order so `provisional_bytes` never exceeds the cap.
+        // Batch seam updates across contiguous records borrowed directly from `new_bytes` so a
+        // stream of tiny records (e.g., 1-byte `\n` lines) updates the 4 KiB seam once per chunk
+        // instead of shifting bytes on every record.
+        let mut batch_seam_start: Option<usize> = None;
+        let mut loop_error: Option<QuarryError> = None;
         for absolute_end in record_ends {
             let local_end_in_new = usize::try_from(
                 absolute_end
@@ -447,9 +454,10 @@ impl TailScanner {
             let piece = &new_bytes[consumed_from_new..local_end_in_new];
             let rec_len = self.provisional_bytes.len().saturating_add(piece.len());
             if rec_len > self.max_record_bytes {
-                return Err(QuarryError::RecordTooLarge {
+                loop_error = Some(QuarryError::RecordTooLarge {
                     limit: self.max_record_bytes,
                 });
+                break;
             }
 
             let record_start = self.committed_record_end;
@@ -457,7 +465,8 @@ impl TailScanner {
 
             // Borrow directly from `piece` when the entire record lies inside `new_bytes`
             // (zero-copy fast path during sustained streaming!), otherwise assemble in `provisional_bytes`.
-            let record_slice: &[u8] = if self.provisional_bytes.is_empty() {
+            let assembled_from_provisional = !self.provisional_bytes.is_empty();
+            let record_slice: &[u8] = if !assembled_from_provisional {
                 piece
             } else {
                 self.provisional_bytes.extend_from_slice(piece);
@@ -472,16 +481,21 @@ impl TailScanner {
                 } else {
                     record_slice
                 };
-                self.encoding
+                if let Err(err) = self
+                    .encoding
                     .decode(body, self.max_record_bytes)
-                    .map_err(|err| crate::record_encoding_error(row_number + 1, err))?;
+                    .map_err(|err| crate::record_encoding_error(row_number + 1, err))
+                {
+                    loop_error = Some(err);
+                    break;
+                }
             }
 
             if let (Some(filter_state), Some((query, matchers, groups))) =
                 (filter.as_deref_mut(), compiled_filter.as_ref())
                 && row_number >= filter_state.data_start
             {
-                let matched = record_matches_fast(
+                let matched = match record_matches_fast(
                     record_slice,
                     self.delimiter,
                     row_number,
@@ -493,7 +507,13 @@ impl TailScanner {
                     &filter_state.edits,
                     self.encoding,
                     &mut field_ranges,
-                )?;
+                ) {
+                    Ok(matched) => matched,
+                    Err(err) => {
+                        loop_error = Some(err);
+                        break;
+                    }
+                };
                 if matched {
                     filter_state.index.record_match(row_number, record_start);
                 }
@@ -512,12 +532,25 @@ impl TailScanner {
                 );
                 index.set_maximum_width(index.maximum_width().max(width));
             }
-            append_to_seam_buf(&mut self.seam_bytes, record_slice);
+            if assembled_from_provisional {
+                append_to_seam_buf(&mut self.seam_bytes, record_slice);
+            } else {
+                batch_seam_start.get_or_insert(consumed_from_new);
+            }
             index.record_boundary(absolute_end);
             self.committed_record_end = absolute_end;
             self.provisional_bytes.clear();
             consumed_from_new = local_end_in_new;
             newly_committed += 1;
+        }
+        if let Some(batch_start) = batch_seam_start {
+            append_to_seam_buf(
+                &mut self.seam_bytes,
+                &new_bytes[batch_start..consumed_from_new],
+            );
+        }
+        if let Some(err) = loop_error {
+            return Err(err);
         }
 
         // Propagate any parse error after committing the valid prefix; never save the errored suffix.
@@ -717,26 +750,26 @@ fn count_encoded_record_fields(
     }
 }
 
-fn append_to_seam_buf(seam_bytes: &mut Vec<u8>, committed_slice: &[u8]) {
+fn append_to_seam_buf(seam_bytes: &mut VecDeque<u8>, committed_slice: &[u8]) {
     if committed_slice.is_empty() {
         return;
     }
     if committed_slice.len() >= SEAM_WINDOW_BYTES {
         seam_bytes.clear();
-        seam_bytes.extend_from_slice(&committed_slice[committed_slice.len() - SEAM_WINDOW_BYTES..]);
+        seam_bytes.extend(&committed_slice[committed_slice.len() - SEAM_WINDOW_BYTES..]);
     } else {
         let total = seam_bytes.len() + committed_slice.len();
         if total > SEAM_WINDOW_BYTES {
             let drop_count = total - SEAM_WINDOW_BYTES;
             seam_bytes.drain(..drop_count);
         }
-        seam_bytes.extend_from_slice(committed_slice);
+        seam_bytes.extend(committed_slice);
     }
 }
 
-fn read_seam_bytes(file: &File, end_offset: u64) -> Result<Vec<u8>, QuarryError> {
+fn read_seam_bytes(file: &File, end_offset: u64) -> Result<VecDeque<u8>, QuarryError> {
     if end_offset == 0 {
-        return Ok(Vec::new());
+        return Ok(VecDeque::with_capacity(SEAM_WINDOW_BYTES));
     }
     let len = end_offset.min(SEAM_WINDOW_BYTES as u64) as usize;
     let start = end_offset - len as u64;
@@ -745,7 +778,9 @@ fn read_seam_bytes(file: &File, end_offset: u64) -> Result<Vec<u8>, QuarryError>
     if read < len {
         return Err(QuarryError::SourceChanged);
     }
-    Ok(buf)
+    let mut deque = VecDeque::with_capacity(SEAM_WINDOW_BYTES);
+    deque.extend(buf);
+    Ok(deque)
 }
 
 /// Inspects whether the last indexed row in `index` lacks a trailing newline, and if so returns
@@ -831,6 +866,7 @@ struct WatchShared {
     filter: RwLock<Option<WatchFilterState>>,
     snapshot: RwLock<WatchSnapshot>,
     stop_requested: AtomicBool,
+    drop_requested: AtomicBool,
     /// Used by the polling backend and for waking tests / shutdown cleanly.
     wake_cond: (Mutex<bool>, Condvar),
     #[cfg(any(
@@ -1127,6 +1163,7 @@ impl LiveWatchJob {
             filter: RwLock::new(live_filter),
             snapshot: RwLock::new(initial_snapshot),
             stop_requested: AtomicBool::new(false),
+            drop_requested: AtomicBool::new(false),
             wake_cond: (Mutex::new(false), Condvar::new()),
             #[cfg(any(
                 target_os = "macos",
@@ -1567,6 +1604,7 @@ impl LiveWatchJob {
 impl Drop for LiveWatchJob {
     fn drop(&mut self) {
         if let Some(handle) = self.handle.take() {
+            self.shared.drop_requested.store(true, Ordering::Release);
             self.shared.stop_requested.store(true, Ordering::Release);
             self.shared.signal_wakeup();
             let _ = handle.join();
@@ -1806,10 +1844,18 @@ fn run_watch_loop(
 
     loop {
         if shared.stop_requested.load(Ordering::Acquire) {
+            if shared.drop_requested.load(Ordering::Acquire) {
+                status = WatchStatus::Stopped;
+                publish_snapshot(&shared, &tail, &status, events_coalesced);
+                return WatchWorkerResult {
+                    tail,
+                    final_status: status,
+                };
+            }
             // Drain any already-written bytes once before clean stop when still actively watching,
             // propagating both alerts and scan/IO errors rather than reporting a false `Stopped`.
             if status.is_active() {
-                match reconcile_once(&shared, &mut tail, &mut read_buf, &mut status) {
+                match reconcile_once(&shared, &mut tail, &mut read_buf, &mut status, false) {
                     Ok(ReconcileOutcome::Alert(alert)) => {
                         status = WatchStatus::Alert(alert);
                         publish_snapshot(&shared, &tail, &status, events_coalesced);
@@ -1854,7 +1900,7 @@ fn run_watch_loop(
             continue;
         }
 
-        match reconcile_once(&shared, &mut tail, &mut read_buf, &mut status) {
+        match reconcile_once(&shared, &mut tail, &mut read_buf, &mut status, true) {
             Ok(ReconcileOutcome::Changed) => {
                 publish_snapshot(&shared, &tail, &status, events_coalesced);
             }
@@ -2083,6 +2129,7 @@ fn drain_open_fd(
     shared: &WatchShared,
     tail: &mut TailScanner,
     read_buf: &mut [u8],
+    check_stop: bool,
 ) -> Result<DrainOutcome, QuarryError> {
     let mut changed = false;
 
@@ -2146,13 +2193,18 @@ fn drain_open_fd(
     }
 
     // 3. Drain all newly appended bytes from the pinned open FD (`[scanner_consumed_bytes, current_len)`).
-    if current_len > tail.observed_file_len {
-        tail.observed_file_len = current_len;
+    let target_len = current_len;
+    if target_len > tail.observed_file_len {
         changed = true;
     }
 
-    while tail.scanner_consumed_bytes < tail.observed_file_len {
-        let want = usize::try_from(tail.observed_file_len - tail.scanner_consumed_bytes)
+    let mut cancelled_mid_drain = false;
+    while tail.scanner_consumed_bytes < target_len {
+        if check_stop && shared.stop_requested.load(Ordering::Acquire) {
+            cancelled_mid_drain = true;
+            break;
+        }
+        let want = usize::try_from(target_len - tail.scanner_consumed_bytes)
             .unwrap_or(read_buf.len())
             .min(read_buf.len());
         let read = read_at_exact_or_eof(
@@ -2162,7 +2214,7 @@ fn drain_open_fd(
         )?;
         if read < want {
             // Short read on an expected grown region means concurrent truncation.
-            let previous_len = tail.observed_file_len;
+            let previous_len = target_len.max(tail.observed_file_len);
             let actual_len = tail.scanner_consumed_bytes + read as u64;
             tail.observed_file_len = actual_len;
             return Ok(DrainOutcome::Alert(WatchAlert::Truncated {
@@ -2179,6 +2231,7 @@ fn drain_open_fd(
             &mut index_guard,
             filter_guard.as_mut(),
         );
+        tail.observed_file_len = tail.observed_file_len.max(tail.scanner_consumed_bytes);
         // Publish the updated frontier and generation under the same `index -> filter -> snapshot`
         // lock scope so `state_snapshot()` can never observe a newly committed index paired with
         // an earlier snapshot or generation.
@@ -2195,7 +2248,10 @@ fn drain_open_fd(
         }
     }
 
-    tail.last_verified_stamp = current_stamp;
+    if !cancelled_mid_drain {
+        tail.observed_file_len = tail.observed_file_len.max(target_len);
+        tail.last_verified_stamp = current_stamp;
+    }
 
     Ok(if changed {
         DrainOutcome::Changed
@@ -2209,12 +2265,20 @@ fn reconcile_once(
     tail: &mut TailScanner,
     read_buf: &mut [u8],
     status: &mut WatchStatus,
+    check_stop: bool,
 ) -> Result<ReconcileOutcome, QuarryError> {
-    let mut changed = match drain_open_fd(shared, tail, read_buf)? {
+    let mut changed = match drain_open_fd(shared, tail, read_buf, check_stop)? {
         DrainOutcome::Alert(alert) => return Ok(ReconcileOutcome::Alert(alert)),
         DrainOutcome::Changed => true,
         DrainOutcome::Unchanged => false,
     };
+    if check_stop && shared.stop_requested.load(Ordering::Acquire) {
+        return Ok(if changed {
+            ReconcileOutcome::Changed
+        } else {
+            ReconcileOutcome::Unchanged
+        });
+    }
 
     // 4. Reconcile current path identity (draining the open FD again on `Replaced` so any final
     //    records written to the old inode between step 3 and replacement are delivered before
@@ -2233,7 +2297,7 @@ fn reconcile_once(
             }
         }
         PathIdentityCheck::Replaced => {
-            if let DrainOutcome::Alert(alert) = drain_open_fd(shared, tail, read_buf)? {
+            if let DrainOutcome::Alert(alert) = drain_open_fd(shared, tail, read_buf, check_stop)? {
                 return Ok(ReconcileOutcome::Alert(alert));
             }
             return Ok(ReconcileOutcome::Alert(WatchAlert::Rotated));
@@ -4014,5 +4078,90 @@ mod tests {
         let stopped2 = restarted.stop().unwrap();
         assert_eq!(stopped2.final_status, WatchStatus::Stopped);
         assert!(stopped2.index.is_complete());
+    }
+
+    #[test]
+    fn tiny_record_burst_batches_ring_seam_and_drop_exits_promptly() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tiny_burst.csv");
+        std::fs::write(&path, b"a\n").unwrap();
+
+        let (session, index) = open_and_index(&path, None, HeaderMode::NoHeader);
+        let watch = session
+            .start_live_watch(
+                &index,
+                None,
+                WatchConfig {
+                    poll_interval: Duration::from_millis(15),
+                    cache_config: IndexCacheConfig::disabled(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        // Append 256 KiB of 1-byte `\n` records plus a distinctive final record to exercise the
+        // ring-buffered batched seam across hundreds of thousands of tiny records.
+        let mut payload = vec![b'\n'; 256 * 1024];
+        payload.extend_from_slice(b"tail-marker\n");
+        let expected_rows = 1 + (256 * 1024) as u64 + 1;
+        let expected_len = 2 + payload.len() as u64;
+        let mut f = FsOpenOptions::new().append(true).open(&path).unwrap();
+        f.write_all(&payload).unwrap();
+        f.flush().unwrap();
+        watch.nudge();
+
+        assert!(wait_until(Duration::from_secs(5), || {
+            let snap = watch.snapshot();
+            snap.committed_rows == expected_rows && snap.committed_record_end == expected_len
+        }));
+
+        // Overwriting a byte inside the trailing 4 KiB seam must still be caught after batching.
+        {
+            use std::io::{Seek, SeekFrom};
+            let mut rw = FsOpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .unwrap();
+            rw.seek(SeekFrom::Start(expected_len - 4)).unwrap();
+            rw.write_all(b"X").unwrap();
+            rw.flush().unwrap();
+        }
+        watch.nudge();
+        assert!(wait_until(Duration::from_secs(3), || {
+            watch.snapshot().status == WatchStatus::Alert(WatchAlert::Rewritten)
+        }));
+        let stopped = watch.stop().unwrap();
+        assert_eq!(
+            stopped.final_status,
+            WatchStatus::Alert(WatchAlert::Rewritten)
+        );
+
+        // Dropping a live watch while a multi-MiB tiny-record burst is queued must return promptly.
+        let drop_path = dir.path().join("drop_burst.csv");
+        std::fs::write(&drop_path, b"a\n").unwrap();
+        let (drop_session, drop_index) = open_and_index(&drop_path, None, HeaderMode::NoHeader);
+        let drop_watch = drop_session
+            .start_live_watch(
+                &drop_index,
+                None,
+                WatchConfig {
+                    poll_interval: Duration::from_millis(15),
+                    cache_config: IndexCacheConfig::disabled(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let big_burst = vec![b'\n'; 4 * 1024 * 1024];
+        let mut df = FsOpenOptions::new().append(true).open(&drop_path).unwrap();
+        df.write_all(&big_burst).unwrap();
+        df.flush().unwrap();
+        drop_watch.nudge();
+        let start_drop = std::time::Instant::now();
+        drop(drop_watch);
+        assert!(
+            start_drop.elapsed() < Duration::from_secs(2),
+            "dropping LiveWatchJob during a large burst must abort reconciliation promptly"
+        );
     }
 }
