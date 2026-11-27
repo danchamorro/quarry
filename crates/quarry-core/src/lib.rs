@@ -107,8 +107,8 @@ pub use quarry_delimited::{
     ByteEncodingClass, EscapeRule, ScannerDialect, SimdBackend, active_simd_backend,
 };
 pub use regex_match::{
-    MAX_REGEX_COMPILED_SIZE_BYTES, MAX_REGEX_DFA_SIZE_BYTES, MAX_REGEX_NEST_LIMIT,
-    MAX_REGEX_PATTERN_BYTES, validate_regex,
+    MAX_FILTER_REGEX_PREDICATES, MAX_REGEX_COMPILED_SIZE_BYTES, MAX_REGEX_DFA_SIZE_BYTES,
+    MAX_REGEX_NEST_LIMIT, MAX_REGEX_PATTERN_BYTES, validate_regex,
 };
 pub use search::{
     SearchJob, SearchMatch, SearchMode, SearchOutcome, SearchPosition, SearchProgress,

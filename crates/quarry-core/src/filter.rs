@@ -20,7 +20,7 @@ use crate::encoding::RecordScanner;
 use crate::export::source_matches_stamp;
 use crate::pool::{JobExecutor, JobPriority, engine_pool, resolve_worker_count};
 use crate::positional_io::{advise_readahead, read_at_exact_or_eof};
-use crate::regex_match::compile_bounded_regex;
+use crate::regex_match::{MAX_FILTER_REGEX_PREDICATES, compile_bounded_regex};
 use crate::sort::numeric_key;
 use crate::source_stamp::SourceStamp;
 use crate::{
@@ -1275,6 +1275,18 @@ pub(crate) fn compile_matchers(query: &FilterQuery) -> Result<Vec<PredicateMatch
         return Err(QuarryError::InvalidOption(
             "filter query must contain at least one predicate",
         ));
+    }
+    let mut regex_count = 0usize;
+    for (index, predicate) in query.predicates.iter().enumerate() {
+        if predicate.operator == FilterOperator::Regex {
+            regex_count += 1;
+            if regex_count > MAX_FILTER_REGEX_PREDICATES {
+                return Err(QuarryError::InvalidFilter {
+                    rule: index + 1,
+                    reason: Cow::Borrowed("filter query may contain at most 16 regex predicates"),
+                });
+            }
+        }
     }
     query
         .predicates
@@ -4580,6 +4592,29 @@ mod tests {
         assert!(matches!(
             with_upper.validate(),
             Err(QuarryError::InvalidFilter { rule: 1, .. })
+        ));
+
+        // Aggregate compound regex predicate cap: 16 individually valid predicates pass, 17 fail before compiling.
+        let make_compound = |count: usize| FilterQuery {
+            predicates: (0..count)
+                .map(|i| FilterPredicate {
+                    column: i % 4,
+                    operator: FilterOperator::Regex,
+                    value: format!("^v{i}$").into_bytes(),
+                    upper_bound: None,
+                })
+                .collect(),
+            case_sensitivity: CaseSensitivity::Sensitive,
+        };
+        assert!(
+            make_compound(crate::MAX_FILTER_REGEX_PREDICATES)
+                .validate()
+                .is_ok()
+        );
+        assert!(matches!(
+            make_compound(crate::MAX_FILTER_REGEX_PREDICATES + 1).validate(),
+            Err(QuarryError::InvalidFilter { rule, .. })
+                if rule == crate::MAX_FILTER_REGEX_PREDICATES + 1
         ));
 
         // 2. Per-field ^/$ anchors, escaped quotes, multiline quoted cells, and raw invalid UTF-8 bytes.

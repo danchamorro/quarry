@@ -3372,6 +3372,11 @@ fn record_filter_sample(samples: &mut FilterSamples, found: &FilterMatch) {
 }
 
 fn search_command(args: Vec<String>) -> CliResult<()> {
+    let mut stdout = std::io::stdout().lock();
+    search_command_to_writer(args, &mut stdout)
+}
+
+fn search_command_to_writer(args: Vec<String>, out: &mut dyn Write) -> CliResult<()> {
     let mut encoding = None;
     let mut path = None;
     let mut query = None;
@@ -3471,49 +3476,61 @@ fn search_command(args: Vec<String>) -> CliResult<()> {
     let (outcome, progress, search_telemetry, cancellation) =
         wait_for_search(job, cancel_after_bytes, Duration::from_millis(1))?;
 
-    println!("Quarry search benchmark\n");
-    input.print_source("File");
-    println!("Encoding: {}", session.encoding());
-    println!(
+    writeln!(out, "Quarry search benchmark\n")?;
+    input.write_source("File", out)?;
+    writeln!(out, "Encoding: {}", session.encoding())?;
+    writeln!(
+        out,
         "File size: {} ({} bytes)",
         human_bytes(session.file_size),
         session.file_size
-    );
-    println!(
+    )?;
+    writeln!(
+        out,
         "Build: {}",
         if cfg!(debug_assertions) {
             "debug"
         } else {
             "release"
         }
-    );
-    println!("Search cache state: {cache_state} after indexing prepass");
-    println!(
+    )?;
+    writeln!(
+        out,
+        "Search cache state: {cache_state} after indexing prepass"
+    )?;
+    writeln!(
+        out,
         "Mode: {}",
         match mode {
             SearchMode::Literal => "literal",
             SearchMode::Regex => "regex",
         }
-    );
-    println!(
+    )?;
+    writeln!(
+        out,
         "Case sensitivity: {}",
         match case_sensitivity {
             CaseSensitivity::Sensitive => "sensitive",
             CaseSensitivity::Insensitive => "insensitive",
         }
-    );
-    println!("Query: {}", render_field(&query));
-    println!("Start: data row {start_row}, column {start_column}");
-    println!("Rows indexed: {}", index.indexed_rows());
-    println!("Indexing time: {:.3} s", index_elapsed.as_secs_f64());
+    )?;
+    writeln!(out, "Query: {}", render_field(&query))?;
+    writeln!(out, "Start: data row {start_row}, column {start_column}")?;
+    writeln!(out, "Rows indexed: {}", index.indexed_rows())?;
+    writeln!(out, "Indexing time: {:.3} s", index_elapsed.as_secs_f64())?;
     let telemetry = index.telemetry();
-    println!("Engine workers: {}", telemetry.effective_workers);
-    println!("SIMD backend: {}", telemetry.simd_backend);
-    println!("Search workers: {}", search_telemetry.effective_workers);
-    println!(
+    writeln!(out, "Engine workers: {}", telemetry.effective_workers)?;
+    writeln!(out, "SIMD backend: {}", telemetry.simd_backend)?;
+    writeln!(
+        out,
+        "Search workers: {}",
+        search_telemetry.effective_workers
+    )?;
+    writeln!(
+        out,
         "Wasted-work bound: {}",
         human_bytes(search_telemetry.wasted_work_bound_bytes)
-    );
+    )?;
     let time_label = if matches!(&outcome, SearchOutcome::Match(_)) {
         "Time to first match"
     } else {
@@ -3522,48 +3539,55 @@ fn search_command(args: Vec<String>) -> CliResult<()> {
     match outcome {
         SearchOutcome::Match(found) => {
             let data_row = physical_to_data_row(found.row, session.dialect.has_header);
-            println!("Outcome: match");
-            println!(
+            writeln!(out, "Outcome: match")?;
+            writeln!(
+                out,
                 "Match: data row {data_row}, column {}, record offset {}",
                 found.column + 1,
                 found.record_offset
-            );
+            )?;
         }
-        SearchOutcome::NotFound => println!("Outcome: not found"),
-        SearchOutcome::Cancelled => println!("Outcome: cancelled"),
+        SearchOutcome::NotFound => writeln!(out, "Outcome: not found")?,
+        SearchOutcome::Cancelled => writeln!(out, "Outcome: cancelled")?,
     }
-    println!(
+    writeln!(
+        out,
         "Bytes scanned: {} ({} bytes) of {} ({} bytes)",
         human_bytes(progress.bytes_scanned),
         progress.bytes_scanned,
         human_bytes(progress.total_bytes),
         progress.total_bytes
-    );
-    println!("Rows scanned: {}", progress.rows_scanned);
-    println!("{time_label}: {:.3} s", progress.elapsed.as_secs_f64());
-    println!(
+    )?;
+    writeln!(out, "Rows scanned: {}", progress.rows_scanned)?;
+    writeln!(out, "{time_label}: {:.3} s", progress.elapsed.as_secs_f64())?;
+    writeln!(
+        out,
         "Search throughput: {}/s",
         human_bytes(rate(progress.bytes_scanned, progress.elapsed))
-    );
+    )?;
     if let Some((requested_at, latency)) = cancellation {
-        println!(
+        writeln!(
+            out,
             "Cancellation requested after: {} ({} bytes)",
             human_bytes(requested_at),
             requested_at
-        );
-        println!(
+        )?;
+        writeln!(
+            out,
             "Poll-inclusive cancellation latency: {:.3} ms",
             latency.as_secs_f64() * 1000.0
-        );
+        )?;
     }
-    println!(
+    writeln!(
+        out,
         "Current process memory: {}",
         optional_bytes(current_rss_bytes())
-    );
-    println!(
+    )?;
+    writeln!(
+        out,
         "Peak process memory (index + search): {}",
         optional_bytes(peak_rss_bytes())
-    );
+    )?;
     Ok(())
 }
 
@@ -4448,39 +4472,52 @@ struct OpenedInput {
 impl OpenedInput {
     /// Prints the file the user named; a compressed session reads a private copy.
     fn print_source(&self, label: &str) {
+        let mut stdout = std::io::stdout().lock();
+        let _ = self.write_source(label, &mut stdout);
+    }
+
+    fn write_source(&self, label: &str, out: &mut dyn Write) -> std::io::Result<()> {
         let path = self
             .session
             .compressed_source_path()
             .unwrap_or_else(|| self.session.path());
-        println!("{label}: {}", path.display());
+        writeln!(out, "{label}: {}", path.display())?;
         if let Some(summary) = &self.compressed {
-            print_compressed_summary(summary);
+            write_compressed_summary(summary, out)?;
         }
+        Ok(())
     }
 }
 
-fn print_compressed_summary(summary: &CompressedSummary) {
-    println!("Compression: {}", compression_name(summary.format));
-    println!(
+fn write_compressed_summary(
+    summary: &CompressedSummary,
+    out: &mut dyn Write,
+) -> std::io::Result<()> {
+    writeln!(out, "Compression: {}", compression_name(summary.format))?;
+    writeln!(
+        out,
         "Compressed size: {} ({} bytes)",
         human_bytes(summary.compressed_size),
         summary.compressed_size
-    );
-    println!(
+    )?;
+    writeln!(
+        out,
         "Decompressed size: {} ({} bytes)",
         human_bytes(summary.decompressed_size),
         summary.decompressed_size
-    );
-    println!(
+    )?;
+    writeln!(
+        out,
         "Bootstrap time: {:.3} ms",
         summary.bootstrap.as_secs_f64() * 1000.0
-    );
-    println!(
+    )?;
+    writeln!(
+        out,
         "Decompression and indexing time: {:.3} s",
         summary.decompression.as_secs_f64()
-    );
-    println!("Records indexed: {}", summary.records);
-    println!("Columns: {}", summary.columns);
+    )?;
+    writeln!(out, "Records indexed: {}", summary.records)?;
+    writeln!(out, "Columns: {}", summary.columns)
 }
 
 fn compression_name(format: CompressionFormat) -> &'static str {
@@ -7364,25 +7401,51 @@ mod tests {
         )
         .unwrap();
 
-        // Literal search remains the default (a+b matches literally without --regex).
-        search_command(vec![
-            src.display().to_string(),
-            "--query".into(),
-            "a+b".into(),
-            "--no-index-cache".into(),
-        ])
+        // Literal search remains the default (a+b matches literally on data row 1, col 2).
+        let mut literal_out = Vec::new();
+        super::search_command_to_writer(
+            vec![
+                src.display().to_string(),
+                "--query".into(),
+                "a+b".into(),
+                "--no-index-cache".into(),
+            ],
+            &mut literal_out,
+        )
         .unwrap();
+        let literal_text = String::from_utf8(literal_out).unwrap();
+        assert!(literal_text.contains("Mode: literal"), "{literal_text}");
+        assert!(literal_text.contains("Outcome: match"), "{literal_text}");
+        assert!(
+            literal_text.contains("Match: data row 1, column 2,"),
+            "{literal_text}"
+        );
 
-        // Opt-in regex search with --ignore-case matches Unicode CAFÉ for ^café$.
-        search_command(vec![
-            src.display().to_string(),
-            "--query".into(),
-            "^café$".into(),
-            "--regex".into(),
-            "--ignore-case".into(),
-            "--no-index-cache".into(),
-        ])
+        // Opt-in regex search with --ignore-case matches Unicode CAFÉ on data row 2, col 3.
+        let mut regex_out = Vec::new();
+        super::search_command_to_writer(
+            vec![
+                src.display().to_string(),
+                "--query".into(),
+                "^café$".into(),
+                "--regex".into(),
+                "--ignore-case".into(),
+                "--no-index-cache".into(),
+            ],
+            &mut regex_out,
+        )
         .unwrap();
+        let regex_text = String::from_utf8(regex_out).unwrap();
+        assert!(regex_text.contains("Mode: regex"), "{regex_text}");
+        assert!(
+            regex_text.contains("Case sensitivity: insensitive"),
+            "{regex_text}"
+        );
+        assert!(regex_text.contains("Outcome: match"), "{regex_text}");
+        assert!(
+            regex_text.contains("Match: data row 2, column 3,"),
+            "{regex_text}"
+        );
 
         // Invalid or oversized regex fails immediately on search, filter, and export.
         let bad_search = search_command(vec![

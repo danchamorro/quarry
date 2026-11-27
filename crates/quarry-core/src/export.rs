@@ -11986,4 +11986,91 @@ mod tests {
             assert!(!err_dest.exists());
         }
     }
+
+    #[test]
+    fn parallel_regex_filtered_export_matches_serial_across_worker_chunks() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("regex-parallel-src.csv");
+        let mut raw = Vec::from(&b"id,code,note\n"[..]);
+        for i in 1..=300 {
+            if i % 10 == 0 {
+                raw.extend_from_slice(
+                    format!("{i},ERR-{i:03},\"multi\nERR-{i:03}\nline\"\n").as_bytes(),
+                );
+            } else {
+                raw.extend_from_slice(format!("{i},OK-{i:03},normal-payload-{i:04}\n").as_bytes());
+            }
+        }
+        assert!(raw.len() > 4096, "fixture must span many 512-byte chunks");
+        fs::write(&src, &raw).unwrap();
+
+        let query =
+            FilterQuery::single(1, crate::FilterOperator::Regex, b"^ERR-[0-9]{3}$".to_vec());
+        let serial_dst = dir.path().join("serial.csv");
+        let parallel_dst = dir.path().join("parallel.csv");
+
+        let serial_tuning = super::parallel::ExportParallelTuning {
+            requested_threads: 1,
+            min_parallel_bytes: 256,
+            chunk_bytes: 512,
+            max_alignment_search: 256,
+            reorder_budget_bytes: super::parallel::DEFAULT_EXPORT_REORDER_BUDGET_BYTES,
+            delay_chunk_zero: None,
+            on_reorder_wait: None,
+        };
+        let parallel_tuning = super::parallel::ExportParallelTuning {
+            requested_threads: 4,
+            min_parallel_bytes: 256,
+            chunk_bytes: 512,
+            max_alignment_search: 256,
+            reorder_budget_bytes: super::parallel::DEFAULT_EXPORT_REORDER_BUDGET_BYTES,
+            delay_chunk_zero: None,
+            on_reorder_wait: None,
+        };
+
+        let serial_outcome = FilterExportJob::start_with_edits_and_tuning(
+            src.clone(),
+            raw.len() as u64,
+            b',',
+            true,
+            query.clone(),
+            serial_dst.clone(),
+            super::DEFAULT_EXPORT_CONFIG,
+            super::FilteredEdits::default(),
+            None,
+            serial_tuning,
+        )
+        .unwrap()
+        .wait()
+        .unwrap();
+        let parallel_outcome = FilterExportJob::start_with_edits_and_tuning(
+            src,
+            raw.len() as u64,
+            b',',
+            true,
+            query,
+            parallel_dst.clone(),
+            super::DEFAULT_EXPORT_CONFIG,
+            super::FilteredEdits::default(),
+            None,
+            parallel_tuning,
+        )
+        .unwrap()
+        .wait()
+        .unwrap();
+
+        let FilterExportOutcome::Complete(serial_summary) = serial_outcome else {
+            panic!("serial regex export did not complete");
+        };
+        let FilterExportOutcome::Complete(parallel_summary) = parallel_outcome else {
+            panic!("parallel regex export did not complete");
+        };
+        assert_eq!(serial_summary.rows_written, 30);
+        assert_eq!(parallel_summary.rows_written, 30);
+        let serial_bytes = fs::read(&serial_dst).unwrap();
+        let parallel_bytes = fs::read(&parallel_dst).unwrap();
+        assert_eq!(serial_bytes, parallel_bytes);
+        assert!(serial_bytes.starts_with(b"id,code,note\n10,ERR-010,"));
+        assert!(serial_bytes.ends_with(b"300,ERR-300,\"multi\nERR-300\nline\"\n"));
+    }
 }

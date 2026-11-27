@@ -1199,8 +1199,9 @@ expressions are available in the CLI via `quarry search --regex --query PATTERN`
 - **Safety bounds:** To guarantee linear-time matching and prevent pathological
   patterns from exhausting memory or stack depth, patterns are validated before
   scanning with explicit limits: 4,096-byte maximum pattern length, 2 MiB
-  compiled program limit, 2 MiB DFA cache limit, and syntax nesting limit of 64.
-  Empty, malformed, or oversized patterns fail immediately with a clear error.
+  compiled program limit, 2 MiB DFA cache limit, syntax nesting limit of 64,
+  and at most 16 regex predicates per compound filter query. Empty, malformed,
+  or oversized patterns fail immediately with a clear error.
 
 The duplicate dialog starts with **Match case** off each time. Search inside the
 **Columns** popover is always case-insensitive. Split matches its separator

@@ -14,6 +14,10 @@ pub const MAX_REGEX_DFA_SIZE_BYTES: usize = 2 * 1024 * 1024;
 /// Maximum syntax nesting depth passed to `regex::bytes::RegexBuilder::nest_limit`.
 pub const MAX_REGEX_NEST_LIMIT: u32 = 64;
 
+/// Maximum number of `FilterOperator::Regex` predicates permitted in a single compound filter
+/// query, bounding aggregate compiled-regex and lazy-DFA memory across all rules.
+pub const MAX_FILTER_REGEX_PREDICATES: usize = 16;
+
 /// Compiles a bounded `regex::bytes::Regex` for per-field matching.
 ///
 /// Patterns are evaluated in Unicode mode (`.unicode(true)`) with per-field `^`/`$`
