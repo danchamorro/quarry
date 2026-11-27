@@ -1058,3 +1058,119 @@ fn live_watch_async_viewport_defers_tail_refresh_to_background_plan() {
     assert_eq!(rows.last().unwrap().fields[0], b"3");
     let _ = scheduler.stop_live_watch(doc_id).unwrap();
 }
+
+#[test]
+fn stop_live_watch_preserves_field_limit_on_static_and_filtered_reloads() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("wide_append.csv");
+    std::fs::write(&path, b"tag,value\nok,1\n").unwrap();
+
+    let (mut scheduler, doc_id) = open_completed_scheduler(&path);
+    scheduler
+        .start_live_watch_with_config(
+            doc_id,
+            WatchConfig {
+                poll_interval: Duration::from_millis(15),
+                cache_config: quarry_core::IndexCacheConfig::disabled(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    // Attach a filter matching col 0 == "boom" while watching.
+    let query = FilterQuery::single(0, FilterOperator::Equals, b"boom".to_vec());
+    scheduler
+        .tab_mut(doc_id)
+        .unwrap()
+        .document
+        .as_mut()
+        .unwrap()
+        .start_filter(query)
+        .unwrap();
+    assert!(wait_until(Duration::from_secs(3), || {
+        let _ = scheduler.poll_all();
+        let doc = scheduler.tab(doc_id).unwrap().document.as_ref().unwrap();
+        doc.live_watch_filter_attach.is_none() && doc.filter_index.is_some()
+    }));
+
+    // Append a delimiter-dense row exceeding `MAX_TRANSFORMATION_COLUMNS` fields.
+    let mut wide_row = Vec::with_capacity(quarry_core::MAX_TRANSFORMATION_COLUMNS + 32);
+    wide_row.extend_from_slice(b"boom");
+    wide_row.resize(
+        wide_row.len() + quarry_core::MAX_TRANSFORMATION_COLUMNS + 8,
+        b',',
+    );
+    wide_row.push(b'\n');
+    let mut writer = FsOpenOptions::new().append(true).open(&path).unwrap();
+    writer.write_all(&wide_row).unwrap();
+    writer.flush().unwrap();
+    scheduler
+        .tab(doc_id)
+        .unwrap()
+        .document
+        .as_ref()
+        .unwrap()
+        .live_watch
+        .as_ref()
+        .unwrap()
+        .nudge();
+
+    assert!(wait_until(Duration::from_secs(3), || {
+        let _ = scheduler.poll_all();
+        scheduler
+            .tab(doc_id)
+            .unwrap()
+            .document
+            .as_ref()
+            .unwrap()
+            .available_rows()
+            == 3
+    }));
+
+    let is_field_limit_error = |err: &quarry_core::QuarryError| {
+        matches!(err, quarry_core::QuarryError::Parse(_)) && err.to_string().contains("65536")
+    };
+
+    // Live reader rejects the delimiter-dense row.
+    let live_err = scheduler
+        .tab(doc_id)
+        .unwrap()
+        .document
+        .as_ref()
+        .unwrap()
+        .live_watch
+        .as_ref()
+        .unwrap()
+        .read_rows(2, 1)
+        .unwrap_err();
+    assert!(
+        is_field_limit_error(&live_err),
+        "live reader must enforce field cap; got {live_err:?}"
+    );
+
+    // Stop Live Watch: neither the filtered reload nor the static reader may materialize
+    // unbounded fields past `MAX_TRANSFORMATION_COLUMNS`.
+    let alert = scheduler.stop_live_watch(doc_id).unwrap();
+    assert!(alert.is_none());
+
+    let doc = scheduler.tab(doc_id).unwrap().document.as_ref().unwrap();
+    let static_err = doc
+        .session
+        .read_rows(doc.index.as_ref().unwrap(), 2, 1)
+        .unwrap_err();
+    assert!(
+        is_field_limit_error(&static_err),
+        "post-stop static reader must preserve field cap; got {static_err:?}"
+    );
+
+    let filter_index = doc.filter_index.as_ref().unwrap();
+    let filter_read_job = doc
+        .session
+        .start_filtered_read(filter_index, 0, 10)
+        .unwrap();
+    let filtered_err = filter_read_job.wait().unwrap_err();
+    assert!(
+        is_field_limit_error(&filtered_err),
+        "post-stop filtered reader must preserve field cap; got {filtered_err:?}"
+    );
+}

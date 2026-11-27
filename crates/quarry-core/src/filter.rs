@@ -23,8 +23,8 @@ use crate::positional_io::{advise_readahead, read_at_exact_or_eof};
 use crate::sort::numeric_key;
 use crate::source_stamp::SourceStamp;
 use crate::{
-    CaseSensitivity, DEFAULT_MAX_RECORD_BYTES, DEFAULT_READ_CHUNK, QuarryError, Session,
-    parse_encoded_record_with_bom, parse_encoded_record_with_bom_and_field_limit,
+    CaseSensitivity, DEFAULT_MAX_RECORD_BYTES, DEFAULT_READ_CHUNK, MAX_TRANSFORMATION_COLUMNS,
+    QuarryError, Session, parse_encoded_record_with_bom_and_field_limit,
 };
 
 /// Immutable sparse working values, keyed by physical source row and column.
@@ -1410,8 +1410,14 @@ pub(crate) fn matching_fields_with_edits<'a>(
     edits: &FilterEdits,
     encoding: Encoding,
 ) -> Result<Option<Vec<Cow<'a, [u8]>>>, QuarryError> {
-    let fields =
-        parse_encoded_record_with_bom(record, delimiter, physical_row, strip_bom, encoding)?;
+    let fields = parse_encoded_record_with_bom_and_field_limit(
+        record,
+        delimiter,
+        physical_row,
+        strip_bom,
+        encoding,
+        MAX_TRANSFORMATION_COLUMNS,
+    )?;
     if edits
         .range((physical_row, 0)..=(physical_row, usize::MAX))
         .next_back()

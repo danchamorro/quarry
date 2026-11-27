@@ -26,8 +26,9 @@ use crate::positional_io::read_at_exact_or_eof;
 use crate::sidecar::{IndexCacheConfig, is_network_filesystem, save_sidecar};
 use crate::source_stamp::{FileIdentity, SourceStamp, open_regular_file};
 use crate::{
-    DEFAULT_MAX_RECORD_BYTES, DEFAULT_READ_CHUNK, Dialect, OpenMetrics, QuarryError, Row, Session,
-    parse_encoded_record_with_bom, read_rows_from_open_file,
+    DEFAULT_MAX_RECORD_BYTES, DEFAULT_READ_CHUNK, Dialect, MAX_TRANSFORMATION_COLUMNS, OpenMetrics,
+    QuarryError, Row, Session, parse_encoded_record_with_bom_and_field_limit,
+    read_rows_from_open_file,
 };
 
 /// Default local reconciliation wakeup interval paired with native `kqueue` / `inotify` events.
@@ -649,12 +650,13 @@ impl TailScanner {
         {
             return None;
         }
-        parse_encoded_record_with_bom(
+        parse_encoded_record_with_bom_and_field_limit(
             &self.provisional_bytes,
             self.delimiter,
             0,
             self.committed_record_end == 0,
             self.encoding,
+            MAX_TRANSFORMATION_COLUMNS,
         )
         .ok()
         .map(|fields| fields.into_iter().map(|f| f.into_owned()).collect())
