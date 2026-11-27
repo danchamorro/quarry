@@ -946,8 +946,10 @@ impl OmarchyThemeWatcher {
                                 .max(Duration::from_millis(10)),
                         )
                     } else if watch.is_event_driven() {
-                        if watched > 0 {
+                        if watched > 0 && !watch.has_incomplete_watches() {
                             None
+                        } else if watch.has_incomplete_watches() {
+                            Some(Duration::from_secs(1))
                         } else {
                             Some(Duration::from_secs(5))
                         }

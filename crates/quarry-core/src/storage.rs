@@ -281,6 +281,55 @@ fn verify_dir_fd_writable(dir_fd: &rustix::fd::OwnedFd) -> io::Result<()> {
     ))
 }
 
+#[cfg(all(unix, any(target_os = "linux", test)))]
+fn verify_trusted_cache_root_ancestors(cache_root: &Path) -> io::Result<()> {
+    use rustix::fs::{CWD, Mode, OFlags};
+
+    reject_scratch_symlink_components(cache_root)?;
+    let euid = rustix::process::geteuid().as_raw();
+    let mut current = PathBuf::new();
+    for component in cache_root.components() {
+        current.push(component);
+        if matches!(
+            component,
+            std::path::Component::Prefix(_) | std::path::Component::RootDir
+        ) {
+            continue;
+        }
+        // On macOS, `/var` and `/tmp` are OS-level root symlinks to `/private/*`.
+        #[cfg(target_os = "macos")]
+        if current == Path::new("/var") || current == Path::new("/tmp") {
+            continue;
+        }
+        let fd = rustix::fs::openat(
+            CWD,
+            &current,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(io::Error::from)?;
+        let stat = rustix::fs::fstat(&fd).map_err(io::Error::from)?;
+        let mode = stat.st_mode;
+        let group_or_world_writable = (mode & 0o022) != 0;
+        let sticky = (mode & 0o1000) != 0;
+        let trusted_ancestor = if current == cache_root {
+            // `cache_root` itself must be owned by the current user and not writable by others
+            // so no other local user can rename or swap the `quarry` directory inside it.
+            stat.st_uid == euid && !group_or_world_writable && (mode & 0o500) == 0o500
+        } else {
+            (stat.st_uid == euid && !group_or_world_writable)
+                || (stat.st_uid == 0 && (!group_or_world_writable || sticky))
+        };
+        if !trusted_ancestor {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "cache root or ancestor directory is writable by other users",
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(any(target_os = "linux", test))]
 fn ensure_private_cache_temp_dir(cache_root: &Path) -> io::Result<()> {
     fs::create_dir_all(cache_root)?;
@@ -288,10 +337,11 @@ fn ensure_private_cache_temp_dir(cache_root: &Path) -> io::Result<()> {
     {
         use rustix::fs::{CWD, Mode, OFlags};
 
+        verify_trusted_cache_root_ancestors(cache_root)?;
         let root_fd = rustix::fs::openat(
             CWD,
             cache_root,
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
             Mode::empty(),
         )
         .map_err(io::Error::from)?;
@@ -1368,6 +1418,39 @@ mod tests {
             );
             // Restore 0700 so TempDir cleanup always succeeds cleanly.
             fs::set_permissions(&gw_quarry, fs::Permissions::from_mode(0o700)).unwrap();
+
+            // A shared writable cache root (0777 or 0770) or group/world-writable ancestor
+            // must be rejected so another user cannot rename `quarry` after validation.
+            let shared_cache = dir.path().join("shared_cache");
+            fs::create_dir(&shared_cache).unwrap();
+            fs::set_permissions(&shared_cache, fs::Permissions::from_mode(0o777)).unwrap();
+            let rejected_shared_root = super::resolve_default_temp_dir(
+                fake_tmp.clone(),
+                None,
+                Some(shared_cache.clone()),
+                None,
+                |p| p == fake_tmp,
+            );
+            assert_eq!(
+                rejected_shared_root, fake_tmp,
+                "shared writable cache_root (0777) must be rejected"
+            );
+
+            let nested_under_shared = shared_cache.join("user_cache");
+            fs::create_dir(&nested_under_shared).unwrap();
+            fs::set_permissions(&nested_under_shared, fs::Permissions::from_mode(0o700)).unwrap();
+            let rejected_shared_ancestor = super::resolve_default_temp_dir(
+                fake_tmp.clone(),
+                None,
+                Some(nested_under_shared),
+                None,
+                |p| p == fake_tmp,
+            );
+            assert_eq!(
+                rejected_shared_ancestor, fake_tmp,
+                "cache_root beneath a world-writable ancestor must be rejected"
+            );
+            fs::set_permissions(&shared_cache, fs::Permissions::from_mode(0o700)).unwrap();
         }
     }
 }

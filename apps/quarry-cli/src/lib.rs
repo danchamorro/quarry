@@ -4928,27 +4928,57 @@ fn parse_size(value: &str) -> CliResult<u64> {
         "TIB" => 1024_u128.pow(4),
         _ => return Err(format!("unsupported size unit {unit:?}").into()),
     };
-    if !number_str.contains('.') {
-        let count = number_str
+
+    let (int_part, frac_part) = match number_str.split_once('.') {
+        Some((int_p, frac_p)) => {
+            if frac_p.contains('.') || (int_p.is_empty() && frac_p.is_empty()) {
+                return Err("invalid decimal size".into());
+            }
+            (int_p, frac_p)
+        }
+        None => (number_str, ""),
+    };
+    if !int_part.bytes().all(|b| b.is_ascii_digit())
+        || !frac_part.bytes().all(|b| b.is_ascii_digit())
+    {
+        return Err("invalid numeric size".into());
+    }
+
+    let int_val: u128 = if int_part.is_empty() {
+        0
+    } else {
+        int_part
+            .parse::<u128>()
+            .map_err(|_| "size must be between 1 byte and u64::MAX")?
+    };
+    let int_bytes = int_val
+        .checked_mul(multiplier)
+        .ok_or("size must be between 1 byte and u64::MAX")?;
+
+    // Scale fractional digits with exact checked integer arithmetic (truncating only sub-byte
+    // remainders). With `multiplier <= 1024^4 < 2^41`, at most 18 fractional digits can affect
+    // whole bytes and `frac_val * multiplier < 10^31 << u128::MAX`.
+    let sig_frac = &frac_part[..frac_part.len().min(18)];
+    let frac_bytes = if sig_frac.is_empty() {
+        0
+    } else {
+        let frac_val = sig_frac
             .parse::<u128>()
             .map_err(|_| "size must be between 1 byte and u64::MAX")?;
-        let total = count
+        let scale = 10_u128.pow(sig_frac.len() as u32);
+        frac_val
             .checked_mul(multiplier)
-            .ok_or("size must be between 1 byte and u64::MAX")?;
-        if total == 0 || total > u128::from(u64::MAX) {
-            return Err("size must be between 1 byte and u64::MAX".into());
-        }
-        return Ok(total as u64);
-    }
-    let number: f64 = number_str.parse()?;
-    let bytes = number * (multiplier as f64);
-    // `u64::MAX as f64` rounds up to 2^64 (18446744073709551616.0); require strictly less
-    // so fractional inputs never saturate silently to `u64::MAX`.
-    const TWO_POW_64: f64 = 18_446_744_073_709_551_616.0;
-    if !bytes.is_finite() || bytes < 1.0 || bytes >= TWO_POW_64 {
+            .ok_or("size must be between 1 byte and u64::MAX")?
+            / scale
+    };
+
+    let total = int_bytes
+        .checked_add(frac_bytes)
+        .ok_or("size must be between 1 byte and u64::MAX")?;
+    if total == 0 || total > u128::from(u64::MAX) {
         return Err("size must be between 1 byte and u64::MAX".into());
     }
-    Ok(bytes as u64)
+    Ok(total as u64)
 }
 
 fn render_field(field: &[u8]) -> String {
@@ -7207,14 +7237,35 @@ mod tests {
             super::parse_size("9007199254740993").unwrap(),
             9_007_199_254_740_993
         );
-        assert_eq!(super::parse_size("18446744073709551615").unwrap(), u64::MAX);
-        assert!(super::parse_size("18446744073709551616").is_err());
-        assert!(super::parse_memory_budget("18446744073709551616").is_err());
-        #[cfg(target_pointer_width = "64")]
         assert_eq!(
-            super::parse_memory_budget("9007199254740993").unwrap(),
+            super::parse_size("9007199254740993.0B").unwrap(),
             9_007_199_254_740_993
         );
+        assert_eq!(super::parse_size("18446744073709551615").unwrap(), u64::MAX);
+        assert_eq!(
+            super::parse_size("18446744073709551615.0B").unwrap(),
+            u64::MAX
+        );
+        assert_eq!(super::parse_size("1.5GB").unwrap(), 1_500_000_000);
+        assert!(super::parse_size("18446744073709551616").is_err());
+        assert!(super::parse_size("18446744073709551616.0B").is_err());
+        assert!(super::parse_memory_budget("18446744073709551616").is_err());
+        assert!(super::parse_memory_budget("18446744073709551616.0B").is_err());
+        #[cfg(target_pointer_width = "64")]
+        {
+            assert_eq!(
+                super::parse_memory_budget("9007199254740993").unwrap(),
+                9_007_199_254_740_993
+            );
+            assert_eq!(
+                super::parse_memory_budget("9007199254740993.0B").unwrap(),
+                9_007_199_254_740_993
+            );
+            assert_eq!(
+                super::parse_memory_budget("18446744073709551615.0B").unwrap(),
+                usize::MAX
+            );
+        }
         let bad_budget = super::parse_memory_budget("abc").unwrap_err().to_string();
         assert!(
             bad_budget.contains("--memory-budget"),

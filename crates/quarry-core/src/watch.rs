@@ -2874,6 +2874,7 @@ enum DirectoryWatchBackend {
         wake_read: OwnedRawFd,
         wake_write: Arc<Mutex<Option<OwnedRawFd>>>,
         watches: std::collections::BTreeMap<PathBuf, std::ffi::c_int>,
+        incomplete: bool,
     },
     Polling {
         cond: Arc<(Mutex<bool>, Condvar)>,
@@ -2980,6 +2981,7 @@ impl DirectoryWatch {
                             wake_read,
                             wake_write: Arc::new(Mutex::new(Some(wake_write))),
                             watches: std::collections::BTreeMap::new(),
+                            incomplete: false,
                         },
                     });
                 }
@@ -3070,6 +3072,29 @@ impl DirectoryWatch {
         }
     }
 
+    /// Returns `true` when the last [`Self::sync_paths`] call failed to register one or more
+    /// requested paths (for example, `inotify` watch limit reached or a path could not be added),
+    /// signalling callers to use a bounded retry interval instead of waiting indefinitely.
+    pub fn has_incomplete_watches(&self) -> bool {
+        #[cfg(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))]
+        {
+            match &self.backend {
+                DirectoryWatchBackend::Inotify { incomplete, .. } => *incomplete,
+                DirectoryWatchBackend::Polling { .. } => false,
+            }
+        }
+        #[cfg(not(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )))]
+        {
+            false
+        }
+    }
+
     /// Synchronizes the watched path set so every existing path in `paths` is registered (and
     /// replaced/recreated directories are re-bound cleanly). Returns the number of active watches.
     pub fn sync_paths(&mut self, paths: &[PathBuf]) -> usize {
@@ -3081,6 +3106,7 @@ impl DirectoryWatch {
             let DirectoryWatchBackend::Inotify {
                 inotify_fd,
                 watches,
+                incomplete,
                 ..
             } = &mut self.backend
             else {
@@ -3100,6 +3126,7 @@ impl DirectoryWatch {
                 | linux_sys::IN_DELETE_SELF
                 | linux_sys::IN_MOVE_SELF;
 
+            *incomplete = false;
             let desired: BTreeSet<PathBuf> = paths.iter().cloned().collect();
             let stale: Vec<(PathBuf, std::ffi::c_int)> = watches
                 .iter()
@@ -3116,6 +3143,7 @@ impl DirectoryWatch {
 
             for path in desired {
                 let Ok(c_path) = CString::new(path.as_os_str().as_bytes()) else {
+                    *incomplete = true;
                     continue;
                 };
                 // SAFETY: `c_path` is NUL-terminated and `inotify_fd` is owned.
@@ -3131,10 +3159,13 @@ impl DirectoryWatch {
                             let _ = linux_sys::inotify_rm_watch(inotify_fd.raw(), prev_wd);
                         }
                     }
-                } else if let Some(old_wd) = watches.remove(&path) {
-                    // SAFETY: remove watch descriptor for a path that no longer exists.
-                    unsafe {
-                        let _ = linux_sys::inotify_rm_watch(inotify_fd.raw(), old_wd);
+                } else {
+                    *incomplete = true;
+                    if let Some(old_wd) = watches.remove(&path) {
+                        // SAFETY: remove watch descriptor for a path that no longer exists.
+                        unsafe {
+                            let _ = linux_sys::inotify_rm_watch(inotify_fd.raw(), old_wd);
+                        }
                     }
                 }
             }
@@ -4638,8 +4669,18 @@ mod tests {
         let wakeup = watch.wakeup_handle();
         let paths = vec![current.clone(), theme.clone()];
         assert_eq!(watch.sync_paths(&paths), 2);
+        assert!(!watch.has_incomplete_watches());
 
         if watch.is_event_driven() {
+            // One successful registration + one failed registration must flag incomplete coverage.
+            let missing = dir.path().join("does-not-exist");
+            assert_eq!(watch.sync_paths(&[current.clone(), missing]), 1);
+            assert!(
+                watch.has_incomplete_watches(),
+                "partial inotify registration must report incomplete coverage"
+            );
+            assert_eq!(watch.sync_paths(&paths), 2);
+            assert!(!watch.has_incomplete_watches());
             let staged = dir.path().join("next-theme");
             std::fs::create_dir_all(&staged).unwrap();
             std::fs::write(staged.join("colors.toml"), "mode = \"light\"\n").unwrap();
