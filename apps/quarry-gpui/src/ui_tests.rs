@@ -5157,9 +5157,11 @@ fn live_watch_coalesces_tail_refreshes_while_viewport_read_is_in_flight(cx: &mut
             .read(cx)
             .active_document(win_id)
             .is_some_and(|doc| {
-                doc.buffered_rows
-                    .iter()
-                    .any(|row| row.fields.get(1).is_some_and(|v| v == "stream-070"))
+                doc.buffered_rows.iter().any(|row| {
+                    row.fields
+                        .get(1)
+                        .is_some_and(|v| v.as_slice() == b"stream-070")
+                })
             })
     });
     assert!(
@@ -5224,7 +5226,7 @@ fn live_watch_coalesces_tail_refreshes_while_viewport_read_is_in_flight(cx: &mut
     });
     assert_eq!(
         nav_row_1.as_deref(),
-        Some("seed-001"),
+        Some(b"seed-001".as_slice()),
         "superseded tail read must not overwrite rows loaded by explicit user navigation"
     );
 }
