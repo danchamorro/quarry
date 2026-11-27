@@ -13,6 +13,8 @@ GitHub pull requests.
 
 ### Added
 
+- Added `--where EXPR` (along with `--delimiter` and `--header`) to `quarry filter` and `quarry export`, letting users write concise multi-column filter expressions using column names, `[bracketed]` headers, or `#N` column indices instead of repeated `--column`/`--and` flags. (#234)
+- Added an exact, bounded filter expression parser and canonical printer supporting `AND` across columns, same-column `OR`, `!=` exclusions, numeric comparisons, `BETWEEN` / inclusive range folding, `CONTAINS`, and `=~` / `/pattern/` regex rules, with explicit diagnostics for unsupported syntax or ambiguous duplicate headers and early validation before gzip decompression. Documented in `docs/USER_GUIDE.md`. (#234)
 - Added opt-in bounded regular expression matching to the CLI (`quarry search --regex`, `quarry filter --operator regex`, and `quarry export --operator regex`, plus `--ignore-case`) and core search, filter, filtered export, and live-watch engines while keeping literal matching as the default. (#232)
 - Added explicit regex validation limits (4 KiB pattern length, 2 MiB compiled and DFA budgets, syntax nesting depth of 64, and up to 16 regex rules per compound filter) and documented Unicode simple case folding vs literal ASCII case folding in `docs/USER_GUIDE.md`. (#232)
 
