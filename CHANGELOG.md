@@ -12,6 +12,7 @@ parentheses are GitHub pull requests.
 
 ### Added
 
+- Added `quarry --version`, `-V`, and `version` to print the CLI version. (#229)
 - Added opt-in append-only **Live Watch Mode** via **Data → Live Watch** (`Cmd+Shift+L` on macOS / `Ctrl+Shift+L` on Linux) and the toolbar **Watch** button to stream newly appended rows live from active CSV/TSV writers using native `kqueue` (macOS), `inotify` (Linux), or bounded polling on network volumes. (#228)
 - Added provisional tail handling, scroll-preserving tail follow (with **Follow Tail** and **Stop Watch** controls), incremental updates for active filters while watching, and automatic alerts offering **Open New File** on rename rotation or **Reload from Disk** on truncation or tail rewrites. Documented in [ADR 0016](docs/adr/0016-live-watch-mode.md). (#228)
 - Added Linux and Omarchy desktop packaging (`scripts/linux-app.sh`, `packaging/linux/`) with a Wayland `.desktop` launcher, app icon, manifest-tracked `install.sh` / `uninstall.sh`, and automated `x86_64` and `arm64` tarball builds in `.github/workflows/release.yml`. (#224)
@@ -23,10 +24,16 @@ parentheses are GitHub pull requests.
 
 ### Changed
 
+- Updated Linux default temporary scratch storage so that when `TMPDIR` is unset and `/tmp` (or a CLI output directory) is mounted on RAM-backed `tmpfs` or `ramfs`, Quarry automatically uses a private (`0700`) disk-backed `$XDG_CACHE_HOME/quarry/tmp` (defaulting to `~/.cache/quarry/tmp`) while keeping final output staging beside its destination. (#229)
+- Updated CLI `--memory-budget` to accept human-readable size suffixes (`512MB`, `512MiB`, `1.5GB`) with exact integer scaling and clearer validation errors, and clarified `sort-save-as` help and missing-argument errors for `--column` and `--order` versus `--mode shuffle|reverse`. (#229)
 - Moved **Download & Install** to the top of `README.md` with direct links to the published `v0.2.0-beta.2` macOS and Linux/Omarchy release assets and architecture-parameterized verification commands. (#225)
 - Updated `README.md` and `docs/LINUX_AND_OMARCHY.md` with prominent macOS `.dmg` and Linux/Omarchy tarball installation instructions and replaced the outdated `v0.1.0-beta.3` snapshot note. (#224)
 - Bumped the Quarry workspace version from `0.1.0` to `0.2.0` for the GPUI beta series and refreshed third-party license notices accordingly (zero third-party dependency changes). (#223)
 - Scoped GitHub Actions `push` triggers to `main` and enabled `cancel-in-progress` workflow concurrency for pull requests so superseded commits no longer exhaust macOS runner slots. (#222)
+
+### Fixed
+
+- Fixed desktop idle wake-ups by replacing the permanent 32 ms background polling timer with event-driven wake-ups (parking with zero timers when idle and slowing idle Live Resource HUD sampling to 2 seconds) and switching Linux Omarchy live theme sync to kernel `inotify` with swap-gap protection so theme switches repaint immediately without flashing a fallback palette. (#229)
 
 ## [2026-11-25]
 
