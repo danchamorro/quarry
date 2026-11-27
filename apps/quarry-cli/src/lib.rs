@@ -553,15 +553,16 @@ fn filter_command(args: Vec<String>) -> CliResult<()> {
         header_mode,
         ..OpenOptions::default()
     };
-    let input = open_input(&path, open_options, encoding, &compressed)?;
+    let (input, query) = open_input_for_filter(
+        &path,
+        open_options,
+        encoding,
+        &compressed,
+        prebuilt_query,
+        where_expr.as_deref(),
+        case_sensitivity,
+    )?;
     let session = &input.session;
-    let query = match (prebuilt_query, where_expr.as_deref()) {
-        (Some(query), None) => query,
-        (None, Some(expr)) => {
-            parse_filter_expr(expr, &session.filter_column_schema(), case_sensitivity)?
-        }
-        _ => unreachable!(),
-    };
     if cancel_after_bytes.is_some_and(|bytes| bytes >= session.file_size) {
         return Err("cancel-after-bytes must be less than file size".into());
     }
@@ -588,10 +589,10 @@ fn filter_command(args: Vec<String>) -> CliResult<()> {
         }
     );
     println!("Filter cache state: {cache_state}");
-    println!(
-        "Filter expression: {}",
-        print_filter_expr(index.query(), &session.filter_column_schema())
-    );
+    match print_filter_expr(index.query(), &session.filter_column_schema()) {
+        Ok(expr) => println!("Filter expression: {expr}"),
+        Err(err) => println!("Filter expression: <omitted: {}>", err.message),
+    }
     println!("Predicate count: {}", index.query().predicates.len());
     for (position, predicate) in index.query().predicates.iter().enumerate() {
         println!(
@@ -838,15 +839,16 @@ fn export_command(args: Vec<String>) -> CliResult<()> {
         header_mode,
         ..OpenOptions::default()
     };
-    let input = open_input(&path, open_options, encoding, &compressed)?;
+    let (input, query) = open_input_for_filter(
+        &path,
+        open_options,
+        encoding,
+        &compressed,
+        prebuilt_query,
+        where_expr.as_deref(),
+        case_sensitivity,
+    )?;
     let session = &input.session;
-    let query = match (prebuilt_query, where_expr.as_deref()) {
-        (Some(query), None) => query,
-        (None, Some(expr)) => {
-            parse_filter_expr(expr, &session.filter_column_schema(), case_sensitivity)?
-        }
-        _ => unreachable!(),
-    };
     if cancel_after_bytes.is_some_and(|bytes| bytes >= session.file_size) {
         return Err("cancel-after-bytes must be less than file size".into());
     }
@@ -901,10 +903,10 @@ fn export_command(args: Vec<String>) -> CliResult<()> {
         }
     );
     println!("Export cache state: {cache_state}");
-    println!(
-        "Filter expression: {}",
-        print_filter_expr(&query, &session.filter_column_schema())
-    );
+    match print_filter_expr(&query, &session.filter_column_schema()) {
+        Ok(expr) => println!("Filter expression: {expr}"),
+        Err(err) => println!("Filter expression: <omitted: {}>", err.message),
+    }
     println!("Predicate count: {}", query.predicates.len());
     for (position, predicate) in query.predicates.iter().enumerate() {
         println!(
@@ -4629,6 +4631,74 @@ fn compression_name(format: CompressionFormat) -> &'static str {
     }
 }
 
+/// Opens a file for `filter` or `export`, validating any `--where` expression against the
+/// bootstrapped header schema *before* starting full gzip decompression and indexing.
+fn open_input_for_filter(
+    path: &Path,
+    options: OpenOptions,
+    encoding: Option<Encoding>,
+    compressed: &CompressedArgs,
+    prebuilt_query: Option<FilterQuery>,
+    where_expr: Option<&str>,
+    case_sensitivity: CaseSensitivity,
+) -> CliResult<(OpenedInput, FilterQuery)> {
+    let cleanup = CleanupReport(WorkingCopyCleanup::default());
+    let Some(format) = detect_compression(path)? else {
+        let session = Session::open_with_encoding(path, options, encoding)?;
+        let query = match (prebuilt_query, where_expr) {
+            (Some(query), None) => query,
+            (None, Some(expr)) => {
+                parse_filter_expr(expr, &session.filter_column_schema(), case_sensitivity)?
+            }
+            _ => unreachable!(),
+        };
+        return Ok((
+            OpenedInput {
+                session,
+                index: None,
+                compressed: None,
+                _cleanup: cleanup,
+            },
+            query,
+        ));
+    };
+    interrupt::install();
+    let bootstrap =
+        CompressedBootstrap::open(path, options, encoding, compressed.max_decompressed_bytes)?;
+    let query = match (prebuilt_query, where_expr) {
+        (Some(query), None) => query,
+        (None, Some(expr)) => {
+            parse_filter_expr(expr, &bootstrap.filter_column_schema(), case_sensitivity)?
+        }
+        _ => unreachable!(),
+    };
+    let (session, index, progress) =
+        run_decompression(&bootstrap, compressed, &cleanup.0, |_, progress, report| {
+            if report {
+                eprintln!("{}", decompression_progress_line(&progress));
+            }
+            Ok(())
+        })?;
+    let summary = CompressedSummary {
+        format,
+        compressed_size: bootstrap.compressed_size(),
+        decompressed_size: session.file_size,
+        bootstrap: bootstrap.metrics.first_rows,
+        decompression: progress.elapsed,
+        records: index.indexed_rows(),
+        columns: index.maximum_width(),
+    };
+    Ok((
+        OpenedInput {
+            session,
+            index: Some(index),
+            compressed: Some(summary),
+            _cleanup: cleanup,
+        },
+        query,
+    ))
+}
+
 /// Opens a file for reading. A gzip file is decompressed once, with its index built in
 /// the same pass, into a private copy that is removed when the returned input drops.
 fn open_input(
@@ -7818,6 +7888,96 @@ mod tests {
         .to_string();
         assert!(cross_or.contains("same column"));
         assert!(!dir.join("unused2.csv").exists());
+
+        // Gzip input validates --where against the bootstrap header BEFORE full decompression.
+        // Passing a regular file as --temp-dir makes decompression fail immediately if started,
+        // so returning `unknown column 'nope'` proves --where ran on the in-memory bootstrap.
+        let gz_src = dir.join("sample.csv.gz");
+        let not_a_dir = dir.join("not-a-dir");
+        fs::write(&not_a_dir, b"file").unwrap();
+        {
+            use flate2::Compression;
+            use flate2::write::GzEncoder;
+            use std::io::Write;
+            let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+            encoder
+                .write_all(b"state,amount\nTX,25\nFL,100\nCA,50\n")
+                .unwrap();
+            let gz_bytes = encoder.finish().unwrap();
+            fs::write(&gz_src, gz_bytes).unwrap();
+        }
+        let gz_filter_err = filter_command(vec![
+            gz_src.display().to_string(),
+            "--temp-dir".into(),
+            not_a_dir.display().to_string(),
+            "--where".into(),
+            "nope == \"TX\"".into(),
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(
+            gz_filter_err.contains("unknown column 'nope'"),
+            "expected early --where error before decompression, got: {gz_filter_err}"
+        );
+
+        let gz_out = dir.join("gz-unused.csv");
+        let gz_export_err = export_command(vec![
+            gz_src.display().to_string(),
+            "--output".into(),
+            gz_out.display().to_string(),
+            "--temp-dir".into(),
+            not_a_dir.display().to_string(),
+            "--where".into(),
+            "nope == \"TX\"".into(),
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(
+            gz_export_err.contains("unknown column 'nope'"),
+            "expected early --where error before decompression, got: {gz_export_err}"
+        );
+        assert!(!gz_out.exists());
+
+        // Control check: a valid --where proceeds to decompression and hits the invalid --temp-dir.
+        let gz_valid_err = filter_command(vec![
+            gz_src.display().to_string(),
+            "--temp-dir".into(),
+            not_a_dir.display().to_string(),
+            "--where".into(),
+            "state == \"TX\"".into(),
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(
+            !gz_valid_err.contains("unknown column"),
+            "valid --where should pass bootstrap validation and fail during decompression: {gz_valid_err}"
+        );
+
+        // Legacy flag export with >256 predicates still succeeds without failing summary printing.
+        let out_legacy_many = dir.join("out-legacy-many.csv");
+        let mut legacy_args = vec![
+            src.display().to_string(),
+            "--output".into(),
+            out_legacy_many.display().to_string(),
+            "--column".into(),
+            "1".into(),
+            "--operator".into(),
+            "equals".into(),
+            "--value".into(),
+            "TX".into(),
+        ];
+        for i in 0..260 {
+            legacy_args.push("--and".into());
+            legacy_args.push("1".into());
+            legacy_args.push("equals".into());
+            legacy_args.push(format!("NONE_{i}"));
+        }
+        export_command(legacy_args).unwrap();
+        assert!(
+            fs::read_to_string(&out_legacy_many)
+                .unwrap()
+                .contains("TX,25,ERR-007,d1")
+        );
 
         fs::remove_dir_all(&dir).unwrap();
     }

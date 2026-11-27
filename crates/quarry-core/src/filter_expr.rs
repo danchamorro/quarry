@@ -133,18 +133,54 @@ impl<'a> FilterColumnSchema<'a> {
         }
     }
 
-    fn format_column(&self, column: usize) -> String {
-        if let Some(raw) = self.headers.get(column)
-            && !raw.is_empty()
-            && let Ok(name) = std::str::from_utf8(raw)
-            && !name.bytes().any(|b| b < 0x20 || b == 0x7F)
-            && self.is_unique_header(raw)
+    fn preferred_header_label(
+        &self,
+        column: usize,
+        max_bytes: usize,
+    ) -> Option<(&'a str, usize, bool)> {
+        let raw = self.headers.get(column)?;
+        if raw.is_empty() || raw.len() > max_bytes {
+            return None;
+        }
+        let name = std::str::from_utf8(raw).ok()?;
+        if name.bytes().any(|b| b < 0x20 || b == 0x7F) {
+            return None;
+        }
+        let is_bare = is_bare_identifier(name);
+        let formatted_len = if is_bare {
+            name.len()
+        } else {
+            let extra_brackets = name.bytes().filter(|&b| b == b']').count();
+            2usize
+                .saturating_add(name.len())
+                .saturating_add(extra_brackets)
+        };
+        if formatted_len > max_bytes {
+            return None;
+        }
+        if !self.is_unique_header(raw) {
+            return None;
+        }
+        Some((name, formatted_len, is_bare))
+    }
+
+    fn format_column_bounded(&self, column: usize, max_bytes: usize) -> String {
+        if let Some((name, formatted_len, is_bare)) = self.preferred_header_label(column, max_bytes)
         {
-            if is_bare_identifier(name) {
+            if is_bare {
                 return name.to_owned();
             }
-            let escaped = name.replace(']', "]]");
-            return format!("[{escaped}]");
+            let mut out = String::with_capacity(formatted_len);
+            out.push('[');
+            for ch in name.chars() {
+                if ch == ']' {
+                    out.push_str("]]");
+                } else {
+                    out.push(ch);
+                }
+            }
+            out.push(']');
+            return out;
         }
         format!("#{}", column + 1)
     }
@@ -161,6 +197,29 @@ impl<'a> FilterColumnSchema<'a> {
         }
         count == 1
     }
+}
+
+fn char_end_at(input: &str, byte_index: usize) -> usize {
+    if byte_index >= input.len() {
+        return input.len();
+    }
+    input[byte_index..]
+        .chars()
+        .next()
+        .map_or(input.len(), |ch| byte_index + ch.len_utf8())
+}
+
+fn decimal_digits(mut value: usize) -> usize {
+    let mut digits = 1;
+    while value >= 10 {
+        value /= 10;
+        digits += 1;
+    }
+    digits
+}
+
+fn index_label_len(column: usize) -> usize {
+    1 + decimal_digits(column.saturating_add(1))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -404,6 +463,12 @@ fn lex(input: &str) -> Result<Vec<Token>, FilterExprError> {
                             "bracketed column names cannot contain raw line breaks; use #N instead",
                         ));
                     }
+                    if (c as u32) < 0x20 || c == '\x7F' {
+                        return Err(FilterExprError::new(
+                            FilterExprSpan::new(pos, pos + 1),
+                            "bracketed column names cannot contain control characters; use #N instead",
+                        ));
+                    }
                     if c == ']' {
                         if bytes.get(pos + 1) == Some(&b']') {
                             name.push(']');
@@ -446,6 +511,12 @@ fn lex(input: &str) -> Result<Vec<Token>, FilterExprError> {
                             "unterminated string literal; use \\n or \\r for line breaks",
                         ));
                     }
+                    if b < 0x20 || b == 0x7F {
+                        return Err(FilterExprError::new(
+                            FilterExprSpan::new(pos, pos + 1),
+                            "unescaped control character in string literal; use \\t or \\xHH instead",
+                        ));
+                    }
                     if b == b'"' {
                         pos += 1;
                         closed = true;
@@ -485,14 +556,14 @@ fn lex(input: &str) -> Result<Vec<Token>, FilterExprError> {
                                 let Some(hi) = bytes.get(pos + 1).copied().and_then(hex_value)
                                 else {
                                     return Err(FilterExprError::new(
-                                        FilterExprSpan::new(esc_start, (pos + 2).min(bytes.len())),
+                                        FilterExprSpan::new(esc_start, char_end_at(input, pos + 1)),
                                         "invalid hex escape; expected \\xHH with two hexadecimal digits",
                                     ));
                                 };
                                 let Some(lo) = bytes.get(pos + 2).copied().and_then(hex_value)
                                 else {
                                     return Err(FilterExprError::new(
-                                        FilterExprSpan::new(esc_start, (pos + 3).min(bytes.len())),
+                                        FilterExprSpan::new(esc_start, char_end_at(input, pos + 2)),
                                         "invalid hex escape; expected \\xHH with two hexadecimal digits",
                                     ));
                                 };
@@ -542,6 +613,12 @@ fn lex(input: &str) -> Result<Vec<Token>, FilterExprError> {
                         return Err(FilterExprError::new(
                             FilterExprSpan::new(start, pos),
                             "unterminated regex literal; use \\n or \\r inside /.../",
+                        ));
+                    }
+                    if b < 0x20 || b == 0x7F {
+                        return Err(FilterExprError::new(
+                            FilterExprSpan::new(pos, pos + 1),
+                            "unescaped control character in regex literal; use escape sequences like \\t or \\xHH instead",
                         ));
                     }
                     if b == b'/' {
@@ -708,6 +785,7 @@ struct Parser<'a> {
     tokens: &'a [Token],
     pos: usize,
     input_len: usize,
+    atom_count: usize,
     schema: &'a FilterColumnSchema<'a>,
 }
 
@@ -808,6 +886,20 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_atom(&mut self) -> Result<ParsedAtom, FilterExprError> {
+        if self.atom_count >= MAX_FILTER_EXPR_PREDICATES {
+            let span = self
+                .peek()
+                .map(|tok| tok.span)
+                .unwrap_or_else(|| self.eof_span());
+            return Err(FilterExprError::new(
+                span,
+                format!(
+                    "filter expression exceeds the maximum of {MAX_FILTER_EXPR_PREDICATES} predicates"
+                ),
+            ));
+        }
+        self.atom_count += 1;
+
         let Some(col_tok) = self.next() else {
             return Err(FilterExprError::new(
                 self.eof_span(),
@@ -1083,6 +1175,7 @@ pub fn parse_filter_expr(
         tokens: &tokens,
         pos: 0,
         input_len: input.len(),
+        atom_count: 0,
         schema,
     };
     let clauses = parser.parse_all()?;
@@ -1115,7 +1208,6 @@ pub fn parse_filter_expr(
     let mut predicate_spans = Vec::new();
 
     for (column, bucket) in by_column {
-        let col_label = schema.format_column(column);
         match bucket.inclusion_clauses.len() {
             0 => {}
             1 => {
@@ -1154,6 +1246,7 @@ pub fn parse_filter_expr(
                         });
                         predicate_spans.push(span);
                     } else if is_range_pair(a.operator, b.operator) {
+                        let col_label = schema.format_column_bounded(column, 256);
                         return Err(FilterExprError::new(
                             second.span,
                             format!(
@@ -1161,6 +1254,7 @@ pub fn parse_filter_expr(
                             ),
                         ));
                     } else {
+                        let col_label = schema.format_column_bounded(column, 256);
                         return Err(FilterExprError::new(
                             second.span,
                             format!(
@@ -1169,6 +1263,7 @@ pub fn parse_filter_expr(
                         ));
                     }
                 } else {
+                    let col_label = schema.format_column_bounded(column, 256);
                     return Err(FilterExprError::new(
                         second.span,
                         format!(
@@ -1178,6 +1273,7 @@ pub fn parse_filter_expr(
                 }
             }
             _ => {
+                let col_label = schema.format_column_bounded(column, 256);
                 let bad_span = bucket.inclusion_clauses[1].span;
                 return Err(FilterExprError::new(
                     bad_span,
@@ -1191,18 +1287,6 @@ pub fn parse_filter_expr(
         for exc in bucket.exclusions {
             predicates.push(exc.predicate);
             predicate_spans.push(exc.span);
-        }
-
-        if predicates.len() > MAX_FILTER_EXPR_PREDICATES {
-            let overflow_span = *predicate_spans
-                .last()
-                .unwrap_or(&FilterExprSpan::new(0, input.len()));
-            return Err(FilterExprError::new(
-                overflow_span,
-                format!(
-                    "filter expression exceeds the maximum of {MAX_FILTER_EXPR_PREDICATES} predicates"
-                ),
-            ));
         }
     }
 
@@ -1242,15 +1326,87 @@ fn is_range_pair(a: FilterOperator, b: FilterOperator) -> bool {
     (is_lower(a) && is_upper(b)) || (is_upper(a) && is_lower(b))
 }
 
-fn format_string_literal(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len() + 2);
-    out.push('"');
+#[derive(Clone, Copy)]
+enum ColumnLabel<'a> {
+    Index { column: usize, len: usize },
+    Bare(&'a str),
+    Bracketed { name: &'a str, len: usize },
+}
+
+impl<'a> ColumnLabel<'a> {
+    fn len(self) -> usize {
+        match self {
+            Self::Index { len, .. } | Self::Bracketed { len, .. } => len,
+            Self::Bare(name) => name.len(),
+        }
+    }
+
+    fn first_byte(self) -> u8 {
+        match self {
+            Self::Index { .. } => b'#',
+            Self::Bracketed { .. } => b'[',
+            Self::Bare(name) => name.as_bytes()[0],
+        }
+    }
+
+    fn last_byte(self) -> u8 {
+        match self {
+            Self::Index { column, .. } => b'0' + (((column + 1) % 10) as u8),
+            Self::Bracketed { .. } => b']',
+            Self::Bare(name) => *name.as_bytes().last().unwrap(),
+        }
+    }
+
+    fn write_to(self, out: &mut String) {
+        match self {
+            Self::Index { column, .. } => {
+                use std::fmt::Write;
+                let _ = write!(out, "#{}", column + 1);
+            }
+            Self::Bare(name) => out.push_str(name),
+            Self::Bracketed { name, .. } => {
+                out.push('[');
+                for ch in name.chars() {
+                    if ch == ']' {
+                        out.push_str("]]");
+                    } else {
+                        out.push(ch);
+                    }
+                }
+                out.push(']');
+            }
+        }
+    }
+}
+
+fn token_boundary_needs_space(prev_byte: u8, next_byte: u8) -> bool {
+    let prev_is_word = prev_byte.is_ascii_alphanumeric()
+        || prev_byte == b'_'
+        || prev_byte == b'.'
+        || prev_byte >= 0x80;
+    let next_is_word = next_byte.is_ascii_alphanumeric()
+        || next_byte == b'_'
+        || next_byte == b'.'
+        || next_byte >= 0x80;
+    prev_is_word && next_is_word
+}
+
+fn escaped_char_len(ch: char) -> usize {
+    match ch {
+        '"' | '\\' | '\n' | '\r' | '\t' => 2,
+        c if (c as u32) < 0x20 || c == '\x7F' => 4,
+        c => c.len_utf8(),
+    }
+}
+
+fn string_literal_len(bytes: &[u8]) -> usize {
+    let mut len = 2usize; // opening and closing quotes
     let mut cursor = 0usize;
     while cursor < bytes.len() {
         match std::str::from_utf8(&bytes[cursor..]) {
             Ok(valid) => {
                 for ch in valid.chars() {
-                    push_escaped_char(&mut out, ch);
+                    len = len.saturating_add(escaped_char_len(ch));
                 }
                 break;
             }
@@ -1259,7 +1415,36 @@ fn format_string_literal(bytes: &[u8]) -> String {
                 if valid_len > 0 {
                     let valid = std::str::from_utf8(&bytes[cursor..cursor + valid_len]).unwrap();
                     for ch in valid.chars() {
-                        push_escaped_char(&mut out, ch);
+                        len = len.saturating_add(escaped_char_len(ch));
+                    }
+                    cursor += valid_len;
+                }
+                let bad_len = err.error_len().unwrap_or(bytes.len() - cursor);
+                len = len.saturating_add(bad_len.saturating_mul(4));
+                cursor += bad_len;
+            }
+        }
+    }
+    len
+}
+
+fn write_string_literal(out: &mut String, bytes: &[u8]) {
+    out.push('"');
+    let mut cursor = 0usize;
+    while cursor < bytes.len() {
+        match std::str::from_utf8(&bytes[cursor..]) {
+            Ok(valid) => {
+                for ch in valid.chars() {
+                    push_escaped_char(out, ch);
+                }
+                break;
+            }
+            Err(err) => {
+                let valid_len = err.valid_up_to();
+                if valid_len > 0 {
+                    let valid = std::str::from_utf8(&bytes[cursor..cursor + valid_len]).unwrap();
+                    for ch in valid.chars() {
+                        push_escaped_char(out, ch);
                     }
                     cursor += valid_len;
                 }
@@ -1273,7 +1458,6 @@ fn format_string_literal(bytes: &[u8]) -> String {
         }
     }
     out.push('"');
-    out
 }
 
 fn push_escaped_char(out: &mut String, ch: char) {
@@ -1291,65 +1475,500 @@ fn push_escaped_char(out: &mut String, ch: char) {
     }
 }
 
-fn format_numeric_literal(bytes: &[u8]) -> String {
-    String::from_utf8_lossy(bytes.trim_ascii()).into_owned()
+/// Returns the exact `/.../` literal byte length if `bytes` can round-trip losslessly
+/// through the regex literal lexer without adding extra backslashes.
+fn regex_literal_len(bytes: &[u8]) -> Option<usize> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    let mut len = 2usize; // opening and closing '/'
+    let mut backslashes = 0usize;
+    for &b in text.as_bytes() {
+        if b < 0x20 || b == 0x7F {
+            return None;
+        }
+        if b == b'/' {
+            if backslashes % 2 == 1 {
+                return None;
+            }
+            len = len.saturating_add(2); // \/
+            backslashes = 0;
+        } else if b == b'\\' {
+            len = len.saturating_add(1);
+            backslashes += 1;
+        } else {
+            len = len.saturating_add(1);
+            backslashes = 0;
+        }
+    }
+    if backslashes % 2 == 1 {
+        return None;
+    }
+    Some(len)
 }
 
-fn format_predicate(predicate: &FilterPredicate, col_label: &str) -> String {
-    match predicate.operator {
-        FilterOperator::Equals => {
-            format!("{col_label} == {}", format_string_literal(&predicate.value))
+fn write_regex_literal(out: &mut String, bytes: &[u8]) {
+    let text = std::str::from_utf8(bytes).expect("validated utf8 regex literal");
+    out.push('/');
+    for ch in text.chars() {
+        if ch == '/' {
+            out.push_str("\\/");
+        } else {
+            out.push(ch);
         }
-        FilterOperator::NotEquals => {
-            format!("{col_label} != {}", format_string_literal(&predicate.value))
+    }
+    out.push('/');
+}
+
+fn numeric_literal_len(bytes: &[u8]) -> usize {
+    let trimmed = bytes.trim_ascii();
+    match std::str::from_utf8(trimmed) {
+        Ok(s) => s.len(),
+        Err(_) => String::from_utf8_lossy(trimmed).len(),
+    }
+}
+
+fn write_numeric_literal(out: &mut String, bytes: &[u8]) {
+    let trimmed = bytes.trim_ascii();
+    match std::str::from_utf8(trimmed) {
+        Ok(s) => out.push_str(s),
+        Err(_) => out.push_str(&String::from_utf8_lossy(trimmed)),
+    }
+}
+
+fn numeric_first_byte(bytes: &[u8]) -> u8 {
+    bytes.trim_ascii().first().copied().unwrap_or(b'0')
+}
+
+fn numeric_last_byte(bytes: &[u8]) -> u8 {
+    bytes.trim_ascii().last().copied().unwrap_or(b'0')
+}
+
+#[derive(Clone, Copy)]
+enum PrintTier {
+    PrettyHeaders,
+    PrettyIndex,
+    Compact,
+}
+
+fn choose_column_label<'a>(
+    schema: &FilterColumnSchema<'a>,
+    column: usize,
+    tier: PrintTier,
+) -> ColumnLabel<'a> {
+    let idx_len = index_label_len(column);
+    let idx_label = ColumnLabel::Index {
+        column,
+        len: idx_len,
+    };
+    match tier {
+        PrintTier::PrettyIndex => idx_label,
+        PrintTier::PrettyHeaders => {
+            if let Some((name, formatted_len, is_bare)) =
+                schema.preferred_header_label(column, MAX_FILTER_EXPR_BYTES)
+            {
+                if is_bare {
+                    ColumnLabel::Bare(name)
+                } else {
+                    ColumnLabel::Bracketed {
+                        name,
+                        len: formatted_len,
+                    }
+                }
+            } else {
+                idx_label
+            }
         }
-        FilterOperator::Contains => {
-            format!(
-                "{col_label} CONTAINS {}",
-                format_string_literal(&predicate.value)
-            )
-        }
-        FilterOperator::Regex => {
-            format!("{col_label} =~ {}", format_string_literal(&predicate.value))
-        }
-        FilterOperator::GreaterThan => {
-            format!("{col_label} > {}", format_numeric_literal(&predicate.value))
-        }
-        FilterOperator::GreaterThanOrEqual => {
-            format!(
-                "{col_label} >= {}",
-                format_numeric_literal(&predicate.value)
-            )
-        }
-        FilterOperator::LessThan => {
-            format!("{col_label} < {}", format_numeric_literal(&predicate.value))
-        }
-        FilterOperator::LessThanOrEqual => {
-            format!(
-                "{col_label} <= {}",
-                format_numeric_literal(&predicate.value)
-            )
-        }
-        FilterOperator::Between => {
-            let upper = predicate
-                .upper_bound
-                .as_deref()
-                .map(format_numeric_literal)
-                .unwrap_or_default();
-            format!(
-                "{col_label} BETWEEN {} AND {upper}",
-                format_numeric_literal(&predicate.value)
-            )
+        PrintTier::Compact => {
+            if let Some((name, formatted_len, is_bare)) =
+                schema.preferred_header_label(column, idx_len.saturating_sub(1))
+            {
+                if is_bare {
+                    ColumnLabel::Bare(name)
+                } else {
+                    ColumnLabel::Bracketed {
+                        name,
+                        len: formatted_len,
+                    }
+                }
+            } else {
+                idx_label
+            }
         }
     }
 }
 
-/// Prints any [`FilterQuery`] in canonical expression form against `schema`.
+/// Measure or render a single predicate under `compact` rules, returning `(len, last_byte)`.
+/// If `out` is `Some`, writes exact bytes matching the measured length.
+fn emit_predicate(
+    predicate: &FilterPredicate,
+    col_label: ColumnLabel<'_>,
+    compact: bool,
+    expand_between: bool,
+    mut out: Option<&mut String>,
+) -> (usize, u8) {
+    let mut len = 0usize;
+    let push_str = |out: &mut Option<&mut String>, len: &mut usize, s: &str| {
+        *len = len.saturating_add(s.len());
+        if let Some(buf) = out.as_deref_mut() {
+            buf.push_str(s);
+        }
+    };
+    let push_col = |out: &mut Option<&mut String>, len: &mut usize, col: ColumnLabel<'_>| {
+        *len = len.saturating_add(col.len());
+        if let Some(buf) = out.as_deref_mut() {
+            col.write_to(buf);
+        }
+    };
+
+    match predicate.operator {
+        FilterOperator::Equals => {
+            push_col(&mut out, &mut len, col_label);
+            push_str(&mut out, &mut len, if compact { "==" } else { " == " });
+            len = len.saturating_add(string_literal_len(&predicate.value));
+            if let Some(buf) = out {
+                write_string_literal(buf, &predicate.value);
+            }
+            (len, b'"')
+        }
+        FilterOperator::NotEquals => {
+            push_col(&mut out, &mut len, col_label);
+            push_str(&mut out, &mut len, if compact { "!=" } else { " != " });
+            len = len.saturating_add(string_literal_len(&predicate.value));
+            if let Some(buf) = out {
+                write_string_literal(buf, &predicate.value);
+            }
+            (len, b'"')
+        }
+        FilterOperator::Contains => {
+            push_col(&mut out, &mut len, col_label);
+            if compact {
+                if token_boundary_needs_space(col_label.last_byte(), b'C') {
+                    push_str(&mut out, &mut len, " ");
+                }
+                push_str(&mut out, &mut len, "CONTAINS");
+            } else {
+                push_str(&mut out, &mut len, " CONTAINS ");
+            }
+            len = len.saturating_add(string_literal_len(&predicate.value));
+            if let Some(buf) = out {
+                write_string_literal(buf, &predicate.value);
+            }
+            (len, b'"')
+        }
+        FilterOperator::Regex => {
+            push_col(&mut out, &mut len, col_label);
+            push_str(&mut out, &mut len, if compact { "=~" } else { " =~ " });
+            let str_len = string_literal_len(&predicate.value);
+            let use_slash = compact
+                && regex_literal_len(&predicate.value).is_some_and(|slash_len| slash_len < str_len);
+            if use_slash {
+                let slash_len = regex_literal_len(&predicate.value).unwrap();
+                len = len.saturating_add(slash_len);
+                if let Some(buf) = out {
+                    write_regex_literal(buf, &predicate.value);
+                }
+                (len, b'/')
+            } else {
+                len = len.saturating_add(str_len);
+                if let Some(buf) = out {
+                    write_string_literal(buf, &predicate.value);
+                }
+                (len, b'"')
+            }
+        }
+        FilterOperator::GreaterThan => {
+            push_col(&mut out, &mut len, col_label);
+            push_str(&mut out, &mut len, if compact { ">" } else { " > " });
+            len = len.saturating_add(numeric_literal_len(&predicate.value));
+            if let Some(buf) = out {
+                write_numeric_literal(buf, &predicate.value);
+            }
+            (len, numeric_last_byte(&predicate.value))
+        }
+        FilterOperator::GreaterThanOrEqual => {
+            push_col(&mut out, &mut len, col_label);
+            push_str(&mut out, &mut len, if compact { ">=" } else { " >= " });
+            len = len.saturating_add(numeric_literal_len(&predicate.value));
+            if let Some(buf) = out {
+                write_numeric_literal(buf, &predicate.value);
+            }
+            (len, numeric_last_byte(&predicate.value))
+        }
+        FilterOperator::LessThan => {
+            push_col(&mut out, &mut len, col_label);
+            push_str(&mut out, &mut len, if compact { "<" } else { " < " });
+            len = len.saturating_add(numeric_literal_len(&predicate.value));
+            if let Some(buf) = out {
+                write_numeric_literal(buf, &predicate.value);
+            }
+            (len, numeric_last_byte(&predicate.value))
+        }
+        FilterOperator::LessThanOrEqual => {
+            push_col(&mut out, &mut len, col_label);
+            push_str(&mut out, &mut len, if compact { "<=" } else { " <= " });
+            len = len.saturating_add(numeric_literal_len(&predicate.value));
+            if let Some(buf) = out {
+                write_numeric_literal(buf, &predicate.value);
+            }
+            (len, numeric_last_byte(&predicate.value))
+        }
+        FilterOperator::Between => {
+            let upper = predicate.upper_bound.as_deref().unwrap_or(&[]);
+            if compact && expand_between {
+                push_col(&mut out, &mut len, col_label);
+                push_str(&mut out, &mut len, ">=");
+                len = len.saturating_add(numeric_literal_len(&predicate.value));
+                if let Some(buf) = out.as_deref_mut() {
+                    write_numeric_literal(buf, &predicate.value);
+                }
+                if token_boundary_needs_space(numeric_last_byte(&predicate.value), b'A') {
+                    push_str(&mut out, &mut len, " ");
+                }
+                push_str(&mut out, &mut len, "AND");
+                if token_boundary_needs_space(b'D', col_label.first_byte()) {
+                    push_str(&mut out, &mut len, " ");
+                }
+                push_col(&mut out, &mut len, col_label);
+                push_str(&mut out, &mut len, "<=");
+                len = len.saturating_add(numeric_literal_len(upper));
+                if let Some(buf) = out {
+                    write_numeric_literal(buf, upper);
+                }
+                (len, numeric_last_byte(upper))
+            } else {
+                push_col(&mut out, &mut len, col_label);
+                if compact {
+                    if token_boundary_needs_space(col_label.last_byte(), b'B') {
+                        push_str(&mut out, &mut len, " ");
+                    }
+                    push_str(&mut out, &mut len, "BETWEEN");
+                    if token_boundary_needs_space(b'N', numeric_first_byte(&predicate.value)) {
+                        push_str(&mut out, &mut len, " ");
+                    }
+                } else {
+                    push_str(&mut out, &mut len, " BETWEEN ");
+                }
+                len = len.saturating_add(numeric_literal_len(&predicate.value));
+                if let Some(buf) = out.as_deref_mut() {
+                    write_numeric_literal(buf, &predicate.value);
+                }
+                if compact {
+                    if token_boundary_needs_space(numeric_last_byte(&predicate.value), b'A') {
+                        push_str(&mut out, &mut len, " ");
+                    }
+                    push_str(&mut out, &mut len, "AND");
+                    if token_boundary_needs_space(b'D', numeric_first_byte(upper)) {
+                        push_str(&mut out, &mut len, " ");
+                    }
+                } else {
+                    push_str(&mut out, &mut len, " AND ");
+                }
+                len = len.saturating_add(numeric_literal_len(upper));
+                if let Some(buf) = out {
+                    write_numeric_literal(buf, upper);
+                }
+                (len, numeric_last_byte(upper))
+            }
+        }
+    }
+}
+
+fn emit_joiner(
+    prev_byte: u8,
+    keyword: &str,
+    next_byte: u8,
+    compact: bool,
+    mut out: Option<&mut String>,
+) -> usize {
+    if !compact {
+        let total = 2 + keyword.len();
+        if let Some(buf) = out {
+            buf.push(' ');
+            buf.push_str(keyword);
+            buf.push(' ');
+        }
+        return total;
+    }
+    let mut len = 0usize;
+    if token_boundary_needs_space(prev_byte, keyword.as_bytes()[0]) {
+        len += 1;
+        if let Some(buf) = out.as_deref_mut() {
+            buf.push(' ');
+        }
+    }
+    len += keyword.len();
+    if let Some(buf) = out.as_deref_mut() {
+        buf.push_str(keyword);
+    }
+    if token_boundary_needs_space(*keyword.as_bytes().last().unwrap(), next_byte) {
+        len += 1;
+        if let Some(buf) = out {
+            buf.push(' ');
+        }
+    }
+    len
+}
+
+fn try_render_grouped(
+    by_column: &BTreeMap<usize, (Vec<&FilterPredicate>, Vec<&FilterPredicate>)>,
+    schema: &FilterColumnSchema<'_>,
+    total_predicates: usize,
+    tier: PrintTier,
+) -> Option<String> {
+    let compact = matches!(tier, PrintTier::Compact);
+    let mut spare_atoms = MAX_FILTER_EXPR_PREDICATES.saturating_sub(total_predicates);
+    let mut expand_flags: Vec<bool> = Vec::new();
+    if compact {
+        expand_flags.reserve(total_predicates);
+    }
+
+    // Pass 1: measure exact total byte length without allocating the output string.
+    let mut total_len = 0usize;
+    let mut prev_clause_last: Option<u8> = None;
+
+    for (&column, (inclusions, exclusions)) in by_column {
+        let col_label = choose_column_label(schema, column, tier);
+        if !inclusions.is_empty() {
+            if let Some(prev) = prev_clause_last {
+                total_len = total_len.saturating_add(emit_joiner(
+                    prev,
+                    "AND",
+                    col_label.first_byte(),
+                    compact,
+                    None,
+                ));
+            }
+            let single_inclusion = inclusions.len() == 1;
+            let mut prev_or_last: Option<u8> = None;
+            for pred in inclusions {
+                if let Some(prev) = prev_or_last {
+                    total_len = total_len.saturating_add(emit_joiner(
+                        prev,
+                        "OR",
+                        col_label.first_byte(),
+                        compact,
+                        None,
+                    ));
+                }
+                let expand = if compact
+                    && single_inclusion
+                    && pred.operator == FilterOperator::Between
+                    && spare_atoms > 0
+                {
+                    let (between_len, _) = emit_predicate(pred, col_label, true, false, None);
+                    let (expanded_len, _) = emit_predicate(pred, col_label, true, true, None);
+                    if expanded_len < between_len {
+                        spare_atoms -= 1;
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+                if compact {
+                    expand_flags.push(expand);
+                }
+                let (pred_len, last) = emit_predicate(pred, col_label, compact, expand, None);
+                total_len = total_len.saturating_add(pred_len);
+                prev_or_last = Some(last);
+                if total_len > MAX_FILTER_EXPR_BYTES {
+                    return None;
+                }
+            }
+            prev_clause_last = prev_or_last;
+        }
+        for exc in exclusions {
+            if let Some(prev) = prev_clause_last {
+                total_len = total_len.saturating_add(emit_joiner(
+                    prev,
+                    "AND",
+                    col_label.first_byte(),
+                    compact,
+                    None,
+                ));
+            }
+            let (pred_len, last) = emit_predicate(exc, col_label, compact, false, None);
+            total_len = total_len.saturating_add(pred_len);
+            prev_clause_last = Some(last);
+            if total_len > MAX_FILTER_EXPR_BYTES {
+                return None;
+            }
+        }
+    }
+
+    if total_len > MAX_FILTER_EXPR_BYTES {
+        return None;
+    }
+
+    // Pass 2: allocate exact bounded capacity and render directly.
+    let mut out = String::with_capacity(total_len);
+    let mut prev_clause_last: Option<u8> = None;
+    let mut expand_idx = 0usize;
+
+    for (&column, (inclusions, exclusions)) in by_column {
+        let col_label = choose_column_label(schema, column, tier);
+        if !inclusions.is_empty() {
+            if let Some(prev) = prev_clause_last {
+                emit_joiner(prev, "AND", col_label.first_byte(), compact, Some(&mut out));
+            }
+            let mut prev_or_last: Option<u8> = None;
+            for pred in inclusions {
+                if let Some(prev) = prev_or_last {
+                    emit_joiner(prev, "OR", col_label.first_byte(), compact, Some(&mut out));
+                }
+                let expand = if compact {
+                    let flag = expand_flags[expand_idx];
+                    expand_idx += 1;
+                    flag
+                } else {
+                    false
+                };
+                let (_, last) = emit_predicate(pred, col_label, compact, expand, Some(&mut out));
+                prev_or_last = Some(last);
+            }
+            prev_clause_last = prev_or_last;
+        }
+        for exc in exclusions {
+            if let Some(prev) = prev_clause_last {
+                emit_joiner(prev, "AND", col_label.first_byte(), compact, Some(&mut out));
+            }
+            let (_, last) = emit_predicate(exc, col_label, compact, false, Some(&mut out));
+            prev_clause_last = Some(last);
+        }
+    }
+
+    debug_assert_eq!(out.len(), total_len);
+    Some(out)
+}
+
+/// Prints a [`FilterQuery`] in canonical expression form against `schema`, strictly bounded to
+/// [`MAX_FILTER_EXPR_BYTES`] and [`MAX_FILTER_EXPR_PREDICATES`].
 ///
 /// Column groups are emitted in ascending column order, with each column's inclusion predicates
-/// joined by `OR` and exclusions (`!=`) and separate columns joined by `AND`. Every valid
-/// [`FilterQuery`] round-trips losslessly through `parse_filter_expr(print_filter_expr(q))`.
-pub fn print_filter_expr(query: &FilterQuery, schema: &FilterColumnSchema<'_>) -> String {
+/// joined by `OR` and exclusions (`!=`) and separate columns joined by `AND`. Every expression
+/// accepted by [`parse_filter_expr`] prints to a valid, bounded expression that round-trips
+/// losslessly through [`parse_filter_expr`]. Oversized or empty legacy queries return an explicit
+/// [`FilterExprError`] without allocating unbounded output.
+pub fn print_filter_expr(
+    query: &FilterQuery,
+    schema: &FilterColumnSchema<'_>,
+) -> Result<String, FilterExprError> {
+    if query.predicates.is_empty() {
+        return Err(FilterExprError::new(
+            FilterExprSpan::new(0, 0),
+            "filter query has no predicates to print",
+        ));
+    }
+    if query.predicates.len() > MAX_FILTER_EXPR_PREDICATES {
+        return Err(FilterExprError::new(
+            FilterExprSpan::new(0, 0),
+            format!(
+                "filter query has {} predicates, exceeding the {MAX_FILTER_EXPR_PREDICATES}-predicate expression limit",
+                query.predicates.len()
+            ),
+        ));
+    }
+
     let mut by_column: BTreeMap<usize, (Vec<&FilterPredicate>, Vec<&FilterPredicate>)> =
         BTreeMap::new();
     for predicate in &query.predicates {
@@ -1361,22 +1980,23 @@ pub fn print_filter_expr(query: &FilterQuery, schema: &FilterColumnSchema<'_>) -
         }
     }
 
-    let mut and_parts = Vec::new();
-    for (column, (inclusions, exclusions)) in by_column {
-        let col_label = schema.format_column(column);
-        if !inclusions.is_empty() {
-            let or_chain = inclusions
-                .into_iter()
-                .map(|p| format_predicate(p, &col_label))
-                .collect::<Vec<_>>()
-                .join(" OR ");
-            and_parts.push(or_chain);
-        }
-        for exc in exclusions {
-            and_parts.push(format_predicate(exc, &col_label));
+    let total_predicates = query.predicates.len();
+    for tier in [
+        PrintTier::PrettyHeaders,
+        PrintTier::PrettyIndex,
+        PrintTier::Compact,
+    ] {
+        if let Some(rendered) = try_render_grouped(&by_column, schema, total_predicates, tier) {
+            return Ok(rendered);
         }
     }
-    and_parts.join(" AND ")
+
+    Err(FilterExprError::new(
+        FilterExprSpan::new(0, 0),
+        format!(
+            "filter query cannot be printed within the {MAX_FILTER_EXPR_BYTES}-byte expression limit"
+        ),
+    ))
 }
 
 #[cfg(test)]
@@ -1415,7 +2035,7 @@ mod tests {
 
         let expr = "  amount >= -12.5  and  amount <= 1e3  AND  #1 == \"TX\" or state == \"FL\" AND state != \"CA\" AND [order id] contains \"inv\" AND [and] != \"\" AND [a]]b] == \"x\" AND #6 == \"first\" AND code =~ /^ERR-\\d+$/ ";
         let parsed = parse_filter_expr(expr, &schema, CaseSensitivity::Sensitive).unwrap();
-        let printed = print_filter_expr(&parsed, &schema);
+        let printed = print_filter_expr(&parsed, &schema).unwrap();
         assert_eq!(
             printed,
             "state == \"TX\" OR state == \"FL\" AND state != \"CA\" AND [order id] CONTAINS \"inv\" AND amount BETWEEN -12.5 AND 1e3 AND [and] != \"\" AND [a]]b] == \"x\" AND #6 == \"first\" AND code =~ \"^ERR-\\\\d+$\""
@@ -1424,7 +2044,7 @@ mod tests {
         // Idempotent canonical printing: print(parse(printed)) == printed.
         let reparsed = parse_filter_expr(&printed, &schema, CaseSensitivity::Sensitive).unwrap();
         assert_eq!(reparsed, parsed);
-        assert_eq!(print_filter_expr(&reparsed, &schema), printed);
+        assert_eq!(print_filter_expr(&reparsed, &schema).unwrap(), printed);
 
         // Reversed inclusive bounds (`<= upper AND >= lower`) fold to the exact same canonical Between.
         let reversed = parse_filter_expr(
@@ -1434,7 +2054,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            print_filter_expr(&reversed, &schema),
+            print_filter_expr(&reversed, &schema).unwrap(),
             "amount BETWEEN -12.5 AND 1e3"
         );
     }
@@ -1497,6 +2117,13 @@ mod tests {
             ("a == \"unterminated", "unterminated string literal"),
             ("a == \"bad\\q\"", "unknown escape sequence"),
             ("a == \"bad\\xZZ\"", "invalid hex escape"),
+            ("a == \"bad\\xé\"", "invalid hex escape"),
+            ("a == \"bad\\x0é\"", "invalid hex escape"),
+            ("a == \"bad\\x", "invalid hex escape"),
+            ("a == \"bad\\x0", "invalid hex escape"),
+            ("a == \"raw\x01ctrl\"", "unescaped control character"),
+            ("a =~ /raw\x01ctrl/", "unescaped control character"),
+            ("[raw\x01hdr] == \"x\"", "control characters"),
             ("a =~ /unterminated", "unterminated regex literal"),
             ("a > 123abc", "invalid numeric literal"),
             ("a > 1e", "missing exponent digits"),
@@ -1511,8 +2138,8 @@ mod tests {
                 err.message
             );
             assert!(
-                err.span.start <= err.span.end && err.span.end <= expr.len(),
-                "invalid span {:?} for `{expr}`",
+                expr.get(err.span.start..err.span.end).is_some(),
+                "invalid or non-UTF8-boundary span {:?} for `{expr}`",
                 err.span
             );
         }
@@ -1523,7 +2150,7 @@ mod tests {
             parse_filter_expr("a == \"1\"", &headerless, CaseSensitivity::Sensitive).unwrap_err();
         assert!(err.message.contains("no header row"));
         let ok = parse_filter_expr("#2 == \"1\"", &headerless, CaseSensitivity::Sensitive).unwrap();
-        assert_eq!(print_filter_expr(&ok, &headerless), "#2 == \"1\"");
+        assert_eq!(print_filter_expr(&ok, &headerless).unwrap(), "#2 == \"1\"");
 
         // Expression byte cap and predicate count cap.
         let huge = format!("a == \"{}\"", "x".repeat(MAX_FILTER_EXPR_BYTES));
@@ -1538,6 +2165,160 @@ mod tests {
                 .unwrap_err()
                 .message
                 .contains("maximum")
+        );
+
+        // Pre-resolution / pre-folding predicate cap:
+        // 1) 128 inclusive range pairs (256 input predicates) succeed and fold to 128 BETWEEN predicates.
+        let open_schema = FilterColumnSchema::headerless(None);
+        let max_pairs = (1..=128)
+            .map(|c| format!("#{c} >= 1 AND #{c} <= 10"))
+            .collect::<Vec<_>>()
+            .join(" AND ");
+        let folded_max = parse_filter_expr(&max_pairs, &open_schema, CaseSensitivity::Sensitive)
+            .expect("256 input predicates should succeed");
+        assert_eq!(folded_max.predicates.len(), 128);
+
+        // 2) 129 inclusive range pairs (258 input predicates) must be rejected at atom 257 BEFORE folding.
+        let over_pairs = (1..=129)
+            .map(|c| format!("#{c} >= 1 AND #{c} <= 10"))
+            .collect::<Vec<_>>()
+            .join(" AND ");
+        let over_err = parse_filter_expr(&over_pairs, &open_schema, CaseSensitivity::Sensitive)
+            .expect_err("258 input predicates must be rejected even if they would fold to 129");
+        assert!(over_err.message.contains("maximum"));
+        assert!(
+            over_pairs
+                .get(over_err.span.start..over_err.span.end)
+                .is_some()
+        );
+
+        // 3) Atom 257 is rejected BEFORE resolving its column name (unknown column does not mask limit).
+        let mut or_chain = (0..MAX_FILTER_EXPR_PREDICATES)
+            .map(|i| format!("a == \"{i}\""))
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        or_chain.push_str(" OR unknown_col_257 == \"x\"");
+        let pre_res_err = parse_filter_expr(&or_chain, &schema, CaseSensitivity::Sensitive)
+            .expect_err("atom 257 must fail max-predicates before name resolution");
+        assert!(
+            pre_res_err.message.contains("maximum"),
+            "expected max-predicates error before unknown-column error, got: {}",
+            pre_res_err.message
+        );
+        assert!(
+            or_chain
+                .get(pre_res_err.span.start..pre_res_err.span.end)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn printer_bounds_huge_headers_preserves_max_byte_round_trip_and_rejects_oversized_legacy_queries()
+     {
+        // 1. Giant 2 MiB unique header falls back to #1 without allocating the header.
+        let giant_hdrs = vec![vec![b'h'; 2 * 1024 * 1024], b"state".to_vec()];
+        let giant_schema = FilterColumnSchema::with_headers(&giant_hdrs, Some(2));
+        let q = parse_filter_expr(
+            "#1 == \"TX\" AND state == \"FL\"",
+            &giant_schema,
+            CaseSensitivity::Sensitive,
+        )
+        .unwrap();
+        let printed = print_filter_expr(&q, &giant_schema).unwrap();
+        assert_eq!(printed, "#1 == \"TX\" AND state == \"FL\"");
+        assert_eq!(
+            parse_filter_expr(&printed, &giant_schema, CaseSensitivity::Sensitive).unwrap(),
+            q
+        );
+
+        // 2. Medium 1 KiB unique header repeated across 200 predicates falls back cleanly to #1.
+        let wide_hdrs = vec![vec![b'k'; 1024]];
+        let wide_schema = FilterColumnSchema::with_headers(&wide_hdrs, Some(1));
+        let many_preds = (0..200)
+            .map(|i| format!("#1 == \"{i}\""))
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        let q_many =
+            parse_filter_expr(&many_preds, &wide_schema, CaseSensitivity::Sensitive).unwrap();
+        let printed_many = print_filter_expr(&q_many, &wide_schema).unwrap();
+        assert!(printed_many.len() <= MAX_FILTER_EXPR_BYTES);
+        assert!(printed_many.starts_with("#1 == \"0\""));
+        assert_eq!(
+            parse_filter_expr(&printed_many, &wide_schema, CaseSensitivity::Sensitive).unwrap(),
+            q_many
+        );
+
+        // 3. Exact 64 KiB compact expression (`#1=="..."`) prints as a parseable <= 64 KiB string.
+        let headerless = FilterColumnSchema::headerless(Some(10));
+        let prefix = "#1==\"";
+        let suffix = "\"";
+        let fill = "a".repeat(MAX_FILTER_EXPR_BYTES - prefix.len() - suffix.len());
+        let exact_compact = format!("{prefix}{fill}{suffix}");
+        assert_eq!(exact_compact.len(), MAX_FILTER_EXPR_BYTES);
+        let q_exact =
+            parse_filter_expr(&exact_compact, &headerless, CaseSensitivity::Sensitive).unwrap();
+        let printed_exact = print_filter_expr(&q_exact, &headerless).unwrap();
+        assert!(printed_exact.len() <= MAX_FILTER_EXPR_BYTES);
+        assert_eq!(
+            parse_filter_expr(&printed_exact, &headerless, CaseSensitivity::Sensitive).unwrap(),
+            q_exact
+        );
+
+        // 4. Exact 64 KiB compact expression on column #10 with 1-byte bare header `a` (shorter than `#10`).
+        let mut short_hdrs: Vec<Vec<u8>> =
+            (1..=9).map(|i| format!("col{i}").into_bytes()).collect();
+        short_hdrs.push(b"a".to_vec());
+        let short_schema = FilterColumnSchema::with_headers(&short_hdrs, Some(10));
+        let short_prefix = "a==\"";
+        let short_fill = "z".repeat(MAX_FILTER_EXPR_BYTES - short_prefix.len() - suffix.len());
+        let exact_short = format!("{short_prefix}{short_fill}{suffix}");
+        assert_eq!(exact_short.len(), MAX_FILTER_EXPR_BYTES);
+        let q_short =
+            parse_filter_expr(&exact_short, &short_schema, CaseSensitivity::Sensitive).unwrap();
+        let printed_short = print_filter_expr(&q_short, &short_schema).unwrap();
+        assert!(printed_short.len() <= MAX_FILTER_EXPR_BYTES);
+        assert_eq!(
+            parse_filter_expr(&printed_short, &short_schema, CaseSensitivity::Sensitive).unwrap(),
+            q_short
+        );
+
+        // 5. Legacy queries exceeding MAX_FILTER_EXPR_PREDICATES or MAX_FILTER_EXPR_BYTES return explicit Err.
+        let legacy_many = FilterQuery {
+            predicates: (0..=MAX_FILTER_EXPR_PREDICATES)
+                .map(|i| FilterPredicate {
+                    column: 0,
+                    operator: FilterOperator::Equals,
+                    value: format!("v{i}").into_bytes(),
+                    upper_bound: None,
+                })
+                .collect(),
+            case_sensitivity: CaseSensitivity::Sensitive,
+        };
+        assert!(
+            print_filter_expr(&legacy_many, &headerless)
+                .unwrap_err()
+                .message
+                .contains("predicate expression limit")
+        );
+
+        let legacy_huge_val =
+            FilterQuery::single(0, FilterOperator::Equals, vec![b'x'; MAX_FILTER_EXPR_BYTES]);
+        assert!(
+            print_filter_expr(&legacy_huge_val, &headerless)
+                .unwrap_err()
+                .message
+                .contains("byte expression limit")
+        );
+
+        let empty_query = FilterQuery {
+            predicates: Vec::new(),
+            case_sensitivity: CaseSensitivity::Sensitive,
+        };
+        assert!(
+            print_filter_expr(&empty_query, &headerless)
+                .unwrap_err()
+                .message
+                .contains("no predicates")
         );
     }
 
@@ -1665,9 +2446,9 @@ mod tests {
 
         for query in queries {
             query.validate().unwrap();
-            let printed = print_filter_expr(&query, &schema);
+            let printed = print_filter_expr(&query, &schema).unwrap();
             let reparsed = parse_filter_expr(&printed, &schema, query.case_sensitivity).unwrap();
-            assert_eq!(print_filter_expr(&reparsed, &schema), printed);
+            assert_eq!(print_filter_expr(&reparsed, &schema).unwrap(), printed);
 
             let orig_idx = session.start_filter(query).unwrap().wait().unwrap();
             let rt_idx = session.start_filter(reparsed).unwrap().wait().unwrap();
@@ -1808,15 +2589,15 @@ mod tests {
                 case_sensitivity,
             };
             query.validate().unwrap();
-            let printed = print_filter_expr(&query, &schema);
+            let printed = print_filter_expr(&query, &schema).unwrap();
             let reparsed = parse_filter_expr(&printed, &schema, case_sensitivity)
                 .unwrap_or_else(|e| panic!("failed to reparse `{printed}`: {e}"));
-            let reprinted = print_filter_expr(&reparsed, &schema);
+            let reprinted = print_filter_expr(&reparsed, &schema).unwrap();
             assert_eq!(reprinted, printed);
         }
 
-        // 2. Random token-soup & byte-mutation fuzzing (1,000 inputs): must never panic,
-        //    and every accepted input must canonicalize idempotently via print(parse(text)).
+        // 2. Random token-soup fuzzing (500 inputs): must never panic, and every error span
+        //    must slice on valid UTF-8 boundaries.
         let fragments = [
             "state",
             "[order id]",
@@ -1845,6 +2626,7 @@ mod tests {
             "<=",
             "\"foo\"",
             "\"a\\nb\\xFF\"",
+            "\"bad\\xé\"",
             "\"unclosed",
             "/^a+$/",
             "/bad[/",
@@ -1860,7 +2642,7 @@ mod tests {
             "\\",
             "[]",
         ];
-        for _ in 0..1000 {
+        for _ in 0..500 {
             let len = (next_u64() as usize) % 10;
             let mut expr = String::new();
             for j in 0..len {
@@ -1872,7 +2654,7 @@ mod tests {
             match parse_filter_expr(&expr, &schema, CaseSensitivity::Sensitive) {
                 Ok(q) => {
                     q.validate().unwrap();
-                    let canonical = print_filter_expr(&q, &schema);
+                    let canonical = print_filter_expr(&q, &schema).unwrap();
                     let reparsed =
                         parse_filter_expr(&canonical, &schema, CaseSensitivity::Sensitive)
                             .unwrap_or_else(|e| {
@@ -1880,12 +2662,81 @@ mod tests {
                                     "accepted `{expr}` printed `{canonical}` failed reparse: {e}"
                                 )
                             });
-                    assert_eq!(print_filter_expr(&reparsed, &schema), canonical);
+                    assert_eq!(print_filter_expr(&reparsed, &schema).unwrap(), canonical);
                 }
                 Err(err) => {
-                    assert!(err.span.start <= err.span.end && err.span.end <= expr.len());
+                    assert!(
+                        expr.get(err.span.start..err.span.end).is_some(),
+                        "non-UTF8-boundary span {:?} for `{expr}`",
+                        err.span
+                    );
                 }
             }
         }
+
+        // 3. Seeded valid-expression mutation fuzzing (500 inputs): mutates real user expressions
+        //    so both accepted and rejected branches are guaranteed to execute and hold invariants.
+        let seeds = [
+            "state == \"TX\"",
+            "state == \"TX\" OR state == \"FL\" AND state != \"CA\"",
+            "[order id] CONTAINS \"inv\" AND amount >= -12.5 AND amount <= 1e3",
+            "[and] == \"yes\" AND [br]]ack] =~ /^ERR-\\d+$/ AND #5 != \"x\"",
+            "#1==\"TX\"OR#1==\"NY\"AND#3 BETWEEN 1 AND 100",
+        ];
+        let mut mutated_accepted = 0usize;
+        let mut mutated_rejected = 0usize;
+        for _ in 0..500 {
+            let base = seeds[(next_u64() as usize) % seeds.len()];
+            let expr = match next_u64() % 6 {
+                0 => base.replace(" AND ", " and ").replace(" OR ", " or "),
+                1 => base.replace(" == ", "==").replace(" != ", "!="),
+                2 => format!("  {base}  "),
+                3 => {
+                    // Truncate at a random valid char boundary.
+                    let boundaries: Vec<usize> = base.char_indices().map(|(i, _)| i).collect();
+                    let cut = boundaries[(next_u64() as usize) % boundaries.len()];
+                    base[..cut].to_owned()
+                }
+                4 => {
+                    // Splice a random fragment into a valid char boundary.
+                    let boundaries: Vec<usize> = base.char_indices().map(|(i, _)| i).collect();
+                    let cut = boundaries[(next_u64() as usize) % boundaries.len()];
+                    let frag = fragments[(next_u64() as usize) % fragments.len()];
+                    format!("{}{frag}{}", &base[..cut], &base[cut..])
+                }
+                _ => base.replace("==", "=~"),
+            };
+            match parse_filter_expr(&expr, &schema, CaseSensitivity::Sensitive) {
+                Ok(q) => {
+                    mutated_accepted += 1;
+                    q.validate().unwrap();
+                    let canonical = print_filter_expr(&q, &schema).unwrap();
+                    assert!(canonical.len() <= MAX_FILTER_EXPR_BYTES);
+                    let reparsed = parse_filter_expr(
+                        &canonical,
+                        &schema,
+                        CaseSensitivity::Sensitive,
+                    )
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "mutated accepted `{expr}` printed `{canonical}` failed reparse: {e}"
+                        )
+                    });
+                    assert_eq!(print_filter_expr(&reparsed, &schema).unwrap(), canonical);
+                }
+                Err(err) => {
+                    mutated_rejected += 1;
+                    assert!(
+                        expr.get(err.span.start..err.span.end).is_some(),
+                        "non-UTF8-boundary span {:?} for mutated `{expr}`",
+                        err.span
+                    );
+                }
+            }
+        }
+        assert!(
+            mutated_accepted > 20 && mutated_rejected > 20,
+            "mutation fuzzing must cover both branches (accepted={mutated_accepted}, rejected={mutated_rejected})"
+        );
     }
 }
