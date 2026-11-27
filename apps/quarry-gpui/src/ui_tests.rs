@@ -5077,7 +5077,7 @@ fn live_watch_coalesces_tail_refreshes_while_viewport_read_is_in_flight(cx: &mut
     loop {
         let ready = cx.update(|cx| {
             controller.update(cx, |c, cx| {
-                let _ = c.poll_background(cx);
+                c.poll_background(cx);
             });
             controller
                 .read(cx)
@@ -5111,7 +5111,7 @@ fn live_watch_coalesces_tail_refreshes_while_viewport_read_is_in_flight(cx: &mut
     loop {
         let ready = cx.update(|cx| {
             controller.update(cx, |c, cx| {
-                let _ = c.poll_background(cx);
+                c.poll_background(cx);
             });
             controller
                 .read(cx)
@@ -5178,7 +5178,7 @@ fn live_watch_coalesces_tail_refreshes_while_viewport_read_is_in_flight(cx: &mut
     loop {
         let ready = cx.update(|cx| {
             controller.update(cx, |c, cx| {
-                let _ = c.poll_background(cx);
+                c.poll_background(cx);
             });
             controller
                 .read(cx)
