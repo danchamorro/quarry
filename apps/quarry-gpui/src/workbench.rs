@@ -259,6 +259,7 @@ pub struct WorkbenchController {
     windows: BTreeMap<WindowId, WindowHandle<Root>>,
     editing_windows: BTreeSet<WindowId>,
     viewport_read_seq: BTreeMap<DocumentId, u64>,
+    live_watch_tail_read_in_flight: BTreeMap<DocumentId, u64>,
     pending_reveal_cells: BTreeMap<DocumentId, (u64, usize)>,
     whitespace_prefs: whitespace::Preferences,
     word_wrap_prefs: WordWrapPreferences,
@@ -365,6 +366,7 @@ impl WorkbenchController {
             windows: BTreeMap::new(),
             editing_windows: BTreeSet::new(),
             viewport_read_seq: BTreeMap::new(),
+            live_watch_tail_read_in_flight: BTreeMap::new(),
             pending_reveal_cells: BTreeMap::new(),
             whitespace_prefs: whitespace::Preferences::load(None),
             word_wrap_prefs: WordWrapPreferences::load(None),
@@ -717,6 +719,7 @@ impl WorkbenchController {
         };
         // Always advance the generation — even on cache hits or bootstrap reads — so an
         // in-flight async read from an earlier scroll position cannot overwrite current rows.
+        self.live_watch_tail_read_in_flight.remove(&doc_id);
         let seq = {
             let entry = self.viewport_read_seq.entry(doc_id).or_insert(0);
             *entry = entry.wrapping_add(1);
@@ -725,35 +728,78 @@ impl WorkbenchController {
         let Some(plan) = plan else {
             return;
         };
-        self.spawn_viewport_read_plan_with_seq(doc_id, seq, plan, cx);
+        self.spawn_viewport_read_plan_with_seq(doc_id, seq, plan, false, cx);
     }
 
-    fn spawn_viewport_read_plan(
-        &mut self,
-        doc_id: DocumentId,
-        plan: quarry_workbench::ViewportReadPlan,
-        cx: &mut Context<Self>,
-    ) {
+    fn clear_viewport_read_state(&mut self, doc_id: DocumentId) {
+        self.viewport_read_seq.remove(&doc_id);
+        self.live_watch_tail_read_in_flight.remove(&doc_id);
+    }
+
+    fn is_document_active(&self, doc_id: DocumentId) -> bool {
+        self.windows
+            .keys()
+            .any(|&win| self.scheduler.active_document(win) == Some(doc_id))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn viewport_read_sequence(&self, doc_id: DocumentId) -> Option<u64> {
+        self.viewport_read_seq.get(&doc_id).copied()
+    }
+
+    pub(crate) fn has_live_watch_tail_read_in_flight(&self, doc_id: DocumentId) -> bool {
+        let Some(&in_flight_seq) = self.live_watch_tail_read_in_flight.get(&doc_id) else {
+            return false;
+        };
+        self.viewport_read_seq.get(&doc_id) == Some(&in_flight_seq)
+    }
+
+    fn spawn_live_watch_viewport_refresh(&mut self, doc_id: DocumentId, cx: &mut Context<Self>) {
+        // Explicit watch start or Follow Tail jump supersedes any earlier non-tail viewport read.
+        self.live_watch_tail_read_in_flight.remove(&doc_id);
         let seq = {
             let entry = self.viewport_read_seq.entry(doc_id).or_insert(0);
             *entry = entry.wrapping_add(1);
             *entry
         };
-        self.spawn_viewport_read_plan_with_seq(doc_id, seq, plan, cx);
-    }
-
-    fn spawn_live_watch_viewport_refresh(&mut self, doc_id: DocumentId, cx: &mut Context<Self>) {
         let plan = self
             .scheduler
             .tab_mut(doc_id)
             .and_then(|t| t.document.as_mut())
             .and_then(|doc| doc.take_live_watch_viewport_plan());
         if let Some(plan) = plan {
-            self.spawn_viewport_read_plan(doc_id, plan, cx);
-        } else {
+            self.live_watch_tail_read_in_flight.insert(doc_id, seq);
+            self.spawn_viewport_read_plan_with_seq(doc_id, seq, plan, true, cx);
+        }
+    }
+
+    fn maybe_spawn_live_watch_tail_refresh(
+        &mut self,
+        doc_id: DocumentId,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        // Keep at most one live-watch tail read in flight per document and coalesce arriving
+        // appends into `doc.live_watch_viewport_dirty` until the current read finishes, so
+        // sustained appends on slow storage never starve the grid.
+        if self.has_live_watch_tail_read_in_flight(doc_id) {
+            return false;
+        }
+        let Some(plan) = self
+            .scheduler
+            .tab_mut(doc_id)
+            .and_then(|t| t.document.as_mut())
+            .and_then(|doc| doc.take_live_watch_viewport_plan())
+        else {
+            return false;
+        };
+        let seq = {
             let entry = self.viewport_read_seq.entry(doc_id).or_insert(0);
             *entry = entry.wrapping_add(1);
-        }
+            *entry
+        };
+        self.live_watch_tail_read_in_flight.insert(doc_id, seq);
+        self.spawn_viewport_read_plan_with_seq(doc_id, seq, plan, true, cx);
+        true
     }
 
     fn spawn_viewport_read_plan_with_seq(
@@ -761,6 +807,7 @@ impl WorkbenchController {
         doc_id: DocumentId,
         seq: u64,
         plan: quarry_workbench::ViewportReadPlan,
+        is_live_watch_tail: bool,
         cx: &mut Context<Self>,
     ) {
         let session = Arc::clone(&plan.session);
@@ -775,6 +822,11 @@ impl WorkbenchController {
                 })
                 .await;
             let _ = this.update(cx, |controller, cx| {
+                if is_live_watch_tail
+                    && controller.live_watch_tail_read_in_flight.get(&doc_id) == Some(&seq)
+                {
+                    controller.live_watch_tail_read_in_flight.remove(&doc_id);
+                }
                 if controller.viewport_read_seq.get(&doc_id) != Some(&seq) {
                     return;
                 }
@@ -788,14 +840,19 @@ impl WorkbenchController {
                 if !Arc::ptr_eq(&doc.session, &expected_session) {
                     return;
                 }
-                match read {
+                let read_ok = match read {
                     Ok(rows) => {
                         doc.install_buffer_rows(start, rows, elapsed);
+                        true
                     }
                     Err(error) => {
                         let msg = doc.diagnostic_error(error);
                         tab.notice = Some(AppMessage::error(msg));
+                        false
                     }
+                };
+                if is_live_watch_tail && read_ok && controller.is_document_active(doc_id) {
+                    let _ = controller.maybe_spawn_live_watch_tail_refresh(doc_id, cx);
                 }
                 cx.notify();
             });
@@ -1458,6 +1515,9 @@ impl WorkbenchController {
             return Err(AppMessage::warning("Open a file first."));
         };
         let alert = self.scheduler.stop_live_watch(id)?;
+        self.live_watch_tail_read_in_flight.remove(&id);
+        let entry = self.viewport_read_seq.entry(id).or_insert(0);
+        *entry = entry.wrapping_add(1);
         let (msg, is_alert) = match alert {
             Some(alert) => (alert.summary(), true),
             None => ("Live Watch stopped.".to_owned(), false),
@@ -1522,7 +1582,7 @@ impl WorkbenchController {
         let notice = self
             .scheduler
             .reopen_verified_section(id, discard_unsaved)?;
-        self.viewport_read_seq.remove(&id);
+        self.clear_viewport_read_state(id);
         self.pending_reveal_cells.remove(&id);
         cx.notify();
         Ok(notice)
@@ -1656,14 +1716,7 @@ impl WorkbenchController {
             .scheduler
             .activate_tab(window, id)
             .map_err(|e| e.to_string())?;
-        if let Some(plan) = self
-            .scheduler
-            .tab_mut(id)
-            .and_then(|t| t.document.as_mut())
-            .and_then(|doc| doc.take_live_watch_viewport_plan())
-        {
-            self.spawn_viewport_read_plan(id, plan, cx);
-        }
+        let _ = self.maybe_spawn_live_watch_tail_refresh(id, cx);
         cx.notify();
         Ok(outcome)
     }
@@ -1684,14 +1737,7 @@ impl WorkbenchController {
         if let Err(error) = self.scheduler.activate_tab(window, target) {
             self.set_window_message(window, Some(AppMessage::warning(error.to_string())), cx);
         } else {
-            if let Some(plan) = self
-                .scheduler
-                .tab_mut(target)
-                .and_then(|t| t.document.as_mut())
-                .and_then(|doc| doc.take_live_watch_viewport_plan())
-            {
-                self.spawn_viewport_read_plan(target, plan, cx);
-            }
+            let _ = self.maybe_spawn_live_watch_tail_refresh(target, cx);
             cx.notify();
         }
     }
@@ -1745,7 +1791,7 @@ impl WorkbenchController {
                 Some(_) => quarry_workbench::DelimiterMode::Auto,
             };
         }
-        self.viewport_read_seq.remove(&id);
+        self.clear_viewport_read_state(id);
         self.pending_reveal_cells.remove(&id);
         cx.notify();
         Ok(())
@@ -1781,6 +1827,8 @@ impl WorkbenchController {
         self.scheduler
             .reopen_tab(window, id, options, encoding)
             .map_err(|e| e.to_string())?;
+        self.clear_viewport_read_state(id);
+        self.pending_reveal_cells.remove(&id);
         cx.notify();
         Ok(())
     }
@@ -2245,7 +2293,7 @@ impl WorkbenchController {
         }
 
         let _ = self.scheduler.close_tab(id);
-        self.viewport_read_seq.remove(&id);
+        self.clear_viewport_read_state(id);
         self.pending_reveal_cells.remove(&id);
         let empty_now = self.scheduler.tabs_in_window(window).is_empty();
         if empty_now && close_window_if_last && self.scheduler.close_window(window).is_ok() {
@@ -2459,7 +2507,7 @@ impl WorkbenchController {
                 }
                 let _ = self.scheduler.approve_tab_for_close(document_id);
                 let _ = self.scheduler.close_tab(document_id);
-                self.viewport_read_seq.remove(&document_id);
+                self.clear_viewport_read_state(document_id);
                 self.pending_reveal_cells.remove(&document_id);
                 if close_window_if_last
                     && self.scheduler.tabs_in_window(window_id).is_empty()
@@ -3512,7 +3560,7 @@ impl WorkbenchController {
             return Err(AppMessage::warning(conflict));
         }
         let notice = self.scheduler.confirm_duplicate_removal(doc_id)?;
-        self.viewport_read_seq.remove(&doc_id);
+        self.clear_viewport_read_state(doc_id);
         self.pending_reveal_cells.remove(&doc_id);
         cx.notify();
         Ok(notice)
@@ -4635,19 +4683,15 @@ impl WorkbenchController {
             .filter_map(|&win| self.scheduler.active_document(win))
             .collect();
         for doc_id in active_doc_ids {
-            let mut deferred_plan = None;
             if let Some(doc) = self
                 .scheduler
                 .tab_mut(doc_id)
                 .and_then(|t| t.document.as_mut())
+                && doc.whitespace.poll()
             {
-                if doc.whitespace.poll() {
-                    changed = true;
-                }
-                deferred_plan = doc.take_live_watch_viewport_plan();
+                changed = true;
             }
-            if let Some(plan) = deferred_plan {
-                self.spawn_viewport_read_plan(doc_id, plan, cx);
+            if self.maybe_spawn_live_watch_tail_refresh(doc_id, cx) {
                 changed = true;
             }
         }
@@ -4662,7 +4706,7 @@ impl WorkbenchController {
         {
             changed = true;
             if completion.reopened {
-                self.viewport_read_seq.remove(&completion.document_id);
+                self.clear_viewport_read_state(completion.document_id);
                 self.pending_reveal_cells.remove(&completion.document_id);
             }
             match completion.result {
@@ -4747,7 +4791,7 @@ impl WorkbenchController {
             changed = true;
             match completion.result {
                 Ok(Some(status)) => {
-                    self.viewport_read_seq.remove(&completion.document_id);
+                    self.clear_viewport_read_state(completion.document_id);
                     self.pending_reveal_cells.remove(&completion.document_id);
                     if let Some(tab) = self.scheduler.tab_mut(completion.document_id) {
                         tab.notice = Some(AppMessage::new(status, MessageSeverity::Status));
