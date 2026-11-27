@@ -28,7 +28,7 @@ The [beta release checklist](BETA_RELEASE_CHECKLIST.md) separates local package
 validation from the acceptance and distribution gates for a public candidate.
 The current published release is
 [v0.2.0-beta.3](https://github.com/danchamorro/quarry/releases/tag/v0.2.0-beta.3)
-(build 215, clean `d57dec9`), which ships the GPUI application for Apple Silicon
+(build 215, clean `c3febf3`), which ships the GPUI application for Apple Silicon
 macOS alongside Linux/Omarchy tarballs. [Beta 3, build 167, clean
 `f5402e4`](benchmarks/2026-11-21-beta-build167.md) was the final egui snapshot;
 its checks, plus [build 140](benchmarks/2026-10-06-beta-build140.md),

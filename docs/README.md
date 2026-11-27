@@ -18,7 +18,8 @@ live in [`releases/`](releases/) and [`CHANGELOG.md`](../CHANGELOG.md).
 
 ## Product and engineering
 
-- [Product Requirements](PRD.md) — version-by-version scope and requirements.
+- [Product Requirements](PRD.md) — current capabilities on `main` and remaining
+  `v1.0` product requirements.
 - [Roadmap](ROADMAP.md) — shipped highlights on `main`, upcoming v1.0
   milestones, and pointer to open GitHub Issues.
 - [Design System](DESIGN.md) — palettes, typography, layout, and components.

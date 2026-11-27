@@ -2,7 +2,7 @@
 
 **Latest published release, 2026-11-26:**
 [v0.2.0-beta.3](https://github.com/danchamorro/quarry/releases/tag/v0.2.0-beta.3)
-(build 215, clean `d57dec9`) attaches macOS Apple Silicon `.dmg`/`.zip` and
+(build 215, clean `c3febf3`) attaches macOS Apple Silicon `.dmg`/`.zip` and
 Linux `x86_64`/`arm64` tarballs with matching `SHA256SUMS-*` files.
 
 The per-archive tables below document the historical **0.1.0 (egui)** macOS
