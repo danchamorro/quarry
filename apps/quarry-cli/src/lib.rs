@@ -22,7 +22,8 @@ use quarry_core::{
     SortPlan, SortProgress, SortSpec, SplitAnalysisJob, SplitAnalysisOutcome,
     SplitAnalysisProgress, StructuralIndex, WorkingCopyCleanup, check_storage, clear_index_cache,
     detect_compression, estimate_edited_output_bytes, estimate_sort_plan_temporary_bytes,
-    inspect_storage, is_compressed_destination, validate_regex,
+    inspect_storage, is_compressed_destination, parse_filter_expr, print_filter_expr,
+    validate_regex,
 };
 
 type CliResult<T> = Result<T, Box<dyn Error>>;
@@ -246,13 +247,14 @@ fn print_help() {
            quarry search <FILE> --query PATTERN [--regex] [--ignore-case] [--start-row 1] \
          [--start-column 1] [--cancel-after-bytes N] \
          [--cache-state unknown|warm] [--temp-dir DIRECTORY] [--max-decompressed-bytes N]\n  \
-           quarry filter <FILE> --column N --operator contains|equals|not-equals|regex|gt|gte|lt|lte|between \
-         --value VALUE [--upper-bound VALUE] [--and N OPERATOR VALUE [UPPER]]... [--ignore-case] \
-         [--cancel-after-bytes N] \
+           quarry filter <FILE> (--where EXPR | --column N --operator contains|equals|not-equals|regex|gt|gte|lt|lte|between \
+         --value VALUE [--upper-bound VALUE] [--and N OPERATOR VALUE [UPPER]]...) \
+         [--ignore-case] [--delimiter ,] [--header auto|first-row|none] [--cancel-after-bytes N] \
          [--cache-state unknown|cold|warm] [--temp-dir DIRECTORY] [--max-decompressed-bytes N]\n  \
-           quarry export <FILE> --output FILE --column N \
+           quarry export <FILE> --output FILE (--where EXPR | --column N \
          --operator contains|equals|not-equals|regex|gt|gte|lt|lte|between --value VALUE \
-         [--upper-bound VALUE] [--and N OPERATOR VALUE [UPPER]]... [--ignore-case] [--cancel-after-bytes N] \
+         [--upper-bound VALUE] [--and N OPERATOR VALUE [UPPER]]...) \
+         [--ignore-case] [--delimiter ,] [--header auto|first-row|none] [--cancel-after-bytes N] \
          [--cache-state unknown|cold|warm] [--temp-dir DIRECTORY] [--max-decompressed-bytes N]\n  \
            quarry edit-save-as <FILE> --output FILE \
          --edit DATA_ROW COLUMN VALUE [--edit DATA_ROW COLUMN VALUE]... \
@@ -304,6 +306,9 @@ fn print_help() {
          Temporary runs use --temp-dir when set; final output staging stays beside its destination.\n\
          Filters: between includes both bounds and requires --upper-bound (or UPPER after --and).\n\
          Numeric values accept signed decimals and scientific notation; blank or invalid cells do not match.\n\
+         Filter expressions (--where): AND combines columns/exclusions, OR combines inclusion rules on one column (for example 'state == \"TX\" OR state == \"FL\" AND amount BETWEEN 10 AND 100').\n\
+         Use #N for 1-based column indices, [column name] for spaced/special headers, == / != / CONTAINS / =~ for quoted text or /regex/, and >, >=, <, <=, BETWEEN for unquoted numbers.\n\
+         Cross-column OR, parentheses, NOT, duplicate/ambiguous header names, and exclusive same-column AND (a > 1 AND a < 5) are rejected explicitly.\n\
          Regex: opt-in via search --regex or filter/export --operator regex (literal remains the default).\n\
          Regex uses bounded Unicode matching with per-field ^/$ anchors and Unicode simple case folding under --ignore-case (literal --ignore-case uses ASCII case folding).\n\
          Sort: --column and --order are required for text, natural, number, date, characters, and words.\n\
@@ -433,7 +438,10 @@ fn parse_and_filter(args: &[String], cursor: &mut usize) -> CliResult<FilterPred
 
 fn filter_command(args: Vec<String>) -> CliResult<()> {
     let mut encoding = None;
+    let mut delimiter = None;
+    let mut header_mode = HeaderMode::Auto;
     let mut path = None;
+    let mut where_expr = None;
     let mut column = None;
     let mut operator = None;
     let mut filter_value = None;
@@ -449,6 +457,16 @@ fn filter_command(args: Vec<String>) -> CliResult<()> {
     while cursor < args.len() {
         match args[cursor].as_str() {
             "--encoding" => encoding = parse_encoding(value(&args, &mut cursor, "--encoding")?)?,
+            "--delimiter" => {
+                delimiter = Some(parse_delimiter(value(&args, &mut cursor, "--delimiter")?)?)
+            }
+            "--header" => header_mode = parse_header_mode(value(&args, &mut cursor, "--header")?)?,
+            "--where" => {
+                if where_expr.is_some() {
+                    return Err("--where may only be specified once".into());
+                }
+                where_expr = Some(value(&args, &mut cursor, "--where")?.to_owned());
+            }
             "--column" => column = Some(value(&args, &mut cursor, "--column")?.parse::<usize>()?),
             "--operator" => {
                 operator = Some(parse_filter_operator(
@@ -492,25 +510,58 @@ fn filter_command(args: Vec<String>) -> CliResult<()> {
     }
 
     let path = path.ok_or("filter requires a file path")?;
-    let column = column.ok_or("filter requires --column")?;
-    let operator = operator.ok_or("filter requires --operator")?;
-    let filter_value = filter_value.ok_or("filter requires --value")?;
-    if column == 0 {
-        return Err("filter column must be at least 1".into());
-    }
-    if operator == FilterOperator::Contains && filter_value.is_empty() {
-        return Err("contains filter value must not be empty".into());
-    }
-    if cancel_after_bytes == Some(0) {
-        return Err("cancel-after-bytes must be non-zero".into());
-    }
+    let prebuilt_query = if where_expr.is_some() {
+        if column.is_some()
+            || operator.is_some()
+            || filter_value.is_some()
+            || upper_bound.is_some()
+            || !and_predicates.is_empty()
+        {
+            return Err(
+                "--where cannot be combined with --column, --operator, --value, --upper-bound, or --and"
+                    .into(),
+            );
+        }
+        if cancel_after_bytes == Some(0) {
+            return Err("cancel-after-bytes must be non-zero".into());
+        }
+        None
+    } else {
+        let column = column.ok_or("filter requires --column")?;
+        let operator = operator.ok_or("filter requires --operator")?;
+        let filter_value = filter_value.ok_or("filter requires --value")?;
+        if column == 0 {
+            return Err("filter column must be at least 1".into());
+        }
+        if operator == FilterOperator::Contains && filter_value.is_empty() {
+            return Err("contains filter value must not be empty".into());
+        }
+        if cancel_after_bytes == Some(0) {
+            return Err("cancel-after-bytes must be non-zero".into());
+        }
 
-    let mut query =
-        FilterQuery::single_with_case(column - 1, operator, filter_value, case_sensitivity);
-    query.predicates[0].upper_bound = upper_bound;
-    query.predicates.extend(and_predicates);
-    query.validate()?;
-    let input = open_input(&path, OpenOptions::default(), encoding, &compressed)?;
+        let mut query =
+            FilterQuery::single_with_case(column - 1, operator, filter_value, case_sensitivity);
+        query.predicates[0].upper_bound = upper_bound;
+        query.predicates.extend(and_predicates);
+        query.validate()?;
+        Some(query)
+    };
+
+    let open_options = OpenOptions {
+        delimiter,
+        header_mode,
+        ..OpenOptions::default()
+    };
+    let (input, query) = open_input_for_filter(
+        &path,
+        open_options,
+        encoding,
+        &compressed,
+        prebuilt_query,
+        where_expr.as_deref(),
+        case_sensitivity,
+    )?;
     let session = &input.session;
     if cancel_after_bytes.is_some_and(|bytes| bytes >= session.file_size) {
         return Err("cancel-after-bytes must be less than file size".into());
@@ -538,6 +589,10 @@ fn filter_command(args: Vec<String>) -> CliResult<()> {
         }
     );
     println!("Filter cache state: {cache_state}");
+    match print_filter_expr(index.query(), &session.filter_column_schema()) {
+        Ok(expr) => println!("Filter expression: {expr}"),
+        Err(err) => println!("Filter expression: <omitted: {}>", err.message),
+    }
     println!("Predicate count: {}", index.query().predicates.len());
     for (position, predicate) in index.query().predicates.iter().enumerate() {
         println!(
@@ -665,8 +720,11 @@ fn wait_for_filter(
 
 fn export_command(args: Vec<String>) -> CliResult<()> {
     let mut encoding = None;
+    let mut delimiter = None;
+    let mut header_mode = HeaderMode::Auto;
     let mut path = None;
     let mut destination = None;
+    let mut where_expr = None;
     let mut column = None;
     let mut operator = None;
     let mut filter_value = None;
@@ -682,7 +740,17 @@ fn export_command(args: Vec<String>) -> CliResult<()> {
     while cursor < args.len() {
         match args[cursor].as_str() {
             "--encoding" => encoding = parse_encoding(value(&args, &mut cursor, "--encoding")?)?,
+            "--delimiter" => {
+                delimiter = Some(parse_delimiter(value(&args, &mut cursor, "--delimiter")?)?)
+            }
+            "--header" => header_mode = parse_header_mode(value(&args, &mut cursor, "--header")?)?,
             "--output" => destination = Some(PathBuf::from(value(&args, &mut cursor, "--output")?)),
+            "--where" => {
+                if where_expr.is_some() {
+                    return Err("--where may only be specified once".into());
+                }
+                where_expr = Some(value(&args, &mut cursor, "--where")?.to_owned());
+            }
             "--column" => column = Some(value(&args, &mut cursor, "--column")?.parse::<usize>()?),
             "--operator" => {
                 operator = Some(parse_filter_operator(
@@ -728,25 +796,58 @@ fn export_command(args: Vec<String>) -> CliResult<()> {
     let path = path.ok_or("export requires a file path")?;
     let destination = destination.ok_or("export requires --output")?;
     reject_compressed_output(&destination)?;
-    let column = column.ok_or("export requires --column")?;
-    let operator = operator.ok_or("export requires --operator")?;
-    let filter_value = filter_value.ok_or("export requires --value")?;
-    if column == 0 {
-        return Err("export column must be at least 1".into());
-    }
-    if operator == FilterOperator::Contains && filter_value.is_empty() {
-        return Err("contains filter value must not be empty".into());
-    }
-    if cancel_after_bytes == Some(0) {
-        return Err("cancel-after-bytes must be non-zero".into());
-    }
+    let prebuilt_query = if where_expr.is_some() {
+        if column.is_some()
+            || operator.is_some()
+            || filter_value.is_some()
+            || upper_bound.is_some()
+            || !and_predicates.is_empty()
+        {
+            return Err(
+                "--where cannot be combined with --column, --operator, --value, --upper-bound, or --and"
+                    .into(),
+            );
+        }
+        if cancel_after_bytes == Some(0) {
+            return Err("cancel-after-bytes must be non-zero".into());
+        }
+        None
+    } else {
+        let column = column.ok_or("export requires --column")?;
+        let operator = operator.ok_or("export requires --operator")?;
+        let filter_value = filter_value.ok_or("export requires --value")?;
+        if column == 0 {
+            return Err("export column must be at least 1".into());
+        }
+        if operator == FilterOperator::Contains && filter_value.is_empty() {
+            return Err("contains filter value must not be empty".into());
+        }
+        if cancel_after_bytes == Some(0) {
+            return Err("cancel-after-bytes must be non-zero".into());
+        }
 
-    let mut query =
-        FilterQuery::single_with_case(column - 1, operator, filter_value, case_sensitivity);
-    query.predicates[0].upper_bound = upper_bound;
-    query.predicates.extend(and_predicates);
-    query.validate()?;
-    let input = open_input(&path, OpenOptions::default(), encoding, &compressed)?;
+        let mut query =
+            FilterQuery::single_with_case(column - 1, operator, filter_value, case_sensitivity);
+        query.predicates[0].upper_bound = upper_bound;
+        query.predicates.extend(and_predicates);
+        query.validate()?;
+        Some(query)
+    };
+
+    let open_options = OpenOptions {
+        delimiter,
+        header_mode,
+        ..OpenOptions::default()
+    };
+    let (input, query) = open_input_for_filter(
+        &path,
+        open_options,
+        encoding,
+        &compressed,
+        prebuilt_query,
+        where_expr.as_deref(),
+        case_sensitivity,
+    )?;
     let session = &input.session;
     if cancel_after_bytes.is_some_and(|bytes| bytes >= session.file_size) {
         return Err("cancel-after-bytes must be less than file size".into());
@@ -802,6 +903,10 @@ fn export_command(args: Vec<String>) -> CliResult<()> {
         }
     );
     println!("Export cache state: {cache_state}");
+    match print_filter_expr(&query, &session.filter_column_schema()) {
+        Ok(expr) => println!("Filter expression: {expr}"),
+        Err(err) => println!("Filter expression: <omitted: {}>", err.message),
+    }
     println!("Predicate count: {}", query.predicates.len());
     for (position, predicate) in query.predicates.iter().enumerate() {
         println!(
@@ -4526,6 +4631,74 @@ fn compression_name(format: CompressionFormat) -> &'static str {
     }
 }
 
+/// Opens a file for `filter` or `export`, validating any `--where` expression against the
+/// bootstrapped header schema *before* starting full gzip decompression and indexing.
+fn open_input_for_filter(
+    path: &Path,
+    options: OpenOptions,
+    encoding: Option<Encoding>,
+    compressed: &CompressedArgs,
+    prebuilt_query: Option<FilterQuery>,
+    where_expr: Option<&str>,
+    case_sensitivity: CaseSensitivity,
+) -> CliResult<(OpenedInput, FilterQuery)> {
+    let cleanup = CleanupReport(WorkingCopyCleanup::default());
+    let Some(format) = detect_compression(path)? else {
+        let session = Session::open_with_encoding(path, options, encoding)?;
+        let query = match (prebuilt_query, where_expr) {
+            (Some(query), None) => query,
+            (None, Some(expr)) => {
+                parse_filter_expr(expr, &session.filter_column_schema(), case_sensitivity)?
+            }
+            _ => unreachable!(),
+        };
+        return Ok((
+            OpenedInput {
+                session,
+                index: None,
+                compressed: None,
+                _cleanup: cleanup,
+            },
+            query,
+        ));
+    };
+    interrupt::install();
+    let bootstrap =
+        CompressedBootstrap::open(path, options, encoding, compressed.max_decompressed_bytes)?;
+    let query = match (prebuilt_query, where_expr) {
+        (Some(query), None) => query,
+        (None, Some(expr)) => {
+            parse_filter_expr(expr, &bootstrap.filter_column_schema(), case_sensitivity)?
+        }
+        _ => unreachable!(),
+    };
+    let (session, index, progress) =
+        run_decompression(&bootstrap, compressed, &cleanup.0, |_, progress, report| {
+            if report {
+                eprintln!("{}", decompression_progress_line(&progress));
+            }
+            Ok(())
+        })?;
+    let summary = CompressedSummary {
+        format,
+        compressed_size: bootstrap.compressed_size(),
+        decompressed_size: session.file_size,
+        bootstrap: bootstrap.metrics.first_rows,
+        decompression: progress.elapsed,
+        records: index.indexed_rows(),
+        columns: index.maximum_width(),
+    };
+    Ok((
+        OpenedInput {
+            session,
+            index: Some(index),
+            compressed: Some(summary),
+            _cleanup: cleanup,
+        },
+        query,
+    ))
+}
+
 /// Opens a file for reading. A gzip file is decompressed once, with its index built in
 /// the same pass, into a private copy that is removed when the returned input drops.
 fn open_input(
@@ -7532,6 +7705,278 @@ mod tests {
         assert_eq!(
             fs::read_to_string(&dst_ci).unwrap(),
             "id,code,city\n2,ERR-007,CAFÉ\n3,ERR-99,café\n"
+        );
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn cli_where_expression_matches_flag_filters_and_rejects_ambiguous_or_mixed_args() {
+        let dir = std::env::temp_dir().join(format!(
+            "quarry-cli-where-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("orders.csv");
+        fs::write(
+            &src,
+            "state,order total,code,tag\n\
+             TX,25,ERR-007,d1\n\
+             FL,100,ERR-042,d2\n\
+             CA,50,ERR-009,d3\n\
+             TX,150,ERR-099,d4\n\
+             FL,10,OK-001,d5\n\
+             TX,25,ERR-008,d6\n",
+        )
+        .unwrap();
+
+        let out_where = dir.join("out-where.csv");
+        let out_flags = dir.join("out-flags.csv");
+        let expr = "state == \"TX\" OR state == \"FL\" AND [order total] >= 10 AND [order total] <= 100 AND code =~ /^ERR-\\d+$/ AND #4 != \"d6\"";
+
+        filter_command(vec![
+            src.display().to_string(),
+            "--where".into(),
+            expr.into(),
+        ])
+        .unwrap();
+
+        export_command(vec![
+            src.display().to_string(),
+            "--output".into(),
+            out_where.display().to_string(),
+            "--where".into(),
+            expr.into(),
+        ])
+        .unwrap();
+
+        export_command(vec![
+            src.display().to_string(),
+            "--output".into(),
+            out_flags.display().to_string(),
+            "--column".into(),
+            "1".into(),
+            "--operator".into(),
+            "equals".into(),
+            "--value".into(),
+            "TX".into(),
+            "--and".into(),
+            "1".into(),
+            "equals".into(),
+            "FL".into(),
+            "--and".into(),
+            "2".into(),
+            "between".into(),
+            "10".into(),
+            "100".into(),
+            "--and".into(),
+            "3".into(),
+            "regex".into(),
+            "^ERR-\\d+$".into(),
+            "--and".into(),
+            "4".into(),
+            "not-equals".into(),
+            "d6".into(),
+        ])
+        .unwrap();
+
+        let expected = "state,order total,code,tag\nTX,25,ERR-007,d1\nFL,100,ERR-042,d2\n";
+        assert_eq!(fs::read_to_string(&out_where).unwrap(), expected);
+        assert_eq!(fs::read(&out_where).unwrap(), fs::read(&out_flags).unwrap());
+
+        // --ignore-case applies cleanly with --where.
+        let out_ci = dir.join("out-ci.csv");
+        export_command(vec![
+            src.display().to_string(),
+            "--output".into(),
+            out_ci.display().to_string(),
+            "--where".into(),
+            "state == \"tx\" AND code =~ /^err-007$/".into(),
+            "--ignore-case".into(),
+        ])
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(&out_ci).unwrap(),
+            "state,order total,code,tag\nTX,25,ERR-007,d1\n"
+        );
+
+        // Headerless custom-delimiter file with #N column refs.
+        let semi = dir.join("headerless.csv");
+        let out_semi = dir.join("out-semi.csv");
+        fs::write(&semi, "TX;25\nCA;80\nFL;15\n").unwrap();
+        export_command(vec![
+            semi.display().to_string(),
+            "--output".into(),
+            out_semi.display().to_string(),
+            "--delimiter".into(),
+            ";".into(),
+            "--header".into(),
+            "none".into(),
+            "--where".into(),
+            "#1 == \"TX\" OR #1 == \"FL\" AND #2 >= 20".into(),
+        ])
+        .unwrap();
+        assert_eq!(fs::read_to_string(&out_semi).unwrap(), "TX;25\n");
+
+        // Duplicate headers with --header first-row reject ambiguous name and allow #N.
+        let dup_src = dir.join("dup-headers.csv");
+        let out_dup = dir.join("out-dup.csv");
+        fs::write(&dup_src, "state,dup,dup\nTX,a1,b1\nFL,a2,b2\n").unwrap();
+        let ambiguous = filter_command(vec![
+            dup_src.display().to_string(),
+            "--header".into(),
+            "first-row".into(),
+            "--where".into(),
+            "dup == \"a1\"".into(),
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(ambiguous.contains("ambiguous column name 'dup'"));
+
+        export_command(vec![
+            dup_src.display().to_string(),
+            "--header".into(),
+            "first-row".into(),
+            "--output".into(),
+            out_dup.display().to_string(),
+            "--where".into(),
+            "#2 == \"a1\"".into(),
+        ])
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(&out_dup).unwrap(),
+            "state,dup,dup\nTX,a1,b1\n"
+        );
+
+        // Error cases: mixed --where + --column, duplicate --where, cross-column OR.
+        let mixed = filter_command(vec![
+            src.display().to_string(),
+            "--where".into(),
+            "state == \"TX\"".into(),
+            "--column".into(),
+            "1".into(),
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(mixed.contains("--where cannot be combined"));
+
+        let dup_where = export_command(vec![
+            src.display().to_string(),
+            "--output".into(),
+            dir.join("unused.csv").display().to_string(),
+            "--where".into(),
+            "state == \"TX\"".into(),
+            "--where".into(),
+            "state == \"FL\"".into(),
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(dup_where.contains("only be specified once"));
+
+        let cross_or = export_command(vec![
+            src.display().to_string(),
+            "--output".into(),
+            dir.join("unused2.csv").display().to_string(),
+            "--where".into(),
+            "state == \"TX\" OR [order total] > 10".into(),
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(cross_or.contains("same column"));
+        assert!(!dir.join("unused2.csv").exists());
+
+        // Gzip input validates --where against the bootstrap header BEFORE full decompression.
+        // Passing a regular file as --temp-dir makes decompression fail immediately if started,
+        // so returning `unknown column 'nope'` proves --where ran on the in-memory bootstrap.
+        let gz_src = dir.join("sample.csv.gz");
+        let not_a_dir = dir.join("not-a-dir");
+        fs::write(&not_a_dir, b"file").unwrap();
+        {
+            use flate2::Compression;
+            use flate2::write::GzEncoder;
+            use std::io::Write;
+            let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+            encoder
+                .write_all(b"state,amount\nTX,25\nFL,100\nCA,50\n")
+                .unwrap();
+            let gz_bytes = encoder.finish().unwrap();
+            fs::write(&gz_src, gz_bytes).unwrap();
+        }
+        let gz_filter_err = filter_command(vec![
+            gz_src.display().to_string(),
+            "--temp-dir".into(),
+            not_a_dir.display().to_string(),
+            "--where".into(),
+            "nope == \"TX\"".into(),
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(
+            gz_filter_err.contains("unknown column 'nope'"),
+            "expected early --where error before decompression, got: {gz_filter_err}"
+        );
+
+        let gz_out = dir.join("gz-unused.csv");
+        let gz_export_err = export_command(vec![
+            gz_src.display().to_string(),
+            "--output".into(),
+            gz_out.display().to_string(),
+            "--temp-dir".into(),
+            not_a_dir.display().to_string(),
+            "--where".into(),
+            "nope == \"TX\"".into(),
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(
+            gz_export_err.contains("unknown column 'nope'"),
+            "expected early --where error before decompression, got: {gz_export_err}"
+        );
+        assert!(!gz_out.exists());
+
+        // Control check: a valid --where proceeds to decompression and hits the invalid --temp-dir.
+        let gz_valid_err = filter_command(vec![
+            gz_src.display().to_string(),
+            "--temp-dir".into(),
+            not_a_dir.display().to_string(),
+            "--where".into(),
+            "state == \"TX\"".into(),
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(
+            !gz_valid_err.contains("unknown column"),
+            "valid --where should pass bootstrap validation and fail during decompression: {gz_valid_err}"
+        );
+
+        // Legacy flag export with >256 predicates still succeeds without failing summary printing.
+        let out_legacy_many = dir.join("out-legacy-many.csv");
+        let mut legacy_args = vec![
+            src.display().to_string(),
+            "--output".into(),
+            out_legacy_many.display().to_string(),
+            "--column".into(),
+            "1".into(),
+            "--operator".into(),
+            "equals".into(),
+            "--value".into(),
+            "TX".into(),
+        ];
+        for i in 0..260 {
+            legacy_args.push("--and".into());
+            legacy_args.push("1".into());
+            legacy_args.push("equals".into());
+            legacy_args.push(format!("NONE_{i}"));
+        }
+        export_command(legacy_args).unwrap();
+        assert!(
+            fs::read_to_string(&out_legacy_many)
+                .unwrap()
+                .contains("TX,25,ERR-007,d1")
         );
 
         fs::remove_dir_all(&dir).unwrap();

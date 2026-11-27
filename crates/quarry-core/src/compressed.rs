@@ -24,8 +24,8 @@ use crate::source_stamp::{SourceStamp, open_regular_file};
 use crate::spill::{SpillFile, SpillWorkspace};
 use crate::storage::{available_space, storage_error};
 use crate::{
-    CompletedIndex, Dialect, Encoding, HeaderMode, IndexConfig, OpenMetrics, OpenOptions,
-    QuarryError, Row, Session, StructuralIndex, WorkingCopyCleanup,
+    CompletedIndex, Dialect, Encoding, FilterColumnSchema, HeaderMode, IndexConfig, OpenMetrics,
+    OpenOptions, QuarryError, Row, Session, StructuralIndex, WorkingCopyCleanup,
 };
 
 #[cfg(any(test, debug_assertions))]
@@ -973,6 +973,20 @@ impl CompressedBootstrap {
     /// The exact decompressed size, known only when the bootstrap reached the end.
     pub fn decompressed_size(&self) -> Option<u64> {
         self.decompressed_size
+    }
+
+    /// Returns the column schema derived from the bootstrapped header row so callers can
+    /// validate `--where` filter expressions before starting full decompression.
+    pub fn filter_column_schema(&self) -> FilterColumnSchema<'_> {
+        let headers = if self.dialect.has_header {
+            self.first_rows
+                .first()
+                .map(|row| row.fields.as_slice())
+                .unwrap_or(&[])
+        } else {
+            &[]
+        };
+        FilterColumnSchema::with_headers(headers, None)
     }
 
     /// A session over the bootstrap rows alone, for showing them before (or instead
