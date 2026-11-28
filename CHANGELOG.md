@@ -13,6 +13,8 @@ GitHub pull requests.
 
 ### Added
 
+- Added an inline **Query Bar** to the desktop app via **View → Query Bar**, `Cmd+Shift+F` (macOS) / `Ctrl+Shift+F` (Linux), or the toolbar **Query** button so users can filter tables directly with SQL-like `AND` / `OR` expressions, ranges, and regular expressions. (#238)
+- Added two-way synchronization between the **Query Bar** and the **Filters** popover (including a new **Matches regex** operator), per-tab query drafts, inline diagnostics that leave active filters untouched on syntax errors, and an opt-in **Live** as-you-type toggle that defaults to Enter-to-apply on files larger than 10 MiB. Documented in `docs/USER_GUIDE.md`. (#238)
 - Added `--where EXPR` (along with `--delimiter` and `--header`) to `quarry filter` and `quarry export`, letting users write concise multi-column filter expressions using column names, `[bracketed]` headers, or `#N` column indices instead of repeated `--column`/`--and` flags. (#234)
 - Added an exact, bounded filter expression parser and canonical printer supporting `AND` across columns, same-column `OR`, `!=` exclusions, numeric comparisons, `BETWEEN` / inclusive range folding, `CONTAINS`, and `=~` / `/pattern/` regex rules, with explicit diagnostics for unsupported syntax or ambiguous duplicate headers and early validation before gzip decompression. Documented in `docs/USER_GUIDE.md`. (#234)
 - Added opt-in bounded regular expression matching to the CLI (`quarry search --regex`, `quarry filter --operator regex`, and `quarry export --operator regex`, plus `--ignore-case`) and core search, filter, filtered export, and live-watch engines while keeping literal matching as the default. (#232)

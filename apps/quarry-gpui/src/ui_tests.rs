@@ -5426,3 +5426,414 @@ fn idle_coordinator_wakes_for_filtered_edit_parks_on_duplicate_preview_and_updat
         "completed DuplicatePreview waiting on user confirmation must park the real coordinator"
     );
 }
+
+#[gpui_kit::test]
+fn query_bar_applies_syncs_rules_isolates_tabs_and_preserves_active_filter_on_error(
+    cx: &mut TestAppContext,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let path_a = dir.path().join("orders.csv");
+    let path_b = dir.path().join("other.csv");
+    std::fs::write(
+        &path_a,
+        "state,order total,code,tag\n\
+         TX,25,ERR-007,d1\n\
+         FL,100,ERR-042,d2\n\
+         CA,50,ERR-009,d3\n\
+         TX,150,ERR-099,d4\n\
+         FL,10,OK-001,d5\n\
+         TX,25,ERR-008,d6\n",
+    )
+    .unwrap();
+    std::fs::write(&path_b, "region,score\nwest,10\neast,20\n").unwrap();
+
+    let controller = init_test_app(cx);
+    let (win, view) = open_test_window(cx, &controller);
+    let win_id = cx.update(|cx| view.read(cx).window_id);
+    let (id_a, id_b) = cx.update(|cx| {
+        let (_, a) = controller
+            .update(cx, |c, cx| {
+                c.open_paths(
+                    win_id,
+                    vec![path_a.clone()],
+                    OpenOptions {
+                        header_mode: HeaderMode::FirstRow,
+                        ..OpenOptions::default()
+                    },
+                    None,
+                    cx,
+                )
+            })
+            .unwrap();
+        let (_, b) = controller
+            .update(cx, |c, cx| {
+                c.open_paths(
+                    win_id,
+                    vec![path_b.clone()],
+                    OpenOptions {
+                        header_mode: HeaderMode::FirstRow,
+                        ..OpenOptions::default()
+                    },
+                    None,
+                    cx,
+                )
+            })
+            .unwrap();
+        controller
+            .update(cx, |c, cx| c.activate_tab(win_id, a, cx))
+            .unwrap();
+        (a, b)
+    });
+    wait_for_ui(cx, win, &controller, &view, |q, _, cx| {
+        q.snapshot(cx)
+            .is_some_and(|s| s.document_id == id_a && s.index_done && s.total_rows == 6)
+    });
+
+    // Open Query Bar, switch to Enter-to-apply, type a compound expression, and apply.
+    cx.update_window(win.into(), |_, window, cx| {
+        view.update(cx, |q, cx| {
+            q.toggle_query_bar_action(&super::menus::ToggleQueryBar, window, cx);
+            assert!(q.query_bar.read(cx).is_open());
+            assert!(
+                q.query_bar.read(cx).live_mode_for_test(),
+                "small files (<= 10 MiB) default to live mode enabled"
+            );
+            q.query_bar.update(cx, |bar, cx| {
+                bar.set_live_mode_for_test(false, window, cx);
+                bar.set_match_case_for_test(true, cx);
+                bar.set_expression_for_test(
+                    "state == \"TX\" OR state == \"FL\" AND [order total] >= 10 AND [order total] <= 100 AND code =~ /^ERR-\\d+$/ AND #4 != \"d6\"",
+                    window,
+                    cx,
+                );
+                assert!(bar.parse_error_for_test().is_none());
+                bar.apply_now(cx);
+            });
+        });
+    })
+    .unwrap();
+
+    wait_for_ui(cx, win, &controller, &view, |q, _, cx| {
+        q.snapshot(cx)
+            .is_some_and(|s| s.filter_active && s.filter_done && s.available_rows == 2)
+    });
+
+    // Verify canonical expression synced back to Query Bar AND two-way sync populated Filters rules
+    // (including Between folding and Matches regex operator).
+    cx.update(|cx| {
+        let q = view.read(cx);
+        let text = q.query_bar.read(cx).text_for_test(cx);
+        assert_eq!(
+            text,
+            "state == \"TX\" OR state == \"FL\" AND [order total] BETWEEN 10 AND 100 AND code =~ \"^ERR-\\\\d+$\" AND tag != \"d6\""
+        );
+        let synced = q.panels.read(cx).synced_query_for_test(cx);
+        assert_eq!(synced.predicates.len(), 5);
+        assert_eq!(
+            synced.predicates[2].operator,
+            quarry_core::FilterOperator::Between
+        );
+        assert_eq!(
+            synced.predicates[3].operator,
+            quarry_core::FilterOperator::Regex
+        );
+        assert_eq!(
+            synced.case_sensitivity,
+            quarry_core::CaseSensitivity::Sensitive
+        );
+    });
+
+    // Typing an unrepresentable expression (cross-column OR) shows inline diagnostic WITHOUT
+    // disturbing the 2 active filtered rows.
+    cx.update_window(win.into(), |_, window, cx| {
+        view.update(cx, |q, cx| {
+            q.query_bar.update(cx, |bar, cx| {
+                bar.set_expression_for_test("state == \"TX\" OR [order total] > 10", window, cx);
+                let err = bar
+                    .parse_error_for_test()
+                    .expect("cross-column OR must report inline diagnostic");
+                assert!(err.message.contains("same column"));
+                bar.apply_now(cx);
+            });
+        });
+    })
+    .unwrap();
+    wait_for_ui(cx, win, &controller, &view, |q, _, cx| {
+        q.snapshot(cx)
+            .is_some_and(|s| s.filter_active && s.filter_done && s.available_rows == 2)
+    });
+
+    // Switching to Tab B isolates Query Bar draft/errors; switching back restores Tab A's draft.
+    cx.update(|cx| {
+        controller
+            .update(cx, |c, cx| c.activate_tab(win_id, id_b, cx))
+            .unwrap();
+    });
+    wait_for_ui(cx, win, &controller, &view, |q, _, cx| {
+        q.snapshot(cx)
+            .is_some_and(|s| s.document_id == id_b && s.index_done && s.total_rows == 2)
+    });
+    cx.update(|cx| {
+        let bar = view.read(cx).query_bar.read(cx);
+        assert_eq!(bar.text_for_test(cx), "");
+        assert!(bar.parse_error_for_test().is_none());
+    });
+
+    // Applying a filter on Tab B via controller syncs canonical expression into Query Bar.
+    cx.update(|cx| {
+        controller.update(cx, |c, cx| {
+            c.start_filter_active(
+                win_id,
+                quarry_core::FilterQuery::single(
+                    0,
+                    quarry_core::FilterOperator::Equals,
+                    b"west".to_vec(),
+                ),
+                cx,
+            )
+            .unwrap();
+        });
+    });
+    wait_for_ui(cx, win, &controller, &view, |q, _, cx| {
+        q.snapshot(cx).is_some_and(|s| {
+            s.document_id == id_b && s.filter_active && s.filter_done && s.available_rows == 1
+        })
+    });
+    cx.update(|cx| {
+        assert_eq!(
+            view.read(cx).query_bar.read(cx).text_for_test(cx),
+            "region == \"west\""
+        );
+    });
+
+    // Switch back to Tab A: its in-progress invalid draft is preserved, and Clear restores all 6 rows.
+    cx.update(|cx| {
+        controller
+            .update(cx, |c, cx| c.activate_tab(win_id, id_a, cx))
+            .unwrap();
+    });
+    wait_for_ui(cx, win, &controller, &view, |q, _, cx| {
+        q.snapshot(cx)
+            .is_some_and(|s| s.document_id == id_a && s.filter_active && s.available_rows == 2)
+    });
+    cx.update_window(win.into(), |_, window, cx| {
+        view.update(cx, |q, cx| {
+            assert!(q.query_bar.read(cx).parse_error_for_test().is_some());
+            q.query_bar.update(cx, |bar, cx| bar.clear_now(window, cx));
+        });
+    })
+    .unwrap();
+    wait_for_ui(cx, win, &controller, &view, |q, _, cx| {
+        q.snapshot(cx)
+            .is_some_and(|s| s.document_id == id_a && !s.filter_active && s.available_rows == 6)
+    });
+    cx.update(|cx| {
+        let q = view.read(cx);
+        assert_eq!(q.query_bar.read(cx).text_for_test(cx), "");
+        assert!(q.query_bar.read(cx).parse_error_for_test().is_none());
+    });
+
+    // Header rename updates canonical expression in Query Bar AND Filters column labels without
+    // wiping active rules.
+    cx.update_window(win.into(), |_, window, cx| {
+        view.update(cx, |q, cx| {
+            q.query_bar.update(cx, |bar, cx| {
+                bar.set_expression_for_test("state == \"TX\"", window, cx);
+                bar.apply_now(cx);
+            });
+        });
+    })
+    .unwrap();
+    wait_for_ui(cx, win, &controller, &view, |q, _, cx| {
+        q.snapshot(cx).is_some_and(|s| {
+            s.document_id == id_a && s.filter_active && s.filter_done && s.available_rows == 3
+        })
+    });
+    cx.update(|cx| {
+        controller.update(cx, |c, cx| {
+            let doc = c.active_document_mut(win_id).unwrap();
+            doc.begin_header_edit(0);
+            doc.header_edit.as_mut().unwrap().draft = "province".into();
+            doc.commit_edits();
+            cx.notify();
+        });
+    });
+    wait_for_ui(cx, win, &controller, &view, |q, _, cx| {
+        q.query_bar.read(cx).text_for_test(cx) == "province == \"TX\""
+    });
+    cx.update(|cx| {
+        let synced = view.read(cx).panels.read(cx).synced_query_for_test(cx);
+        assert_eq!(synced.predicates.len(), 1);
+        assert_eq!(synced.predicates[0].value, b"TX");
+    });
+
+    // Cell edit automatic rescan must NOT overwrite an unapplied dirty draft in the Query Bar.
+    cx.update_window(win.into(), |_, window, cx| {
+        view.update(cx, |q, cx| {
+            q.query_bar.update(cx, |bar, cx| {
+                bar.set_expression_for_test("province == \"FL\"", window, cx);
+            });
+        });
+    })
+    .unwrap();
+    cx.update(|cx| {
+        controller.update(cx, |c, cx| {
+            let doc = c.active_document_mut(win_id).unwrap();
+            doc.begin_cell_edit(1, 0, b"TX".to_vec()).unwrap();
+            doc.cell_edit.as_mut().unwrap().draft = "NY".into();
+            doc.commit_edits();
+            cx.notify();
+        });
+    });
+    wait_for_ui(cx, win, &controller, &view, |q, _, cx| {
+        q.snapshot(cx)
+            .is_some_and(|s| s.filter_active && s.filter_done && s.available_rows == 2)
+    });
+    cx.update(|cx| {
+        assert_eq!(
+            view.read(cx).query_bar.read(cx).text_for_test(cx),
+            "province == \"FL\"",
+            "automatic cell-edit filter refresh must preserve an unapplied Query Bar draft"
+        );
+    });
+
+    // Non-UTF-8 predicate applied via Query Bar clears stale Filters rules and shows the notice.
+    cx.update_window(win.into(), |_, window, cx| {
+        view.update(cx, |q, cx| {
+            q.query_bar.update(cx, |bar, cx| {
+                bar.set_expression_for_test("province == \"\\xff\"", window, cx);
+                bar.apply_now(cx);
+            });
+        });
+    })
+    .unwrap();
+    wait_for_ui(cx, win, &controller, &view, |q, _, cx| {
+        q.snapshot(cx)
+            .is_some_and(|s| s.filter_active && s.filter_done && s.available_rows == 0)
+    });
+    cx.update(|cx| {
+        let panels = view.read(cx).panels.read(cx);
+        assert!(panels.has_non_utf8_query_notice_for_test());
+        assert!(
+            panels.synced_query_for_test(cx).predicates[0]
+                .value
+                .is_empty()
+        );
+    });
+
+    // External query exceeding expression printer limits clears stale input text, retains the
+    // omission warning, and does not clear the active filter on bare Enter (`apply_now`).
+    cx.update(|cx| {
+        controller.update(cx, |c, cx| {
+            c.start_filter_active(
+                win_id,
+                quarry_core::FilterQuery::single(
+                    0,
+                    quarry_core::FilterOperator::Equals,
+                    vec![b'x'; quarry_core::MAX_FILTER_EXPR_BYTES + 1],
+                ),
+                cx,
+            )
+            .unwrap();
+        });
+    });
+    wait_for_ui(cx, win, &controller, &view, |q, _, cx| {
+        q.snapshot(cx)
+            .is_some_and(|s| s.filter_active && s.filter_done)
+            && q.query_bar
+                .read(cx)
+                .print_omitted_reason_for_test()
+                .is_some()
+    });
+    cx.update_window(win.into(), |_, window, cx| {
+        view.update(cx, |q, cx| {
+            assert_eq!(q.query_bar.read(cx).text_for_test(cx), "");
+            q.query_bar.update(cx, |bar, cx| {
+                bar.apply_now(cx);
+                // Toggling Live on while the active filter expression is omitted must preserve
+                // the omission notice and must NOT schedule an empty-input Clear.
+                bar.set_live_mode_for_test(true, window, cx);
+            });
+        });
+    })
+    .unwrap();
+    cx.background_executor
+        .advance_clock(Duration::from_millis(250));
+    cx.run_until_parked();
+    cx.update(|cx| {
+        assert!(
+            view.read(cx).snapshot(cx).is_some_and(|s| s.filter_active),
+            "pressing Enter or enabling Live on an omitted expression must not clear active filter"
+        );
+        assert!(
+            view.read(cx)
+                .query_bar
+                .read(cx)
+                .print_omitted_reason_for_test()
+                .is_some(),
+            "enabling Live must preserve the omission notice"
+        );
+    });
+
+    // Live debounce mode supersedes an earlier draft within 180ms and applies the final valid
+    // expression automatically once the debounce timer elapses without pressing Enter.
+    cx.update_window(win.into(), |_, window, cx| {
+        view.update(cx, |q, cx| {
+            q.query_bar.update(cx, |bar, cx| {
+                bar.set_live_mode_for_test(true, window, cx);
+                bar.set_expression_for_test("province == \"FL\"", window, cx);
+            });
+        });
+    })
+    .unwrap();
+    cx.background_executor
+        .advance_clock(Duration::from_millis(50));
+    cx.run_until_parked();
+    cx.update_window(win.into(), |_, window, cx| {
+        view.update(cx, |q, cx| {
+            q.query_bar.update(cx, |bar, cx| {
+                bar.set_expression_for_test("province == \"CA\"", window, cx);
+            });
+        });
+    })
+    .unwrap();
+    cx.background_executor
+        .advance_clock(Duration::from_millis(250));
+    cx.run_until_parked();
+    wait_for_ui(cx, win, &controller, &view, |q, _, cx| {
+        q.snapshot(cx).is_some_and(|s| {
+            s.filter_active
+                && s.filter_done
+                && s.available_rows == 1
+                && q.query_bar.read(cx).text_for_test(cx) == "province == \"CA\""
+        })
+    });
+
+    // Close Tab B and verify its draft entry is pruned from QueryBar (leaving only Tab A).
+    cx.update(|cx| {
+        assert_eq!(
+            view.read(cx).query_bar.read(cx).tab_draft_count_for_test(),
+            2
+        );
+        let _ = controller.update(cx, |c, cx| c.request_close_tab(win_id, id_b, false, cx));
+    });
+    wait_for_ui(cx, win, &controller, &view, |q, _, cx| {
+        q.query_bar.read(cx).tab_draft_count_for_test() == 1
+    });
+
+    // Closing Query Bar via toggle/Escape hides it cleanly.
+    cx.update_window(win.into(), |_, window, cx| {
+        view.update(cx, |q, cx| {
+            q.query_bar.update(cx, |bar, cx| bar.close(cx));
+            assert!(!q.query_bar.read(cx).is_open());
+            // Verify clear_now on open bar works cleanly too.
+            q.toggle_query_bar_action(&super::menus::ToggleQueryBar, window, cx);
+            assert!(q.query_bar.read(cx).is_open());
+            q.query_bar.update(cx, |bar, cx| bar.clear_now(window, cx));
+        });
+    })
+    .unwrap();
+    wait_for_ui(cx, win, &controller, &view, |q, _, cx| {
+        q.snapshot(cx).is_some_and(|s| !s.filter_active)
+    });
+}

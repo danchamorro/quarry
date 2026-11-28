@@ -15,6 +15,7 @@ use quarry_core::{
     CaseSensitivity, Encoding, FilterOperator, FilterPredicate, FilterQuery, HeaderMode,
     OpenOptions,
 };
+use quarry_workbench::DocumentId;
 
 use crate::menus::{encoding_from_label, encoding_index, encoding_label};
 use crate::workbench::{BookmarkListEntry, DocumentSnapshot};
@@ -54,7 +55,7 @@ impl SelectItem for Choice {
 
 type ChoiceState = SelectState<SearchableVec<Choice>>;
 
-const OPERATORS: [(FilterOperator, &str); 8] = [
+const OPERATORS: [(FilterOperator, &str); 9] = [
     (FilterOperator::Contains, "Contains"),
     (FilterOperator::Equals, "Equals"),
     (FilterOperator::NotEquals, "Does not equal"),
@@ -63,6 +64,7 @@ const OPERATORS: [(FilterOperator, &str); 8] = [
     (FilterOperator::LessThan, "Less than"),
     (FilterOperator::LessThanOrEqual, "At most"),
     (FilterOperator::Between, "Between (inclusive)"),
+    (FilterOperator::Regex, "Matches regex"),
 ];
 const DELIMITERS: [&str; 5] = ["Auto", "Comma", "Tab", "Pipe", "Semicolon"];
 const HEADERS: [&str; 3] = ["Auto", "First row is header", "No header"];
@@ -94,6 +96,7 @@ pub enum Tool {
 
 pub struct Panels {
     path: Option<PathBuf>,
+    active_doc: Option<(DocumentId, u64)>,
     headers: Vec<String>,
     order: Vec<usize>,
     shown: Vec<bool>,
@@ -115,6 +118,10 @@ pub struct Panels {
     source_changed: bool,
     filter_active: bool,
     filter_running: bool,
+    last_synced_filter: Option<(u64, u64)>,
+    latest_filter_key: Option<(u64, u64)>,
+    latest_filter_query: Option<FilterQuery>,
+    non_utf8_query_notice: bool,
     can_export_filtered: bool,
     export_running: bool,
     filter_status: Option<String>,
@@ -202,6 +209,7 @@ impl Panels {
         ];
         Self {
             path: None,
+            active_doc: None,
             headers: vec![],
             order: vec![],
             shown: vec![],
@@ -223,6 +231,10 @@ impl Panels {
             source_changed: false,
             filter_active: false,
             filter_running: false,
+            last_synced_filter: None,
+            latest_filter_key: None,
+            latest_filter_query: None,
+            non_utf8_query_notice: false,
             can_export_filtered: false,
             export_running: false,
             filter_status: None,
@@ -234,6 +246,17 @@ impl Panels {
         }
     }
 
+    fn activate_tool(&mut self, tool: Tool, window: &mut Window, cx: &mut Context<Self>) {
+        if tool == Tool::Format {
+            self.restore_format(window, cx);
+        } else if tool == Tool::Filters && self.last_synced_filter != self.latest_filter_key {
+            let query = self.latest_filter_query.clone();
+            self.sync_rules_from_query(query.as_ref(), window, cx);
+            self.last_synced_filter = self.latest_filter_key;
+        }
+        self.active = Some(tool);
+    }
+
     pub fn open_tool(&mut self, tool: Tool, window: &mut Window, cx: &mut Context<Self>) {
         if self.path.is_none() {
             return;
@@ -241,10 +264,7 @@ impl Panels {
         if self.active == Some(tool) {
             self.close(window, cx);
         } else {
-            if tool == Tool::Format {
-                self.restore_format(window, cx);
-            }
-            self.active = Some(tool);
+            self.activate_tool(tool, window, cx);
             cx.notify();
         }
     }
@@ -253,11 +273,16 @@ impl Panels {
         if self.path.is_some() {
             self.close(window, cx);
             self.path = None;
+            self.active_doc = None;
             self.headers.clear();
             self.order.clear();
             self.shown.clear();
             self.matches.clear();
             self.rules.clear();
+            self.last_synced_filter = None;
+            self.latest_filter_key = None;
+            self.latest_filter_query = None;
+            self.non_utf8_query_notice = false;
             self.dirty = false;
             self.busy = false;
             self.live_watching = false;
@@ -319,9 +344,16 @@ impl Panels {
                 self.restore_format(window, cx);
             }
         }
-        let added_columns = self.path.as_ref() == Some(&info.path)
+        let doc_key = (info.document_id, info.instance_id);
+        let doc_changed = self.active_doc != Some(doc_key);
+        let added_columns = !doc_changed
+            && self.path.as_ref() == Some(&info.path)
             && info.headers.len() > self.headers.len()
             && info.headers.starts_with(&self.headers);
+        let renamed_headers = !doc_changed
+            && self.path.as_ref() == Some(&info.path)
+            && info.headers.len() == self.headers.len()
+            && info.headers != self.headers;
         if added_columns {
             let previous_count = self.headers.len();
             self.headers = info.headers.clone();
@@ -344,8 +376,31 @@ impl Panels {
                 });
             }
             self.refresh_matches(cx);
-        } else if self.path.as_ref() != Some(&info.path) || self.headers != info.headers {
+        } else if renamed_headers {
+            self.headers = info.headers.clone();
+            for rule in &self.rules {
+                let selected = *rule.column.read(cx).selected_value().unwrap_or(&0);
+                rule.column.update(cx, |state, cx| {
+                    state.set_items(
+                        choices(
+                            self.headers
+                                .iter()
+                                .enumerate()
+                                .map(|(source, name)| format!("{}: {}", source + 1, name)),
+                        ),
+                        window,
+                        cx,
+                    );
+                    state.set_selected_value(&selected, window, cx);
+                });
+            }
+            self.refresh_matches(cx);
+        } else if doc_changed
+            || self.path.as_ref() != Some(&info.path)
+            || self.headers != info.headers
+        {
             self.close(window, cx);
+            self.active_doc = Some(doc_key);
             self.path = Some(info.path.clone());
             self.headers = info.headers.clone();
             let mut is_shown = vec![false; self.headers.len()];
@@ -363,6 +418,8 @@ impl Panels {
             self.refresh_matches(cx);
             self.rules.clear();
             self.match_case = false;
+            self.non_utf8_query_notice = false;
+            self.last_synced_filter = None;
             self.add_rule(window, cx);
         }
         if !self
@@ -389,7 +446,78 @@ impl Panels {
             self.shown = is_shown;
             self.refresh_matches(cx);
         }
+        let filter_sync_key = (info.instance_id, info.filter_query_generation);
+        let query_changed = self.latest_filter_query != info.filter_query;
+        self.latest_filter_key = Some(filter_sync_key);
+        self.latest_filter_query = info.filter_query.clone();
+        if self.active != Some(Tool::Filters)
+            && (self.last_synced_filter != Some(filter_sync_key) || query_changed)
+        {
+            self.sync_rules_from_query(info.filter_query.as_ref(), window, cx);
+            self.last_synced_filter = Some(filter_sync_key);
+        }
         cx.notify();
+    }
+
+    fn sync_rules_from_query(
+        &mut self,
+        query: Option<&FilterQuery>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(query) = query else {
+            self.non_utf8_query_notice = false;
+            self.rules.clear();
+            self.match_case = false;
+            self.add_rule(window, cx);
+            return;
+        };
+        // Non-UTF-8 byte predicates cannot be edited losslessly in UTF-8 rule textboxes:
+        // clear stale rules and display an explicit banner directing the user to the Query Bar.
+        if query.predicates.iter().any(|p| {
+            std::str::from_utf8(&p.value).is_err()
+                || p.upper_bound
+                    .as_deref()
+                    .is_some_and(|u| std::str::from_utf8(u).is_err())
+        }) {
+            self.non_utf8_query_notice = true;
+            self.rules.clear();
+            self.match_case = query.case_sensitivity == CaseSensitivity::Sensitive;
+            self.add_rule(window, cx);
+            return;
+        }
+        self.non_utf8_query_notice = false;
+        self.rules.clear();
+        self.match_case = query.case_sensitivity == CaseSensitivity::Sensitive;
+        for predicate in &query.predicates {
+            let op_idx = OPERATORS
+                .iter()
+                .position(|(op, _)| *op == predicate.operator)
+                .unwrap_or(0);
+            let value_str = std::str::from_utf8(&predicate.value)
+                .unwrap_or("")
+                .to_owned();
+            let upper_str = predicate
+                .upper_bound
+                .as_deref()
+                .and_then(|u| std::str::from_utf8(u).ok())
+                .unwrap_or("")
+                .to_owned();
+            self.add_rule_with_values(predicate.column, op_idx, value_str, upper_str, window, cx);
+        }
+        if self.rules.is_empty() {
+            self.add_rule(window, cx);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn synced_query_for_test(&self, cx: &App) -> FilterQuery {
+        self.query(cx)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_non_utf8_query_notice_for_test(&self) -> bool {
+        self.non_utf8_query_notice
     }
 
     pub fn close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -439,6 +567,18 @@ impl Panels {
     }
 
     fn add_rule(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.add_rule_with_values(0, 0, String::new(), String::new(), window, cx);
+    }
+
+    fn add_rule_with_values(
+        &mut self,
+        selected_column: usize,
+        selected_operator: usize,
+        initial_value: String,
+        initial_upper: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let column = select_state(
             self.headers
                 .iter()
@@ -448,14 +588,36 @@ impl Panels {
             window,
             cx,
         );
+        if selected_column > 0 {
+            column.update(cx, |state, cx| {
+                state.set_selected_value(&selected_column, window, cx)
+            });
+        }
         let operator = select_state(
             OPERATORS.map(|(_, label)| label.to_owned()),
             false,
             window,
             cx,
         );
-        let value = cx.new(|cx| TextareaState::new(window, cx).rows(1).placeholder("Value"));
-        let upper = cx.new(|cx| InputState::new(window, cx).placeholder("Upper bound"));
+        if selected_operator > 0 {
+            operator.update(cx, |state, cx| {
+                state.set_selected_value(&selected_operator, window, cx)
+            });
+        }
+        let value = cx.new(|cx| {
+            let mut state = TextareaState::new(window, cx).rows(1).placeholder("Value");
+            if !initial_value.is_empty() {
+                state.set_value(initial_value, window, cx);
+            }
+            state
+        });
+        let upper = cx.new(|cx| {
+            let mut state = InputState::new(window, cx).placeholder("Upper bound");
+            if !initial_upper.is_empty() {
+                state.set_value(initial_upper, window, cx);
+            }
+            state
+        });
         let subscriptions = vec![
             cx.subscribe_in(
                 &column,
@@ -525,10 +687,7 @@ impl Panels {
                         && this.active.is_some()
                         && this.active != Some(tool)
                     {
-                        if tool == Tool::Format {
-                            this.restore_format(window, cx);
-                        }
-                        this.active = Some(tool);
+                        this.activate_tool(tool, window, cx);
                         cx.notify();
                     }
                 }),
@@ -546,10 +705,7 @@ impl Panels {
                     )
                     .on_open_change(cx.listener(move |this, open, window, cx| {
                         if *open {
-                            if tool == Tool::Format {
-                                this.restore_format(window, cx);
-                            }
-                            this.active = Some(tool);
+                            this.activate_tool(tool, window, cx);
                         } else if this.active == Some(tool) {
                             this.close(window, cx);
                         }
@@ -947,6 +1103,16 @@ impl Panels {
                     .text_size(px(12.))
                     .child("Choose which rows stay in view."),
             )
+            .when(self.non_utf8_query_notice, |this| {
+                this.child(
+                    div()
+                        .id("filter-non-utf8-notice")
+                        .role(Role::Status)
+                        .text_size(px(12.))
+                        .text_color(cx.theme().warning_foreground)
+                        .child("Active filter contains raw non-UTF-8 bytes; edit it in the Query Bar or enter new rules here to replace it."),
+                )
+            })
             .child(
                 div()
                     .flex()
@@ -970,7 +1136,10 @@ impl Panels {
                     .overflow_y_scroll()
                     .children(self.rules.iter().enumerate().map(|(position, rule)| {
                         let id = rule.id;
-                        let between = *rule.operator.read(cx).selected_value().unwrap_or(&0) == 7;
+                        let between = OPERATORS
+                            [*rule.operator.read(cx).selected_value().unwrap_or(&0)]
+                            .0
+                            == FilterOperator::Between;
                         div()
                             .flex()
                             .w_full()
@@ -1388,8 +1557,9 @@ mod tests {
             title: "Duplicate".into(),
         };
         assert_ne!(first.value(), last.value());
-        assert_eq!(OPERATORS.len(), 8);
+        assert_eq!(OPERATORS.len(), 9);
         assert_eq!(OPERATORS[7].0, FilterOperator::Between);
+        assert_eq!(OPERATORS[8].0, FilterOperator::Regex);
         assert_eq!(format_options((2, 1)).delimiter, Some(b'\t'));
         assert_eq!(format_options((0, 2)).header_mode, HeaderMode::NoHeader);
     }

@@ -2701,3 +2701,101 @@ fn damaged_gzip_returns_uninspectable_open_error_while_malformed_csv_is_inspecta
         "expected inspectable OpenFailed for malformed .csv, got {csv_err:?}"
     );
 }
+
+#[test]
+fn waking_dormant_filtered_tab_and_superseding_filter_discards_pending_restore() {
+    let dir = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let csv_a = dir.path().join("filtered_a.csv");
+    let mut content = String::from("id,tag\n");
+    for i in 1..=200 {
+        content.push_str(&format!("{i},KEEP\n"));
+    }
+    content.push_str("201,ONLY_ONE\n");
+    std::fs::write(&csv_a, content).unwrap();
+    let csv_b = write_csv(dir.path(), "other_b.csv", 10);
+
+    let mut scheduler = WorkbenchScheduler::new(WorkbenchSchedulerConfig {
+        max_hydrated_tabs: 1,
+        working_directory: scratch.path().to_path_buf(),
+        index_cache_enabled: false,
+        ..Default::default()
+    });
+    let w1 = WindowId::PRIMARY;
+    let ids = scheduler
+        .open_many_lazy(w1, [csv_a, csv_b], open_options(), None)
+        .unwrap();
+    finish_active_indexing(&mut scheduler, ids[0]);
+
+    // Apply filter A (`KEEP`, 200 matches), scroll to match 150, and select a cell.
+    let keep_query = FilterQuery::single(1, FilterOperator::Equals, b"KEEP".to_vec());
+    scheduler.start_filter(ids[0], keep_query).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while {
+        let errors = scheduler.poll_all();
+        assert!(errors.is_empty(), "initial filter poll failed: {errors:?}");
+        let doc = scheduler.tab(ids[0]).unwrap().document.as_ref().unwrap();
+        doc.filter_job.is_some() || doc.filter_rows_loading()
+    } {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    {
+        let doc = scheduler
+            .tab_mut(ids[0])
+            .unwrap()
+            .document
+            .as_mut()
+            .unwrap();
+        doc.filter_viewport_start = 150;
+        doc.selection = Some(quarry_workbench::GridSelection::Cell {
+            row: 150,
+            column: 1,
+        });
+    }
+
+    // Evict tab 0 to dormancy by activating tab 1 under max_hydrated_tabs = 1.
+    scheduler.activate_tab(w1, ids[1]).unwrap();
+    finish_active_indexing(&mut scheduler, ids[1]);
+    assert_eq!(
+        scheduler.residency(ids[0]),
+        Some(ResidencyState::DormantClean)
+    );
+
+    // Wake tab 0 (starts rebuilding filter A and records `pending_filter_restore`), then
+    // immediately supersede with filter B (`ONLY_ONE`, 1 match) before polling completes.
+    scheduler.activate_tab(w1, ids[0]).unwrap();
+    let only_one_query = FilterQuery::single(1, FilterOperator::Equals, b"ONLY_ONE".to_vec());
+    scheduler.start_filter(ids[0], only_one_query).unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while {
+        let errors = scheduler.poll_all();
+        assert!(
+            errors.is_empty(),
+            "replacement filter poll failed: {errors:?}"
+        );
+        let doc = scheduler.tab(ids[0]).unwrap().document.as_ref().unwrap();
+        doc.filter_job.is_some() || doc.filter_rows_loading()
+    } {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    let doc = scheduler.tab(ids[0]).unwrap().document.as_ref().unwrap();
+    assert_eq!(doc.available_filter_rows(), 1);
+    assert_eq!(
+        doc.filtered_rows.len(),
+        1,
+        "replacement page must be loaded so pending restore evaluation was exercised"
+    );
+    assert_eq!(doc.filtered_rows[0].fields[1], b"ONLY_ONE");
+    assert_eq!(
+        doc.filter_viewport_start, 0,
+        "superseded wake must NOT apply previous filter's viewport offset (150) onto replacement filter"
+    );
+    assert!(
+        doc.selection.is_none(),
+        "superseded wake must NOT restore previous filter's cleared selection"
+    );
+}

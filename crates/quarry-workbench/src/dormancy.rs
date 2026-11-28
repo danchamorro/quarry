@@ -487,6 +487,7 @@ struct DormantDocument {
 
 #[derive(Clone)]
 struct PendingFilterRestore {
+    expected_tag: crate::document::FilterResultTag,
     filter_viewport_start: u64,
     scroll_points: f32,
     selection: Option<GridSelection>,
@@ -497,8 +498,12 @@ struct PendingFilterRestore {
 }
 
 impl PendingFilterRestore {
-    fn from_view(view: &DormantViewSnapshot) -> Self {
+    fn from_view(
+        view: &DormantViewSnapshot,
+        expected_tag: crate::document::FilterResultTag,
+    ) -> Self {
         Self {
+            expected_tag,
             filter_viewport_start: view.filter_viewport_start,
             scroll_points: view.scroll_points,
             selection: view.selection,
@@ -1257,6 +1262,7 @@ impl WorkbenchScheduler {
         }
 
         let id = self.allocate_id();
+        doc.document_id = Some(id);
         let mut tab = WorkbenchTab::new(id.raw());
         tab.delimiter_mode = delimiter_mode;
         tab.header_mode = header_mode;
@@ -1433,6 +1439,7 @@ impl WorkbenchScheduler {
             if let Some(mut old) = slot.tab.document.take() {
                 old.shutdown();
             }
+            replacement.document_id = Some(id);
             slot.tab.document = Some(replacement);
             slot.tab.notice = Some(AppMessage::status(notice.clone()));
         }
@@ -1661,7 +1668,8 @@ impl WorkbenchScheduler {
                         &fd_budget,
                         write_slot_available,
                     ) {
-                        Ok((doc, temp_dir_lease, job_lease)) => {
+                        Ok((mut doc, temp_dir_lease, job_lease)) => {
+                            doc.document_id = Some(id);
                             slot.tab.document = Some(doc);
                             Ok(HydratedWake {
                                 kind: WakeKind::StubInitialOpen,
@@ -1675,21 +1683,26 @@ impl WorkbenchScheduler {
                     }
                 }
                 SlotResidency::Dormant(dormant) => {
-                    let saved_filter_restore = dormant
+                    let saved_filter_view = dormant
                         .view
                         .filter_query
                         .as_ref()
-                        .map(|_| PendingFilterRestore::from_view(&dormant.view));
+                        .map(|_| dormant.view.clone());
                     match wake_dormant_document(
+                        id,
                         dormant,
                         &self.config,
                         &self.working_cleanup,
                         &self.decompression_slots,
                         &fd_budget,
                     ) {
-                        Ok((doc, kind, conflict_notice, temp_dir_lease, job_lease)) => {
+                        Ok((mut doc, kind, conflict_notice, temp_dir_lease, job_lease)) => {
+                            doc.document_id = Some(id);
                             let pending_filter_restore = if doc.filter_job.is_some() {
-                                saved_filter_restore
+                                let wake_tag = doc.current_filter_tag();
+                                saved_filter_view
+                                    .as_ref()
+                                    .map(|view| PendingFilterRestore::from_view(view, wake_tag))
                             } else {
                                 None
                             };
@@ -2069,8 +2082,8 @@ impl WorkbenchScheduler {
                     errors.push((id, err));
                 }
             }
-            if pending_filter_restore.is_some() {
-                if doc.filter_query.is_none() {
+            if let Some(expected_tag) = pending_filter_restore.as_ref().map(|p| p.expected_tag) {
+                if doc.filter_query.is_none() || doc.current_filter_tag() != expected_tag {
                     *pending_filter_restore = None;
                 } else if doc.filter_job.is_none() && !doc.filter_rows_loading() {
                     let has_matches = doc
@@ -2489,7 +2502,15 @@ impl WorkbenchScheduler {
                 if let Some(doc) = slot.tab.document.as_mut() {
                     doc.shutdown();
                 }
+                replacement.document_id = Some(id);
                 slot.tab.document = Some(replacement);
+                if let SlotResidency::Hydrated {
+                    pending_filter_restore,
+                    ..
+                } = &mut slot.residency
+                {
+                    *pending_filter_restore = None;
+                }
                 slot.tab.delimiter_mode =
                     crate::tab::DelimiterMode::from_delimiter(options.delimiter);
                 slot.tab.header_mode = options.header_mode;
@@ -2846,6 +2867,7 @@ impl WorkbenchScheduler {
         replacement.custom_working_directory = self.config.custom_working_directory;
         replacement.working_cleanup = self.working_cleanup.clone();
         replacement.decompression_slots = self.decompression_slots.clone();
+        replacement.document_id = Some(id);
         current.shutdown();
         drop(temp_open_fd);
         slot.tab.document = Some(replacement);
@@ -2936,6 +2958,7 @@ impl WorkbenchScheduler {
             replacement.index_cache_enabled = self.config.index_cache_enabled;
             replacement.working_cleanup = self.working_cleanup.clone();
             replacement.decompression_slots = self.decompression_slots.clone();
+            replacement.document_id = Some(id);
             replacement.start_indexing().map_err(AppMessage::error)?;
             doc.shutdown();
             drop(temp_open_fd);
@@ -3056,7 +3079,8 @@ impl WorkbenchScheduler {
                     });
 
                     match reload {
-                        Ok(replacement) => {
+                        Ok(mut replacement) => {
+                            replacement.document_id = Some(id);
                             let new_identity = replacement.session.file_identity();
                             doc.shutdown();
                             slot.tab.document = Some(replacement);
@@ -3371,6 +3395,7 @@ impl WorkbenchScheduler {
         {
             replacement.refresh_column_headers();
         }
+        replacement.document_id = Some(id);
         current.shutdown();
         slot.tab.document = Some(replacement);
         if let Some(lease) = job_fd_lease_to_install
@@ -4763,6 +4788,7 @@ fn cancel_woken_read_jobs(doc: &mut Document) {
 }
 
 fn wake_dormant_document(
+    document_id: DocumentId,
     dormant: Box<DormantDocument>,
     config: &WorkbenchSchedulerConfig,
     working_cleanup: &WorkingCopyCleanup,
@@ -4827,6 +4853,7 @@ fn wake_dormant_document(
                 };
                 apply_view_snapshot(
                     &mut doc,
+                    document_id,
                     &dormant.view,
                     config,
                     working_cleanup,
@@ -4893,6 +4920,7 @@ fn wake_dormant_document(
             if doc.session.source_guard() != dormant.source_guard {
                 apply_view_snapshot(
                     &mut doc,
+                    document_id,
                     &dormant.view,
                     config,
                     working_cleanup,
@@ -4937,6 +4965,7 @@ fn wake_dormant_document(
 
             apply_view_snapshot(
                 &mut doc,
+                document_id,
                 &dormant.view,
                 config,
                 working_cleanup,
@@ -5016,6 +5045,7 @@ fn wake_dormant_document(
             }
             apply_view_snapshot(
                 &mut doc,
+                document_id,
                 &dormant.view,
                 config,
                 working_cleanup,
@@ -5138,6 +5168,7 @@ fn wake_dormant_document(
             doc.compressed = Some(compressed);
             apply_view_snapshot(
                 &mut doc,
+                document_id,
                 &dormant.view,
                 config,
                 working_cleanup,
@@ -5237,6 +5268,7 @@ fn wake_dormant_document(
             doc.compressed = Some(compressed);
             apply_view_snapshot(
                 &mut doc,
+                document_id,
                 &dormant.view,
                 config,
                 working_cleanup,
@@ -5272,11 +5304,13 @@ fn restore_filtered_view_state(doc: &mut Document, view: &DormantViewSnapshot) {
 
 fn apply_view_snapshot(
     doc: &mut Document,
+    document_id: DocumentId,
     view: &DormantViewSnapshot,
     config: &WorkbenchSchedulerConfig,
     working_cleanup: &WorkingCopyCleanup,
     decompression_slots: &compressed::DecompressionSlots,
 ) {
+    doc.document_id = Some(document_id);
     doc.viewport_start = view.viewport_start;
     doc.scroll_points = view.scroll_points;
     doc.visible_rows = view.visible_rows;

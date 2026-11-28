@@ -515,15 +515,142 @@ fn stop_live_watch_reconciles_filter_query_when_cancelling_in_flight_replacement
     let _ = scheduler.stop_live_watch(doc_id).unwrap();
 
     // Regardless of whether B finished before cancellation or was cancelled mid-attach,
-    // `doc.filter_query` MUST match `doc.filter_index.query()`!
+    // `doc.filter_query` MUST match `doc.filter_index.query()`, `filter_index_tag` MUST be
+    // reconciled with `current_filter_tag()`, and static filtered page reads MUST deliver the
+    // expected row bytes and become idle instead of looping forever.
+    assert!(wait_until(Duration::from_secs(5), || {
+        let _ = scheduler.poll_all();
+        let doc = scheduler.tab(doc_id).unwrap().document.as_ref().unwrap();
+        !doc.filter_rows_loading() && !doc.filtered_rows.is_empty()
+    }));
     let doc = scheduler.tab(doc_id).unwrap().document.as_ref().unwrap();
     let idx = doc.filter_index.as_ref().expect("filter index retained");
     assert_eq!(doc.filter_query.as_ref(), Some(idx.query()));
+    assert_eq!(doc.filter_index_tag, Some(doc.current_filter_tag()));
+    assert_eq!(doc.filtered_rows_tag, Some(doc.current_filter_tag()));
+    assert!(doc.filter_read.is_none() && doc.pending_filter_read.is_none());
     if idx.query() == &warn_query {
         assert_eq!(idx.matches_found(), 1);
+        assert_eq!(doc.filtered_rows.len(), 1);
+        assert_eq!(doc.filtered_rows[0].fields[1], b"WARN");
     } else {
         assert_eq!(idx.matches_found(), 49_999);
+        assert!(!doc.filtered_rows.is_empty());
+        assert_eq!(doc.filtered_rows[0].fields[1], b"INFO");
     }
+}
+
+#[test]
+fn live_watch_ignores_superseded_filter_snapshot_while_replacement_attaches() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("replace_snapshot.csv");
+    let mut initial = String::from("id,level\n0,WARN\n");
+    for i in 1..40_000 {
+        initial.push_str(&format!("{i},INFO\n"));
+    }
+    std::fs::write(&path, initial).unwrap();
+
+    let (mut scheduler, doc_id) = open_completed_scheduler(&path);
+    scheduler
+        .start_live_watch_with_config(
+            doc_id,
+            WatchConfig {
+                poll_interval: Duration::from_millis(15),
+                cache_config: quarry_core::IndexCacheConfig::disabled(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    // Attach filter A (`WARN`, 1 match).
+    let warn_query = FilterQuery::single(1, FilterOperator::Equals, b"WARN".to_vec());
+    scheduler
+        .tab_mut(doc_id)
+        .unwrap()
+        .document
+        .as_mut()
+        .unwrap()
+        .start_filter(warn_query.clone())
+        .unwrap();
+    assert!(wait_until(Duration::from_secs(5), || {
+        let _ = scheduler.poll_all();
+        let doc = scheduler.tab(doc_id).unwrap().document.as_ref().unwrap();
+        doc.live_watch_filter_attach.is_none()
+            && doc
+                .filter_index
+                .as_ref()
+                .is_some_and(|i| i.matches_found() == 1)
+    }));
+
+    // Deterministically simulate the window where filter B (`INFO`) is active on the Document
+    // while the watcher still has filter A (`WARN`) attached: append another `WARN` row and wait
+    // for the watcher to publish the new row + 2-match WARN snapshot, then verify `poll_live_watch`
+    // ingests the appended row while ignoring the mismatched WARN filter snapshot.
+    let info_query = FilterQuery::single(1, FilterOperator::Equals, b"INFO".to_vec());
+    {
+        let doc = scheduler
+            .tab_mut(doc_id)
+            .unwrap()
+            .document
+            .as_mut()
+            .unwrap();
+        doc.filter_query = Some(info_query.clone());
+        doc.filter_index = None;
+        doc.filter_index_tag = None;
+        doc.filter_status = Some("Filtering live file…".into());
+        if let Some(progress) = doc.filter_progress.as_mut() {
+            progress.matches_found = 0;
+            progress.done = false;
+        }
+    }
+    let mut writer = FsOpenOptions::new().append(true).open(&path).unwrap();
+    writer.write_all(b"40000,WARN\n").unwrap();
+    writer.flush().unwrap();
+
+    assert!(wait_until(Duration::from_secs(5), || {
+        let doc = scheduler
+            .tab_mut(doc_id)
+            .unwrap()
+            .document
+            .as_mut()
+            .unwrap();
+        let _ = doc.poll_live_watch().unwrap();
+        // Ordinary watch progress must still ingest row 40000 (40_002 committed rows incl. header).
+        doc.progress.rows_scanned >= 40_002
+    }));
+    {
+        let doc = scheduler.tab(doc_id).unwrap().document.as_ref().unwrap();
+        assert!(
+            doc.filter_index.is_none(),
+            "stale filter A index must never be installed while filter B is active"
+        );
+        assert_eq!(doc.filter_status.as_deref(), Some("Filtering live file…"));
+        assert_eq!(
+            doc.filter_progress.as_ref().map(|p| p.matches_found),
+            Some(0)
+        );
+        assert_eq!(doc.filter_progress.as_ref().map(|p| p.done), Some(false));
+    }
+
+    // Now start and complete the real replacement attachment for B (`INFO`, 39_999 matches).
+    scheduler
+        .tab_mut(doc_id)
+        .unwrap()
+        .document
+        .as_mut()
+        .unwrap()
+        .start_filter(info_query.clone())
+        .unwrap();
+    assert!(wait_until(Duration::from_secs(5), || {
+        let errors = scheduler.poll_all();
+        assert!(errors.is_empty(), "live watch poll failed: {errors:?}");
+        let doc = scheduler.tab(doc_id).unwrap().document.as_ref().unwrap();
+        doc.live_watch_filter_attach.is_none()
+            && doc
+                .filter_index
+                .as_ref()
+                .is_some_and(|i| i.query() == &info_query && i.matches_found() == 39_999)
+    }));
 }
 
 #[test]
