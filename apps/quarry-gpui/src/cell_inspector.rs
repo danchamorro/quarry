@@ -260,9 +260,18 @@ impl CellInspector {
             (snap.raw.bytes(), &snap.raw_lines)
         };
         let start = self.current_viewport_top_line();
-        let end = start
-            .saturating_add(INSPECTOR_VISIBLE_SCAN_LINES)
-            .min(line_index.len());
+        let visible_lines = self
+            .scroll_handle
+            .0
+            .borrow()
+            .last_item_size
+            .and_then(|size| {
+                let h = f32::from(size.item.height);
+                (h > 0.0).then(|| (h / INSPECTOR_LINE_HEIGHT_PX).ceil() as usize + 1)
+            })
+            .unwrap_or(INSPECTOR_VISIBLE_SCAN_LINES)
+            .clamp(1, 256);
+        let end = start.saturating_add(visible_lines).min(line_index.len());
         let mut max_chars = 0usize;
         for line_idx in start..end {
             if let Some(slice) = line_index.line_slice(bytes, line_idx, MAX_INSPECTOR_LINE_BYTES) {
