@@ -13,6 +13,9 @@ GitHub pull requests.
 
 ### Added
 
+- Added native arrow-key grid cursor navigation (`Up`/`Down`/`Left`/`Right`, `Home`/`End`, `Cmd/Ctrl+Arrow`, `PageUp`/`PageDown`, and `Enter`/`F2`), an explicit `Tab` focus contract (leaving the grid outside edit mode; committing and moving one cell right inside the cell editor), `/` Quick Filter, and direct **Find…** / **Filter…** toggles. (#240)
+- Added opt-in persisted **Vim Motions** (**View → Vim Motions**, off by default) supporting `hjkl`, `gg` (with a pending-key indicator and timeout), `G`, `0`, `$`, and `n`/`N` on the focused grid while staying inactive inside text inputs, IME composition, and VoiceOver chords. (#240)
+- Added a fuzzy **Command Palette** (`Cmd+K` / `Ctrl+K`, **View → Command Palette…**) and **Go to Row / Column** (`Cmd+L` / `Ctrl+L` or `#` prefix) with 1-based column indices, duplicate header disambiguation, automatic unhiding of hidden columns, and horizontal centering. Documented in `docs/USER_GUIDE.md`. (#240)
 - Added an inline **Query Bar** to the desktop app via **View → Query Bar**, `Cmd+Shift+F` (macOS) / `Ctrl+Shift+F` (Linux), or the toolbar **Query** button so users can filter tables directly with SQL-like `AND` / `OR` expressions, ranges, and regular expressions. (#238)
 - Added two-way synchronization between the **Query Bar** and the **Filters** popover (including a new **Matches regex** operator), per-tab query drafts, inline diagnostics that leave active filters untouched on syntax errors, and an opt-in **Live** as-you-type toggle that defaults to Enter-to-apply on files larger than 10 MiB. Documented in `docs/USER_GUIDE.md`. (#238)
 - Added `--where EXPR` (along with `--delimiter` and `--header`) to `quarry filter` and `quarry export`, letting users write concise multi-column filter expressions using column names, `[bracketed]` headers, or `#N` column indices instead of repeated `--column`/`--and` flags. (#234)
