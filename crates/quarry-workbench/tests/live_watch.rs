@@ -515,15 +515,107 @@ fn stop_live_watch_reconciles_filter_query_when_cancelling_in_flight_replacement
     let _ = scheduler.stop_live_watch(doc_id).unwrap();
 
     // Regardless of whether B finished before cancellation or was cancelled mid-attach,
-    // `doc.filter_query` MUST match `doc.filter_index.query()`!
+    // `doc.filter_query` MUST match `doc.filter_index.query()`, `filter_index_tag` MUST be
+    // reconciled with `current_filter_tag()`, and static filtered page reads MUST deliver the
+    // expected row bytes and become idle instead of looping forever.
+    assert!(wait_until(Duration::from_secs(5), || {
+        let _ = scheduler.poll_all();
+        let doc = scheduler.tab(doc_id).unwrap().document.as_ref().unwrap();
+        !doc.filter_rows_loading() && !doc.filtered_rows.is_empty()
+    }));
     let doc = scheduler.tab(doc_id).unwrap().document.as_ref().unwrap();
     let idx = doc.filter_index.as_ref().expect("filter index retained");
     assert_eq!(doc.filter_query.as_ref(), Some(idx.query()));
+    assert_eq!(doc.filter_index_tag, Some(doc.current_filter_tag()));
+    assert_eq!(doc.filtered_rows_tag, Some(doc.current_filter_tag()));
+    assert!(doc.filter_read.is_none() && doc.pending_filter_read.is_none());
     if idx.query() == &warn_query {
         assert_eq!(idx.matches_found(), 1);
+        assert_eq!(doc.filtered_rows.len(), 1);
+        assert_eq!(doc.filtered_rows[0].fields[1], b"WARN");
     } else {
         assert_eq!(idx.matches_found(), 49_999);
+        assert!(!doc.filtered_rows.is_empty());
+        assert_eq!(doc.filtered_rows[0].fields[1], b"INFO");
     }
+}
+
+#[test]
+fn live_watch_ignores_superseded_filter_snapshot_while_replacement_attaches() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("replace_snapshot.csv");
+    let mut initial = String::from("id,level\n0,WARN\n");
+    for i in 1..40_000 {
+        initial.push_str(&format!("{i},INFO\n"));
+    }
+    std::fs::write(&path, initial).unwrap();
+
+    let (mut scheduler, doc_id) = open_completed_scheduler(&path);
+    scheduler
+        .start_live_watch_with_config(
+            doc_id,
+            WatchConfig {
+                poll_interval: Duration::from_millis(15),
+                cache_config: quarry_core::IndexCacheConfig::disabled(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    // Attach filter A (`WARN`, 1 match).
+    let warn_query = FilterQuery::single(1, FilterOperator::Equals, b"WARN".to_vec());
+    scheduler
+        .tab_mut(doc_id)
+        .unwrap()
+        .document
+        .as_mut()
+        .unwrap()
+        .start_filter(warn_query.clone())
+        .unwrap();
+    assert!(wait_until(Duration::from_secs(5), || {
+        let _ = scheduler.poll_all();
+        let doc = scheduler.tab(doc_id).unwrap().document.as_ref().unwrap();
+        doc.live_watch_filter_attach.is_none()
+            && doc
+                .filter_index
+                .as_ref()
+                .is_some_and(|i| i.matches_found() == 1)
+    }));
+
+    // Start replacement filter B (`INFO`) and immediately append another `WARN` row so the
+    // watcher publishes a snapshot while A is still installed.
+    let info_query = FilterQuery::single(1, FilterOperator::Equals, b"INFO".to_vec());
+    scheduler
+        .tab_mut(doc_id)
+        .unwrap()
+        .document
+        .as_mut()
+        .unwrap()
+        .start_filter(info_query.clone())
+        .unwrap();
+    let mut writer = FsOpenOptions::new().append(true).open(&path).unwrap();
+    writer.write_all(b"40000,WARN\n").unwrap();
+    writer.flush().unwrap();
+
+    // Poll until replacement B finishes attaching, checking on every step that A's match count
+    // (1 or 2) is NEVER installed or published while `filter_query` is B (`INFO`).
+    assert!(wait_until(Duration::from_secs(5), || {
+        let _ = scheduler.poll_all();
+        let doc = scheduler.tab(doc_id).unwrap().document.as_ref().unwrap();
+        if let Some(idx) = doc.filter_index.as_ref() {
+            assert_eq!(
+                idx.query(),
+                &info_query,
+                "stale filter A index must never be installed while filter B is active"
+            );
+            assert_eq!(idx.matches_found(), 39_999);
+        }
+        doc.live_watch_filter_attach.is_none()
+            && doc
+                .filter_index
+                .as_ref()
+                .is_some_and(|i| i.query() == &info_query && i.matches_found() == 39_999)
+    }));
 }
 
 #[test]

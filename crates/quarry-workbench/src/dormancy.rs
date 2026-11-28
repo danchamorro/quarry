@@ -487,6 +487,7 @@ struct DormantDocument {
 
 #[derive(Clone)]
 struct PendingFilterRestore {
+    expected_tag: crate::document::FilterResultTag,
     filter_viewport_start: u64,
     scroll_points: f32,
     selection: Option<GridSelection>,
@@ -497,8 +498,12 @@ struct PendingFilterRestore {
 }
 
 impl PendingFilterRestore {
-    fn from_view(view: &DormantViewSnapshot) -> Self {
+    fn from_view(
+        view: &DormantViewSnapshot,
+        expected_tag: crate::document::FilterResultTag,
+    ) -> Self {
         Self {
+            expected_tag,
             filter_viewport_start: view.filter_viewport_start,
             scroll_points: view.scroll_points,
             selection: view.selection,
@@ -1678,11 +1683,11 @@ impl WorkbenchScheduler {
                     }
                 }
                 SlotResidency::Dormant(dormant) => {
-                    let saved_filter_restore = dormant
+                    let saved_filter_view = dormant
                         .view
                         .filter_query
                         .as_ref()
-                        .map(|_| PendingFilterRestore::from_view(&dormant.view));
+                        .map(|_| dormant.view.clone());
                     match wake_dormant_document(
                         id,
                         dormant,
@@ -1694,7 +1699,10 @@ impl WorkbenchScheduler {
                         Ok((mut doc, kind, conflict_notice, temp_dir_lease, job_lease)) => {
                             doc.document_id = Some(id);
                             let pending_filter_restore = if doc.filter_job.is_some() {
-                                saved_filter_restore
+                                let wake_tag = doc.current_filter_tag();
+                                saved_filter_view
+                                    .as_ref()
+                                    .map(|view| PendingFilterRestore::from_view(view, wake_tag))
                             } else {
                                 None
                             };
@@ -2074,8 +2082,8 @@ impl WorkbenchScheduler {
                     errors.push((id, err));
                 }
             }
-            if pending_filter_restore.is_some() {
-                if doc.filter_query.is_none() {
+            if let Some(expected_tag) = pending_filter_restore.as_ref().map(|p| p.expected_tag) {
+                if doc.filter_query.is_none() || doc.current_filter_tag() != expected_tag {
                     *pending_filter_restore = None;
                 } else if doc.filter_job.is_none() && !doc.filter_rows_loading() {
                     let has_matches = doc

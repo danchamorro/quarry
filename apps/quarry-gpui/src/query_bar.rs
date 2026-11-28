@@ -1,6 +1,6 @@
 //! Inline Filter Query Bar backed by `WorkbenchController` and `quarry_core::filter_expr`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use gpui_kit::component::{
@@ -30,7 +30,10 @@ struct QueryTabDraft {
     text: String,
     match_case: bool,
     live_override: Option<bool>,
-    last_synced_generation: u64,
+    draft_dirty: bool,
+    last_synced_query: Option<FilterQuery>,
+    last_synced_headers: Vec<String>,
+    print_omitted_reason: Option<String>,
 }
 
 pub struct QueryBar {
@@ -42,7 +45,10 @@ pub struct QueryBar {
     match_case: bool,
     live_mode: bool,
     live_override: Option<bool>,
-    last_synced_generation: u64,
+    draft_dirty: bool,
+    awaiting_apply_sync: bool,
+    last_synced_query: Option<FilterQuery>,
+    last_synced_headers: Vec<String>,
     draft_generation: u64,
     suppress_change: bool,
     parse_error: Option<FilterExprError>,
@@ -88,7 +94,10 @@ impl QueryBar {
             match_case: false,
             live_mode: true,
             live_override: None,
-            last_synced_generation: 0,
+            draft_dirty: false,
+            awaiting_apply_sync: false,
+            last_synced_query: None,
+            last_synced_headers: Vec::new(),
             draft_generation: 0,
             suppress_change: false,
             parse_error: None,
@@ -128,14 +137,17 @@ impl QueryBar {
     }
 
     pub fn clear_document(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.save_active_draft(cx);
         self.active_doc = None;
+        self.tab_drafts.clear();
         self.debounce_task = None;
         self.parse_error = None;
         self.print_omitted_reason = None;
         self.live_override = None;
         self.live_mode = true;
-        self.last_synced_generation = 0;
+        self.draft_dirty = false;
+        self.awaiting_apply_sync = false;
+        self.last_synced_query = None;
+        self.last_synced_headers.clear();
         self.set_input_silently("", window, cx);
         self.open = false;
         cx.notify();
@@ -147,11 +159,23 @@ impl QueryBar {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let open_tabs: HashSet<DocumentId> = self
+            .controller
+            .read(cx)
+            .tabs_for_window(self.window_id)
+            .into_iter()
+            .map(|tab| tab.id)
+            .collect();
         let doc_key = (info.document_id, info.instance_id);
         let doc_changed = self.active_doc != Some(doc_key);
         if doc_changed {
-            self.save_active_draft(cx);
+            if let Some((prev_id, _)) = self.active_doc
+                && open_tabs.contains(&prev_id)
+            {
+                self.save_active_draft(cx);
+            }
             self.debounce_task = None;
+            self.awaiting_apply_sync = false;
             self.active_doc = Some(doc_key);
             if let Some(saved) = self.tab_drafts.get(&info.document_id).cloned() {
                 self.live_override = saved.live_override;
@@ -159,7 +183,10 @@ impl QueryBar {
                     .live_override
                     .unwrap_or(info.default_live_filter_enabled);
                 self.match_case = saved.match_case;
-                self.last_synced_generation = saved.last_synced_generation;
+                self.draft_dirty = saved.draft_dirty;
+                self.last_synced_query = saved.last_synced_query;
+                self.last_synced_headers = saved.last_synced_headers;
+                self.print_omitted_reason = saved.print_omitted_reason;
                 self.set_input_silently(&saved.text, window, cx);
             } else {
                 self.live_override = None;
@@ -168,19 +195,37 @@ impl QueryBar {
                     .filter_query
                     .as_ref()
                     .is_some_and(|q| q.case_sensitivity == CaseSensitivity::Sensitive);
-                self.last_synced_generation = 0;
+                self.draft_dirty = false;
+                self.last_synced_query = None;
+                self.last_synced_headers = info.headers.clone();
+                self.print_omitted_reason = None;
                 self.set_input_silently("", window, cx);
             }
         } else if self.live_override.is_none() {
             self.live_mode = info.default_live_filter_enabled;
         }
+        self.tab_drafts.retain(|id, _| open_tabs.contains(id));
 
-        // Sync canonical expression whenever the document's active filter generation changes
-        // (from Query Bar apply, Filters popover, quick cell filter, Clear, or Reload).
-        if doc_changed || self.last_synced_generation != info.filter_query_generation {
-            let external_change = self.last_synced_generation != info.filter_query_generation;
-            self.last_synced_generation = info.filter_query_generation;
-            if external_change {
+        // Track applied query changes, header renames, and dirty drafts independently of
+        // `filter_query_generation` so cell-edit rescans never overwrite an unapplied draft
+        // while header renames refresh clean expressions and revalidate dirty drafts.
+        let query_changed = self.last_synced_query != info.filter_query;
+        let headers_changed = self.last_synced_headers != info.headers;
+        let force_apply_sync = self.awaiting_apply_sync && info.filter_query.is_some();
+        if doc_changed || query_changed || headers_changed || force_apply_sync {
+            self.last_synced_query = info.filter_query.clone();
+            self.last_synced_headers = info.headers.clone();
+            if force_apply_sync {
+                self.awaiting_apply_sync = false;
+            }
+            let should_sync_expression = if query_changed || force_apply_sync {
+                true
+            } else if headers_changed || doc_changed {
+                !self.draft_dirty && info.filter_query.is_some()
+            } else {
+                false
+            };
+            if should_sync_expression {
                 self.debounce_task = None;
                 self.print_omitted_reason = None;
                 match &info.filter_expression {
@@ -190,15 +235,23 @@ impl QueryBar {
                             .as_ref()
                             .is_some_and(|q| q.case_sensitivity == CaseSensitivity::Sensitive);
                         self.parse_error = None;
+                        self.draft_dirty = false;
                         self.set_input_silently(canonical, window, cx);
                     }
                     Some(Err(reason)) => {
+                        self.match_case = info
+                            .filter_query
+                            .as_ref()
+                            .is_some_and(|q| q.case_sensitivity == CaseSensitivity::Sensitive);
+                        self.parse_error = None;
+                        self.draft_dirty = false;
                         self.print_omitted_reason = Some(reason.clone());
+                        self.set_input_silently("", window, cx);
                     }
                     None => {
-                        // Only clear input text if it does not hold an in-progress invalid draft
-                        // or if the filter was actively cleared.
-                        if self.parse_error.is_none() {
+                        if query_changed {
+                            self.draft_dirty = false;
+                            self.parse_error = None;
                             self.set_input_silently("", window, cx);
                         }
                     }
@@ -217,7 +270,10 @@ impl QueryBar {
                     text: self.input.read(cx).value().to_string(),
                     match_case: self.match_case,
                     live_override: self.live_override,
-                    last_synced_generation: self.last_synced_generation,
+                    draft_dirty: self.draft_dirty,
+                    last_synced_query: self.last_synced_query.clone(),
+                    last_synced_headers: self.last_synced_headers.clone(),
+                    print_omitted_reason: self.print_omitted_reason.clone(),
                 },
             );
         }
@@ -256,7 +312,6 @@ impl QueryBar {
         match &result {
             Some(Ok(_)) => {
                 self.parse_error = None;
-                self.print_omitted_reason = None;
             }
             Some(Err(err)) => {
                 self.parse_error = Some(err.clone());
@@ -270,6 +325,7 @@ impl QueryBar {
 
     fn on_input_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.draft_generation = self.draft_generation.wrapping_add(1);
+        self.draft_dirty = true;
         self.debounce_task = None;
         self.print_omitted_reason = None;
 
@@ -309,6 +365,7 @@ impl QueryBar {
         }
         let target_doc = (info.document_id, info.instance_id);
         let target_edit_rev = info.edit_revision;
+        let target_query_gen = info.filter_query_generation;
         let target_draft = self.draft_generation;
 
         self.debounce_task = Some(cx.spawn_in(window, async move |this, cx| {
@@ -322,6 +379,7 @@ impl QueryBar {
                 };
                 if (current.document_id, current.instance_id) != target_doc
                     || current.edit_revision != target_edit_rev
+                    || current.filter_query_generation != target_query_gen
                     || current.busy
                     || current.export_running
                     || current.search_running
@@ -332,6 +390,7 @@ impl QueryBar {
                 match query {
                     Some(q) => {
                         if current.filter_query.as_ref() != Some(&q) {
+                            this.awaiting_apply_sync = true;
                             cx.emit(QueryBarEvent::Apply(q));
                         }
                     }
@@ -349,12 +408,18 @@ impl QueryBar {
         self.debounce_task = None;
         match self.revalidate_current(cx) {
             Some(Ok(query)) => {
+                self.awaiting_apply_sync = true;
                 cx.emit(QueryBarEvent::Apply(query));
             }
             Some(Err(_)) => {
                 // Keep inline diagnostic visible and leave any active filter undisturbed.
             }
             None => {
+                // Do not clear an active filter on bare Enter while its expression is omitted
+                // from the text field due to printer limits; require explicit Clear or new input.
+                if self.print_omitted_reason.is_some() {
+                    return;
+                }
                 let has_active_filter = self
                     .controller
                     .read(cx)
@@ -370,9 +435,12 @@ impl QueryBar {
 
     pub fn clear_now(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.debounce_task = None;
+        self.draft_dirty = false;
+        self.awaiting_apply_sync = false;
         self.parse_error = None;
         self.print_omitted_reason = None;
         self.set_input_silently("", window, cx);
+        self.input.update(cx, |input, cx| input.focus(window, cx));
         let has_active_filter = self
             .controller
             .read(cx)
@@ -434,6 +502,16 @@ impl QueryBar {
     pub(crate) fn live_mode_for_test(&self) -> bool {
         self.live_mode
     }
+
+    #[cfg(test)]
+    pub(crate) fn tab_draft_count_for_test(&self) -> usize {
+        self.tab_drafts.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn print_omitted_reason_for_test(&self) -> Option<&str> {
+        self.print_omitted_reason.as_deref()
+    }
 }
 
 fn format_inline_diagnostic(text: &str, err: &FilterExprError) -> String {
@@ -463,7 +541,9 @@ impl Render for QueryBar {
         let has_text = !text.trim().is_empty();
         let blocked =
             info.busy || info.export_running || info.search_running || info.source_changed;
-        let can_apply = !blocked && self.parse_error.is_none() && (has_text || info.filter_active);
+        let can_apply = !blocked
+            && self.parse_error.is_none()
+            && (has_text || (info.filter_active && self.print_omitted_reason.is_none()));
         let can_clear = !blocked && (has_text || info.filter_active);
         let diagnostic = self
             .parse_error
@@ -531,6 +611,7 @@ impl Render for QueryBar {
                             .checked(self.match_case)
                             .on_change(cx.listener(|this, checked, window, cx| {
                                 this.match_case = *checked;
+                                this.draft_dirty = true;
                                 this.draft_generation = this.draft_generation.wrapping_add(1);
                                 this.debounce_task = None;
                                 if let Some(Ok(query)) = this.revalidate_current(cx)

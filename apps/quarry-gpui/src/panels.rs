@@ -117,6 +117,9 @@ pub struct Panels {
     filter_active: bool,
     filter_running: bool,
     last_synced_filter: Option<(u64, u64)>,
+    latest_filter_key: Option<(u64, u64)>,
+    latest_filter_query: Option<FilterQuery>,
+    non_utf8_query_notice: bool,
     can_export_filtered: bool,
     export_running: bool,
     filter_status: Option<String>,
@@ -226,6 +229,9 @@ impl Panels {
             filter_active: false,
             filter_running: false,
             last_synced_filter: None,
+            latest_filter_key: None,
+            latest_filter_query: None,
+            non_utf8_query_notice: false,
             can_export_filtered: false,
             export_running: false,
             filter_status: None,
@@ -246,6 +252,10 @@ impl Panels {
         } else {
             if tool == Tool::Format {
                 self.restore_format(window, cx);
+            } else if tool == Tool::Filters && self.last_synced_filter != self.latest_filter_key {
+                let query = self.latest_filter_query.clone();
+                self.sync_rules_from_query(query.as_ref(), window, cx);
+                self.last_synced_filter = self.latest_filter_key;
             }
             self.active = Some(tool);
             cx.notify();
@@ -262,6 +272,9 @@ impl Panels {
             self.matches.clear();
             self.rules.clear();
             self.last_synced_filter = None;
+            self.latest_filter_key = None;
+            self.latest_filter_query = None;
+            self.non_utf8_query_notice = false;
             self.dirty = false;
             self.busy = false;
             self.live_watching = false;
@@ -326,11 +339,33 @@ impl Panels {
         let added_columns = self.path.as_ref() == Some(&info.path)
             && info.headers.len() > self.headers.len()
             && info.headers.starts_with(&self.headers);
+        let renamed_headers = self.path.as_ref() == Some(&info.path)
+            && info.headers.len() == self.headers.len()
+            && info.headers != self.headers;
         if added_columns {
             let previous_count = self.headers.len();
             self.headers = info.headers.clone();
             self.order.extend(previous_count..self.headers.len());
             self.shown.resize(self.headers.len(), true);
+            for rule in &self.rules {
+                let selected = *rule.column.read(cx).selected_value().unwrap_or(&0);
+                rule.column.update(cx, |state, cx| {
+                    state.set_items(
+                        choices(
+                            self.headers
+                                .iter()
+                                .enumerate()
+                                .map(|(source, name)| format!("{}: {}", source + 1, name)),
+                        ),
+                        window,
+                        cx,
+                    );
+                    state.set_selected_value(&selected, window, cx);
+                });
+            }
+            self.refresh_matches(cx);
+        } else if renamed_headers {
+            self.headers = info.headers.clone();
             for rule in &self.rules {
                 let selected = *rule.column.read(cx).selected_value().unwrap_or(&0);
                 rule.column.update(cx, |state, cx| {
@@ -367,6 +402,8 @@ impl Panels {
             self.refresh_matches(cx);
             self.rules.clear();
             self.match_case = false;
+            self.non_utf8_query_notice = false;
+            self.last_synced_filter = None;
             self.add_rule(window, cx);
         }
         if !self
@@ -394,11 +431,14 @@ impl Panels {
             self.refresh_matches(cx);
         }
         let filter_sync_key = (info.instance_id, info.filter_query_generation);
-        if self.last_synced_filter != Some(filter_sync_key) {
+        let query_changed = self.latest_filter_query != info.filter_query;
+        self.latest_filter_key = Some(filter_sync_key);
+        self.latest_filter_query = info.filter_query.clone();
+        if self.active != Some(Tool::Filters)
+            && (self.last_synced_filter != Some(filter_sync_key) || query_changed)
+        {
+            self.sync_rules_from_query(info.filter_query.as_ref(), window, cx);
             self.last_synced_filter = Some(filter_sync_key);
-            if self.active != Some(Tool::Filters) {
-                self.sync_rules_from_query(info.filter_query.as_ref(), window, cx);
-            }
         }
         cx.notify();
     }
@@ -410,21 +450,27 @@ impl Panels {
         cx: &mut Context<Self>,
     ) {
         let Some(query) = query else {
+            self.non_utf8_query_notice = false;
             self.rules.clear();
             self.match_case = false;
             self.add_rule(window, cx);
             return;
         };
-        // Only mirror into UTF-8 rule inputs when every predicate payload is valid UTF-8
-        // (non-UTF-8 byte predicates stay lossless in the Query Bar via `\xHH`).
+        // Non-UTF-8 byte predicates cannot be edited losslessly in UTF-8 rule textboxes:
+        // clear stale rules and display an explicit banner directing the user to the Query Bar.
         if query.predicates.iter().any(|p| {
             std::str::from_utf8(&p.value).is_err()
                 || p.upper_bound
                     .as_deref()
                     .is_some_and(|u| std::str::from_utf8(u).is_err())
         }) {
+            self.non_utf8_query_notice = true;
+            self.rules.clear();
+            self.match_case = query.case_sensitivity == CaseSensitivity::Sensitive;
+            self.add_rule(window, cx);
             return;
         }
+        self.non_utf8_query_notice = false;
         self.rules.clear();
         self.match_case = query.case_sensitivity == CaseSensitivity::Sensitive;
         for predicate in &query.predicates {
@@ -451,6 +497,11 @@ impl Panels {
     #[cfg(test)]
     pub(crate) fn synced_query_for_test(&self, cx: &App) -> FilterQuery {
         self.query(cx)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_non_utf8_query_notice_for_test(&self) -> bool {
+        self.non_utf8_query_notice
     }
 
     pub fn close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1042,6 +1093,16 @@ impl Panels {
                     .text_size(px(12.))
                     .child("Choose which rows stay in view."),
             )
+            .when(self.non_utf8_query_notice, |this| {
+                this.child(
+                    div()
+                        .id("filter-non-utf8-notice")
+                        .role(Role::Status)
+                        .text_size(px(12.))
+                        .text_color(cx.theme().warning_foreground)
+                        .child("Active filter contains raw non-UTF-8 bytes; edit it in the Query Bar or enter new rules here to replace it."),
+                )
+            })
             .child(
                 div()
                     .flex()

@@ -3713,8 +3713,8 @@ impl WorkbenchController {
         if let Some(doc) = self.active_document_mut(window) {
             if doc.export_job.is_some() {
                 doc.cancel_filtered_export();
-            } else if let Some(job) = doc.filter_job.as_ref() {
-                job.cancel();
+            } else if doc.filter_job.is_some() || doc.live_watch_filter_attach.is_some() {
+                doc.cancel_filter();
             }
             let _ = self.scheduler.sync_fd_leases();
             cx.notify();
