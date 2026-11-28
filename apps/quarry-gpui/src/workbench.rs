@@ -18,17 +18,18 @@ use quarry_workbench::compressed::{
     DecompressionStatus, decompression_status, gzip_destination_warning,
 };
 use quarry_workbench::{
-    AppMessage, CombineWorkflow, CommandContext, CommandId, CommandResolution,
-    DEFAULT_NOFILE_TARGET, DelimiterMode, Document, DocumentId, EffectiveWordWrap, FailedOpen,
-    GridSelection, HudAnnouncement, HudAnnouncementTracker, HudIndexPhase, InspectWorkflow,
-    JOIN_INPUT_RESERVED, JoinWorkflow, MessageSeverity, OmarchyThemeWatcher, Palette,
-    ResidencyState, ResolvedTheme, ResourceHudSample, ResourceHudSampler, ResourceHudTargets,
-    SchedulerError, SelectionModifiers, StoragePreferences, StructuralDialog, StructuralJob,
-    ThemeAppearance, ThemePreference, ThemePreferences, WakeOutcome, WindowId, WordWrapPreferences,
-    WordWrapToggleOutcome, WorkbenchScheduler, WorkbenchSchedulerConfig, WorkbenchTab,
-    clear_index_cache_summary, evaluate_command, inspect_temporary_storage,
-    materialization_progress, omarchy_theme_fingerprint, resolve_theme, resolve_word_wrap,
-    select_column, sort_progress, whitespace,
+    AppMessage, CellCoord, CombineWorkflow, CommandContext, CommandId, CommandResolution,
+    CommandTarget, DEFAULT_NOFILE_TARGET, DelimiterMode, Document, DocumentId, EffectiveWordWrap,
+    FailedOpen, GridSelection, HudAnnouncement, HudAnnouncementTracker, HudIndexPhase,
+    InspectWorkflow, JOIN_INPUT_RESERVED, JoinWorkflow, MessageSeverity, OmarchyThemeWatcher,
+    Palette, ResidencyState, ResolvedTheme, ResourceHudSample, ResourceHudSampler,
+    ResourceHudTargets, SchedulerError, SelectionModifiers, StoragePreferences, StructuralDialog,
+    StructuralJob, ThemeAppearance, ThemePreference, ThemePreferences, VimMotionPreferences,
+    WakeOutcome, WindowId, WordWrapPreferences, WordWrapToggleOutcome, WorkbenchScheduler,
+    WorkbenchSchedulerConfig, WorkbenchTab, clear_index_cache_summary, command_disabled_reason,
+    evaluate_command, inspect_temporary_storage, materialization_progress,
+    omarchy_theme_fingerprint, resolve_theme, resolve_word_wrap, select_column, sort_progress,
+    whitespace,
 };
 
 /// Shared global concurrency cap across document saves, exports, structural edits, decompressions,
@@ -353,6 +354,7 @@ pub struct WorkbenchController {
     pending_reveal_cells: BTreeMap<DocumentId, (u64, usize)>,
     whitespace_prefs: whitespace::Preferences,
     word_wrap_prefs: WordWrapPreferences,
+    vim_prefs: VimMotionPreferences,
     window_messages: BTreeMap<WindowId, AppMessage>,
     pending_review: Option<PendingReviewScope>,
     active_review_token: Option<u64>,
@@ -480,6 +482,7 @@ impl WorkbenchController {
             pending_reveal_cells: BTreeMap::new(),
             whitespace_prefs: whitespace::Preferences::load(None),
             word_wrap_prefs: WordWrapPreferences::load(None),
+            vim_prefs: VimMotionPreferences::load(None),
             window_messages: BTreeMap::new(),
             pending_review: None,
             active_review_token: None,
@@ -507,6 +510,7 @@ impl WorkbenchController {
         let theme_prefs = ThemePreferences::load_default();
         let whitespace_prefs = whitespace::Preferences::application();
         let word_wrap_prefs = WordWrapPreferences::application();
+        let vim_prefs = VimMotionPreferences::application();
         let theme_home = std::env::var_os("HOME").map(PathBuf::from);
         let config = WorkbenchSchedulerConfig {
             defer_gzip_decompression: true,
@@ -516,6 +520,7 @@ impl WorkbenchController {
             Self::new_with_all_prefs(config, storage_prefs, theme_prefs, theme_home)
                 .with_whitespace_prefs(whitespace_prefs)
                 .with_word_wrap_prefs(word_wrap_prefs)
+                .with_vim_prefs(vim_prefs)
         });
         cx.set_global(WorkbenchGlobal(entity.clone()));
         Self::attach_coordinator(&entity, cx);
@@ -1172,6 +1177,46 @@ impl WorkbenchController {
         self
     }
 
+    pub fn with_vim_prefs(mut self, prefs: VimMotionPreferences) -> Self {
+        self.vim_prefs = prefs;
+        self
+    }
+
+    #[cfg(test)]
+    pub fn set_vim_prefs_for_test(&mut self, prefs: VimMotionPreferences) {
+        self.vim_prefs = prefs;
+    }
+
+    pub fn vim_motions_enabled(&self) -> bool {
+        self.vim_prefs.enabled
+    }
+
+    pub fn toggle_vim_motions(
+        &mut self,
+        window: WindowId,
+        cx: &mut Context<Self>,
+    ) -> (bool, Option<String>) {
+        let next = !self.vim_prefs.enabled;
+        let warning = self
+            .vim_prefs
+            .set_enabled(next)
+            .err()
+            .map(|error| format!("Could not save Vim motions preference: {error}"));
+        self.last_hud_announcement.insert(
+            window,
+            HudAnnouncement {
+                text: if next {
+                    "Vim motions on".into()
+                } else {
+                    "Vim motions off".into()
+                },
+                is_alert: false,
+            },
+        );
+        cx.notify();
+        (next, warning)
+    }
+
     pub fn word_wrap_auto_disable_bytes(&self) -> u64 {
         self.word_wrap_prefs.auto_disable_bytes
     }
@@ -1398,6 +1443,163 @@ impl WorkbenchController {
             show_all_whitespace: self.whitespace_prefs.show_all,
         };
         evaluate_command(command, &ctx)
+    }
+
+    /// Evaluates a Command Palette item against the invoking `(window, captured_doc)` context.
+    ///
+    /// Invalidates all document-scoped commands whenever `captured_doc` no longer matches the
+    /// window's active document (including `None` -> `Some(new_doc)`), preventing stale palette
+    /// invocations from reading or mutating a different tab.
+    pub fn evaluate_command_for_captured_document(
+        &self,
+        window: WindowId,
+        captured_doc: Option<DocumentId>,
+        command: CommandId,
+    ) -> (bool, Option<&'static str>) {
+        let active_doc = self.scheduler.active_document(window);
+        let fallback = WorkbenchTab::new(0);
+        if captured_doc != active_doc {
+            let ctx = CommandContext {
+                window,
+                active_tab: &fallback,
+                open_document_count: self.scheduler.tabs_in_window(window).len(),
+                write_slot_available: self.write_slot_available(),
+                external_modal_blocked: false,
+                text_field_focused: false,
+                show_all_whitespace: self.whitespace_prefs.show_all,
+            };
+            let res = evaluate_command(command, &ctx);
+            let word_wrap_targets_tab = command == CommandId::ToggleWordWrap
+                && [active_doc, captured_doc]
+                    .into_iter()
+                    .flatten()
+                    .any(|doc_id| {
+                        self.scheduler.tab(doc_id).is_some_and(|tab| {
+                            tab.word_wrap_override.is_some()
+                                || matches!(
+                                    resolve_word_wrap(
+                                        &self.word_wrap_prefs,
+                                        tab.word_wrap_override,
+                                        tab.document.as_ref().map(|d| d.session.active_byte_len()),
+                                    ),
+                                    EffectiveWordWrap::AutoDisabled { .. }
+                                )
+                        })
+                    });
+            let is_app_or_window = !word_wrap_targets_tab
+                && matches!(
+                    res.target,
+                    Some(CommandTarget::Application | CommandTarget::Window(_))
+                );
+            if !is_app_or_window {
+                return (false, Some("The target tab is no longer active"));
+            }
+            let reason = (!res.enabled)
+                .then(|| command_disabled_reason(command, &ctx))
+                .flatten();
+            return (res.enabled, reason);
+        }
+
+        let active_tab = captured_doc
+            .and_then(|id| self.scheduler.tab(id))
+            .unwrap_or(&fallback);
+        let ctx = CommandContext {
+            window,
+            active_tab,
+            open_document_count: self.scheduler.tabs_in_window(window).len(),
+            write_slot_available: self.write_slot_available(),
+            external_modal_blocked: false,
+            text_field_focused: false,
+            show_all_whitespace: self.whitespace_prefs.show_all,
+        };
+        let res = evaluate_command(command, &ctx);
+        if active_tab.document.is_none()
+            && !matches!(
+                res.target,
+                Some(CommandTarget::Application | CommandTarget::Window(_))
+            )
+        {
+            return (false, Some("Open a file first"));
+        }
+        let reason = (!res.enabled)
+            .then(|| command_disabled_reason(command, &ctx))
+            .flatten();
+        (res.enabled, reason)
+    }
+
+    /// Returns `(headers, hidden_flags, available_rows)` for `doc_id` if it is active in `window`.
+    pub fn jump_info_for_document(
+        &self,
+        window: WindowId,
+        doc_id: DocumentId,
+    ) -> Option<(Vec<String>, Vec<bool>, u64)> {
+        if self.scheduler.active_document(window) != Some(doc_id) {
+            return None;
+        }
+        let doc = self.scheduler.tab(doc_id)?.document.as_ref()?;
+        let width = doc.total_columns;
+        let headers = (0..width).map(|col| doc.column_name(col)).collect();
+        let hidden = (0..width)
+            .map(|col| doc.columns.hidden.get(col).copied().unwrap_or(false))
+            .collect();
+        Some((headers, hidden, doc.grid_total_rows()))
+    }
+
+    /// Auto-shows hidden `source_col` if needed on the captured `(window, doc_id)` and returns
+    /// `(table_col_1based, was_hidden, column_name)`.
+    pub fn jump_to_source_column_active(
+        &mut self,
+        window: WindowId,
+        doc_id: DocumentId,
+        source_col: usize,
+        cx: &mut Context<Self>,
+    ) -> Result<(usize, bool, String), String> {
+        if self.scheduler.active_document(window) != Some(doc_id) {
+            return Err("The target tab is no longer active.".into());
+        }
+        let Some(doc) = self
+            .scheduler
+            .tab_mut(doc_id)
+            .and_then(|tab| tab.document.as_mut())
+        else {
+            return Err("Open a file first.".into());
+        };
+        let Some((display_col_idx, was_hidden)) = doc.reveal_column(source_col) else {
+            return Err(format!("Column #{} is outside this file.", source_col + 1));
+        };
+        let name = doc.column_name(source_col);
+        if let Some(coord) = doc.cursor.active() {
+            doc.cursor
+                .move_to(CellCoord::new(coord.row, source_col), false);
+            doc.selection = doc.cursor.as_grid_selection();
+        }
+        cx.notify();
+        Ok((display_col_idx + 1, was_hidden, name))
+    }
+
+    /// Validates a 1-based visible display row jump for captured `(window, doc_id)` and returns the
+    /// 0-based table row index.
+    pub fn jump_to_display_row_active(
+        &self,
+        window: WindowId,
+        doc_id: DocumentId,
+        row_1based: u64,
+    ) -> Result<usize, String> {
+        if self.scheduler.active_document(window) != Some(doc_id) {
+            return Err("The target tab is no longer active.".into());
+        }
+        let Some(doc) = self
+            .scheduler
+            .tab(doc_id)
+            .and_then(|tab| tab.document.as_ref())
+        else {
+            return Err("Open a file first.".into());
+        };
+        let limit = doc.grid_total_rows();
+        if row_1based == 0 || row_1based > limit {
+            return Err(format!("Enter a row from 1 to {limit}."));
+        }
+        usize::try_from(row_1based - 1).map_err(|_| "Row number is too large to display.".into())
     }
 
     pub fn active_snapshot(&self, window: WindowId) -> Option<DocumentSnapshot> {
@@ -2146,6 +2348,7 @@ impl WorkbenchController {
     pub fn set_active_selection(&mut self, window: WindowId, selection: Option<GridSelection>) {
         if let Some(doc) = self.active_document_mut(window) {
             doc.selection = selection;
+            doc.cursor.sync_from_grid_selection(selection);
         }
     }
 
@@ -2158,6 +2361,7 @@ impl WorkbenchController {
     ) {
         if let Some(doc) = self.active_document_mut(window) {
             doc.selection = target.map(|(row, column)| GridSelection::Cell { row, column });
+            doc.cursor.sync_from_grid_selection(doc.selection);
             if target.is_some() {
                 doc.clear_row_selection();
                 doc.selected_columns.clear();
@@ -2165,6 +2369,44 @@ impl WorkbenchController {
             }
             cx.notify();
         }
+    }
+
+    /// Selects a data cell by display `(table_row, display_col_idx)` in O(1), syncing `doc.cursor`
+    /// and `doc.selection` immediately even before an out-of-buffer row finishes loading.
+    pub fn select_display_cell_active(
+        &mut self,
+        window: WindowId,
+        table_row: usize,
+        display_col_idx: usize,
+        cx: &mut Context<Self>,
+    ) -> Option<(u64, usize)> {
+        let doc = self.active_document_mut(window)?;
+        let source_col = *doc.columns.visible.get(display_col_idx)?;
+        let source_row = if doc.filter_active() {
+            let rel = (table_row as u64).checked_sub(doc.filter_buffer_start)?;
+            let idx = usize::try_from(rel).ok()?;
+            doc.filtered_rows.get(idx).map(|m| m.row)
+        } else {
+            doc.data_start.checked_add(table_row as u64)
+        };
+        if let Some(src_row) = source_row {
+            doc.cursor
+                .move_to(CellCoord::new(src_row, source_col), false);
+            doc.selection = Some(GridSelection::Cell {
+                row: src_row,
+                column: source_col,
+            });
+            doc.clear_row_selection();
+            doc.selected_columns.clear();
+            doc.column_selection_anchor = None;
+            cx.notify();
+            return Some((src_row, source_col));
+        }
+        None
+    }
+
+    pub fn active_cursor(&self, window: WindowId) -> Option<CellCoord> {
+        self.active_document(window)?.cursor.active()
     }
 
     pub fn active_selection(&self, window: WindowId) -> Option<GridSelection> {
@@ -3398,6 +3640,7 @@ impl WorkbenchController {
                     doc.column_selection_anchor = None;
                 }
             }
+            doc.cursor.sync_from_grid_selection(doc.selection);
             cx.notify();
         }
     }
@@ -3406,6 +3649,7 @@ impl WorkbenchController {
     pub fn clear_selection_active(&mut self, window: WindowId, cx: &mut Context<Self>) {
         if let Some(doc) = self.active_document_mut(window) {
             doc.selection = None;
+            doc.cursor.clear();
             doc.clear_row_selection();
             doc.selected_columns.clear();
             doc.column_selection_anchor = None;
@@ -3431,6 +3675,7 @@ impl WorkbenchController {
                     .select(source_row, SelectionModifiers::NONE);
             }
             doc.selection = Some(GridSelection::Row { row: source_row });
+            doc.cursor.select_row(source_row);
             doc.selected_columns.clear();
             doc.column_selection_anchor = None;
             cx.notify();
@@ -3457,6 +3702,7 @@ impl WorkbenchController {
                     .select(source_row, SelectionModifiers::NONE);
             }
             doc.selection = Some(GridSelection::Row { row: source_row });
+            doc.cursor.sync_from_grid_selection(doc.selection);
             doc.selected_columns.clear();
             doc.column_selection_anchor = None;
             cx.notify();
@@ -3487,6 +3733,7 @@ impl WorkbenchController {
                 },
             );
             doc.selection = None;
+            doc.cursor.clear();
             doc.clear_row_selection();
             cx.notify();
         }
@@ -3510,6 +3757,7 @@ impl WorkbenchController {
                 doc.column_selection_anchor = Some(source_col);
             }
             doc.selection = None;
+            doc.cursor.clear();
             doc.clear_row_selection();
             cx.notify();
         }

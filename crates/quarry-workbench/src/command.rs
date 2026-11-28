@@ -74,6 +74,7 @@ pub enum CommandId {
     Save,
     SaveAs,
     SaveAsUtf8,
+    ExportFiltered,
     DiscardChanges,
     TemporaryStorage,
     InspectFile,
@@ -83,16 +84,37 @@ pub enum CommandId {
     Copy,
     Paste,
     SelectAll,
+    EditCell,
+    RenameHeader,
     Find,
+    FindNext,
+    FindPrevious,
+    Replace,
+    ToggleQueryBar,
+    OpenCommandPalette,
+    GoToRowOrColumn,
+    ToggleVimMotions,
     ToggleBookmark,
     NextBookmark,
     PreviousBookmark,
     ClearBookmarks,
     ToggleBookmarksPanel,
+    SortRows,
+    FindDuplicates,
+    CleanupColumns,
     InsertRows,
     InsertColumns,
+    DeleteSelectedRows,
+    DeleteSelectedColumns,
+    MoveColumns,
+    SplitColumn,
+    CombineColumns,
     ShowAllWhitespace,
     ToggleWordWrap,
+    ThemeSystem,
+    ThemeLight,
+    ThemeDark,
+    ThemeOmarchy,
     Columns,
     Filters,
     PauseResumeIndexing,
@@ -204,12 +226,18 @@ pub fn evaluate_command(command: CommandId, ctx: &CommandContext<'_>) -> Command
         | CommandId::JoinFiles
         | CommandId::ShowAllWhitespace
         | CommandId::ToggleWordWrap
+        | CommandId::ToggleVimMotions
+        | CommandId::ThemeSystem
+        | CommandId::ThemeLight
+        | CommandId::ThemeDark
+        | CommandId::ThemeOmarchy
         | CommandId::Quit
         | CommandId::UserGuide
         | CommandId::ReportIssue => Some(CommandTarget::Application),
-        CommandId::CloseWindow | CommandId::NextTab | CommandId::PreviousTab => {
-            Some(CommandTarget::Window(ctx.window))
-        }
+        CommandId::CloseWindow
+        | CommandId::NextTab
+        | CommandId::PreviousTab
+        | CommandId::OpenCommandPalette => Some(CommandTarget::Window(ctx.window)),
         CommandId::TemporaryStorage | CommandId::InspectFile | CommandId::KeepEditing => {
             doc_target.or(Some(CommandTarget::Window(ctx.window)))
         }
@@ -223,6 +251,7 @@ pub fn evaluate_command(command: CommandId, ctx: &CommandContext<'_>) -> Command
         | CommandId::Save
         | CommandId::SaveAs
         | CommandId::SaveAsUtf8
+        | CommandId::ExportFiltered
         | CommandId::DiscardChanges
         | CommandId::Undo
         | CommandId::Redo
@@ -230,14 +259,29 @@ pub fn evaluate_command(command: CommandId, ctx: &CommandContext<'_>) -> Command
         | CommandId::Copy
         | CommandId::Paste
         | CommandId::SelectAll
+        | CommandId::EditCell
+        | CommandId::RenameHeader
         | CommandId::Find
+        | CommandId::FindNext
+        | CommandId::FindPrevious
+        | CommandId::Replace
+        | CommandId::ToggleQueryBar
+        | CommandId::GoToRowOrColumn
         | CommandId::ToggleBookmark
         | CommandId::NextBookmark
         | CommandId::PreviousBookmark
         | CommandId::ClearBookmarks
         | CommandId::ToggleBookmarksPanel
+        | CommandId::SortRows
+        | CommandId::FindDuplicates
+        | CommandId::CleanupColumns
         | CommandId::InsertRows
         | CommandId::InsertColumns
+        | CommandId::DeleteSelectedRows
+        | CommandId::DeleteSelectedColumns
+        | CommandId::MoveColumns
+        | CommandId::SplitColumn
+        | CommandId::CombineColumns
         | CommandId::Columns
         | CommandId::Filters
         | CommandId::PauseResumeIndexing
@@ -280,6 +324,11 @@ pub fn evaluate_command(command: CommandId, ctx: &CommandContext<'_>) -> Command
             | CommandId::SelectAll
             | CommandId::ShowAllWhitespace
             | CommandId::ToggleWordWrap
+            | CommandId::ToggleVimMotions
+            | CommandId::ThemeSystem
+            | CommandId::ThemeLight
+            | CommandId::ThemeDark
+            | CommandId::ThemeOmarchy
             | CommandId::Quit
             | CommandId::UserGuide
             | CommandId::ReportIssue => CommandResolution {
@@ -297,6 +346,16 @@ pub fn evaluate_command(command: CommandId, ctx: &CommandContext<'_>) -> Command
     let filter_active = document.is_some_and(Document::filter_active);
     let insertion =
         |rows| document.is_some_and(|document| document.insertion_disabled_reason(rows).is_none());
+    let structural_ready = document.is_some_and(|doc| {
+        doc.structural_edit_disabled_reason().is_none()
+            && doc.structural_job.is_none()
+            && doc.pending_materialization.is_none()
+    });
+    let row_structural_ready = document.is_some_and(|doc| {
+        doc.row_structural_edit_disabled_reason().is_none()
+            && doc.structural_job.is_none()
+            && doc.pending_materialization.is_none()
+    });
     let available = match command {
         CommandId::About
         | CommandId::NewWindow
@@ -305,12 +364,18 @@ pub fn evaluate_command(command: CommandId, ctx: &CommandContext<'_>) -> Command
         | CommandId::OpenWithEncoding(_)
         | CommandId::JoinFiles
         | CommandId::CloseWindow
+        | CommandId::OpenCommandPalette
         | CommandId::Cut
         | CommandId::Copy
         | CommandId::Paste
         | CommandId::SelectAll
         | CommandId::ShowAllWhitespace
         | CommandId::ToggleWordWrap
+        | CommandId::ToggleVimMotions
+        | CommandId::ThemeSystem
+        | CommandId::ThemeLight
+        | CommandId::ThemeDark
+        | CommandId::ThemeOmarchy
         | CommandId::Quit
         | CommandId::UserGuide
         | CommandId::ReportIssue => true,
@@ -318,22 +383,46 @@ pub fn evaluate_command(command: CommandId, ctx: &CommandContext<'_>) -> Command
         CommandId::CloseTab
         | CommandId::MoveTabToNewWindow
         | CommandId::Columns
-        | CommandId::Filters => open,
+        | CommandId::Filters
+        | CommandId::ToggleQueryBar
+        | CommandId::GoToRowOrColumn => open,
         CommandId::ReloadFromDisk => files.reload,
         CommandId::Save => files.save,
         CommandId::SaveAs => files.save_as,
         CommandId::SaveAsUtf8 => files.save_as_utf8,
+        CommandId::ExportFiltered => document.is_some_and(Document::is_filtered_export_ready),
         CommandId::DiscardChanges => files.discard,
         CommandId::InspectFile => files.inspect,
         CommandId::TemporaryStorage => files.temporary_storage,
         CommandId::Undo => ctx.text_field_focused || document.is_some_and(Document::can_undo),
         CommandId::Redo => ctx.text_field_focused || document.is_some_and(Document::can_redo),
-        CommandId::Find => open && !filter_active,
+        CommandId::EditCell => {
+            document.is_some_and(|doc| !doc.source_changed && !doc.is_live_watching())
+        }
+        CommandId::RenameHeader => document.is_some_and(|doc| {
+            doc.session.dialect.has_header && !doc.source_changed && !doc.is_live_watching()
+        }),
+        CommandId::Find | CommandId::FindNext | CommandId::FindPrevious | CommandId::Replace => {
+            open && !filter_active
+        }
         CommandId::ToggleBookmark => document.is_some_and(Document::can_toggle_bookmark),
         CommandId::NextBookmark | CommandId::PreviousBookmark | CommandId::ClearBookmarks => {
             document.is_some_and(|doc| !doc.source_changed && !doc.bookmarks.is_empty())
         }
         CommandId::ToggleBookmarksPanel => open,
+        CommandId::SortRows | CommandId::FindDuplicates => structural_ready,
+        CommandId::CleanupColumns | CommandId::MoveColumns | CommandId::DeleteSelectedColumns => {
+            structural_ready && document.is_some_and(|doc| !doc.selected_columns.is_empty())
+        }
+        CommandId::SplitColumn => {
+            structural_ready && document.is_some_and(|doc| doc.selected_columns.len() == 1)
+        }
+        CommandId::CombineColumns => {
+            structural_ready && document.is_some_and(|doc| doc.selected_columns.len() >= 2)
+        }
+        CommandId::DeleteSelectedRows => {
+            row_structural_ready && document.is_some_and(|doc| doc.selected_row_count() > 0)
+        }
         CommandId::InsertRows => insertion(true),
         CommandId::InsertColumns => insertion(false),
         CommandId::PauseResumeIndexing => {
@@ -353,6 +442,79 @@ pub fn evaluate_command(command: CommandId, ctx: &CommandContext<'_>) -> Command
         enabled: available,
         target,
     }
+}
+
+/// Returns a brief plain-English reason when `command` is disabled in `ctx`.
+pub fn command_disabled_reason(
+    command: CommandId,
+    ctx: &CommandContext<'_>,
+) -> Option<&'static str> {
+    if evaluate_command(command, ctx).enabled {
+        return None;
+    }
+    if ctx.modal_blocked() {
+        return Some("Finish the active dialog first");
+    }
+    let Some(doc) = ctx.active_tab.document.as_ref() else {
+        return match command {
+            CommandId::NextTab | CommandId::PreviousTab => Some("Open at least two tabs"),
+            CommandId::CombineFiles => Some("Another file write is in progress"),
+            _ => Some("Open a file first"),
+        };
+    };
+    Some(match command {
+        CommandId::Find | CommandId::FindNext | CommandId::FindPrevious | CommandId::Replace
+            if doc.filter_active() =>
+        {
+            "Clear the active filter first"
+        }
+        CommandId::Save => "No unsaved changes or save unavailable",
+        CommandId::SaveAsUtf8 => "File is already UTF-8 or busy",
+        CommandId::ExportFiltered => {
+            if !doc.filter_active() {
+                "Apply a filter first"
+            } else if doc.filter_paused_row_limit.is_some() {
+                "Resume indexing before exporting filtered rows"
+            } else if doc.filter_job.is_some() || doc.filter_refresh_pending {
+                "Wait for the active filter to finish"
+            } else if doc.filter_progress.is_some_and(|p| p.cancelled) {
+                "Reapply the cancelled filter before exporting"
+            } else if doc.export_job.is_some() || doc.save_job.is_some() {
+                "Wait for the active file operation to finish"
+            } else if doc.is_live_watching() {
+                "Stop Live Watch before exporting filtered rows"
+            } else if doc.source_changed {
+                "Reload the changed file before exporting"
+            } else {
+                "Filtered export is unavailable right now"
+            }
+        }
+        CommandId::DiscardChanges => "No unsaved changes",
+        CommandId::Undo => "Nothing to undo",
+        CommandId::Redo => "Nothing to redo",
+        CommandId::NextBookmark | CommandId::PreviousBookmark | CommandId::ClearBookmarks => {
+            "No bookmarks in this tab"
+        }
+        CommandId::DeleteSelectedRows => {
+            if let Some(reason) = doc.row_structural_edit_disabled_reason() {
+                reason
+            } else if doc.selected_row_count() == 0 {
+                "Select one or more rows first"
+            } else {
+                "Unavailable right now"
+            }
+        }
+        CommandId::CleanupColumns | CommandId::MoveColumns | CommandId::DeleteSelectedColumns => {
+            "Select one or more columns first"
+        }
+        CommandId::SplitColumn => "Select exactly one column first",
+        CommandId::CombineColumns => "Select two or more columns first",
+        CommandId::RenameHeader if !doc.session.dialect.has_header => "File has no header row",
+        CommandId::PauseResumeIndexing => "Indexing is already complete",
+        CommandId::VerifySectionBoundary => "Available only for bounded section tabs",
+        CommandId::NextTab | CommandId::PreviousTab => "Open at least two tabs",
+        _ => "Unavailable right now",
+    })
 }
 
 /// Outcome of executing a close-lifecycle command (`CloseTab`, `KeepEditing`, `DiscardAndClose`)

@@ -5,9 +5,9 @@ use gpui_kit::component::Root;
 use gpui_kit::component::table::TableDelegate;
 use gpui_kit::test::TestWindowExt;
 use gpui_kit::{
-    App, AppContext, ClipboardItem, Entity, Focusable, InputEvent, Modifiers, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, ScrollDelta, ScrollEvent, TestAppContext,
-    TouchPhase, Window, WindowHandle, point, px, size,
+    App, AppContext, ClipboardItem, Entity, Focusable, InputEvent, KeyDownEvent, Keystroke,
+    Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ScrollDelta, ScrollEvent,
+    TestAppContext, TouchPhase, Window, WindowHandle, point, px, size,
 };
 use quarry_core::{HeaderMode, OpenOptions};
 use quarry_workbench::{ResidencyState, WorkbenchSchedulerConfig};
@@ -5835,5 +5835,1200 @@ fn query_bar_applies_syncs_rules_isolates_tabs_and_preserves_active_filter_on_er
     .unwrap();
     wait_for_ui(cx, win, &controller, &view, |q, _, cx| {
         q.snapshot(cx).is_some_and(|s| !s.filter_active)
+    });
+}
+
+fn setup_window(
+    cx: &mut TestAppContext,
+    paths: Vec<std::path::PathBuf>,
+) -> (
+    Entity<WorkbenchController>,
+    WindowHandle<Root>,
+    Entity<QuarryWindow>,
+) {
+    let controller = init_test_app(cx);
+    let (win, view) = open_test_window(cx, &controller);
+    cx.update_window(win.into(), |_, window, cx| {
+        view.update(cx, |q, cx| {
+            q.open_paths_direct(paths, OpenOptions::default(), None, window, cx);
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+    (controller, win, view)
+}
+
+#[gpui_kit::test]
+fn native_arrow_cursor_navigation_across_filtered_rows_and_shown_columns(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("nav.csv");
+    let mut csv = String::from("id,hidden_col,state,amount,note\n");
+    for row in 1..=12 {
+        let state = if row % 4 == 0 { "TX" } else { "NY" };
+        csv.push_str(&format!("{row},skip{row},{state},{},row-{row}\n", row * 10));
+    }
+    std::fs::write(&path, csv).unwrap();
+
+    let (controller, win, view) = setup_window(cx, vec![path]);
+    let win_id = cx.update(|cx| view.read(cx).window_id);
+    wait_for_ui(cx, win, &controller, &view, |q, _, cx| {
+        q.snapshot(cx)
+            .is_some_and(|s| s.index_done && s.available_rows == 12)
+    });
+
+    // Hide source column 1 (`hidden_col`) so shown columns are [0, 2, 3, 4].
+    cx.update_window(win.into(), |_, window, cx| {
+        controller.update(cx, |c, cx| {
+            c.set_active_shown_columns(win_id, vec![0, 2, 3, 4], cx);
+        });
+        view.update(cx, |q, cx| {
+            q.sync_from_controller(window, cx);
+            q.table.focus_handle(cx).focus(window, cx);
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    let dispatch_grid_key = |cx: &mut TestAppContext, key: &str, mods: Modifiers| {
+        cx.dispatch_keystroke(
+            win.into(),
+            Keystroke {
+                modifiers: mods,
+                key: key.to_owned(),
+                key_char: None,
+            },
+        );
+        cx.run_until_parked();
+        cx.update_window(win.into(), |_, window, cx| {
+            window.render_frame(cx);
+        })
+        .unwrap();
+    };
+
+    // First down initializes cursor at display (0, 0) -> table cell (0, 1), source col 0 (`id`).
+    dispatch_grid_key(cx, "down", Modifiers::default());
+    cx.update(|cx| {
+        assert_eq!(view.read(cx).table.read(cx).selected_cell(), Some((0, 1)));
+        assert_eq!(
+            controller.read(cx).active_cursor(win_id),
+            Some(quarry_workbench::CellCoord::new(1, 0))
+        );
+    });
+
+    // Right skips hidden column 1 and lands on source column 2 (`state`), table col 2.
+    dispatch_grid_key(cx, "right", Modifiers::default());
+    cx.update(|cx| {
+        assert_eq!(view.read(cx).table.read(cx).selected_cell(), Some((0, 2)));
+        assert_eq!(
+            controller.read(cx).active_cursor(win_id),
+            Some(quarry_workbench::CellCoord::new(1, 2))
+        );
+    });
+
+    // End jumps to last shown column (`note`, source col 4, table col 4); Home returns to col 0.
+    dispatch_grid_key(cx, "end", Modifiers::default());
+    cx.update(|cx| {
+        assert_eq!(view.read(cx).table.read(cx).selected_cell(), Some((0, 4)));
+        assert_eq!(
+            controller.read(cx).active_cursor(win_id),
+            Some(quarry_workbench::CellCoord::new(1, 4))
+        );
+    });
+    dispatch_grid_key(cx, "home", Modifiers::default());
+    cx.update(|cx| {
+        assert_eq!(view.read(cx).table.read(cx).selected_cell(), Some((0, 1)));
+    });
+
+    // Up/Left at (0, 1) clamp cleanly without wrapping or entering gutter column 0.
+    dispatch_grid_key(cx, "up", Modifiers::default());
+    dispatch_grid_key(cx, "left", Modifiers::default());
+    cx.update(|cx| {
+        assert_eq!(view.read(cx).table.read(cx).selected_cell(), Some((0, 1)));
+    });
+
+    // Primary+Down jumps to last row (row 11); Primary+Up returns to row 0.
+    #[cfg(target_os = "macos")]
+    let primary_mods = Modifiers {
+        platform: true,
+        ..Modifiers::default()
+    };
+    #[cfg(not(target_os = "macos"))]
+    let primary_mods = Modifiers {
+        control: true,
+        ..Modifiers::default()
+    };
+    dispatch_grid_key(cx, "down", primary_mods);
+    cx.update(|cx| {
+        assert_eq!(view.read(cx).table.read(cx).selected_cell(), Some((11, 1)));
+    });
+    dispatch_grid_key(cx, "up", primary_mods);
+    cx.update(|cx| {
+        assert_eq!(view.read(cx).table.read(cx).selected_cell(), Some((0, 1)));
+    });
+
+    // PageDown & PageUp step across rows cleanly.
+    dispatch_grid_key(cx, "pagedown", Modifiers::default());
+    cx.update(|cx| {
+        let (r, c) = view.read(cx).table.read(cx).selected_cell().unwrap();
+        assert!(r > 0 && r <= 11);
+        assert_eq!(c, 1);
+    });
+    dispatch_grid_key(cx, "pageup", Modifiers::default());
+    cx.update(|cx| {
+        assert_eq!(view.read(cx).table.read(cx).selected_cell(), Some((0, 1)));
+    });
+
+    // Apply a filter matching 3 rows (`state == "TX"`) and verify arrow cursor stays within filtered rows.
+    let query = quarry_core::FilterQuery {
+        predicates: vec![quarry_core::FilterPredicate {
+            column: 2,
+            operator: quarry_core::FilterOperator::Equals,
+            upper_bound: None,
+            value: b"TX".to_vec(),
+        }],
+        case_sensitivity: quarry_core::CaseSensitivity::Sensitive,
+    };
+    cx.update_window(win.into(), |_, window, cx| {
+        let _ = controller.update(cx, |c, cx| c.start_filter_active(win_id, query, cx));
+        view.update(cx, |q, cx| q.table.focus_handle(cx).focus(window, cx));
+    })
+    .unwrap();
+    wait_for_ui(cx, win, &controller, &view, |q, _, cx| {
+        q.snapshot(cx)
+            .is_some_and(|s| s.filter_active && s.filter_done && s.available_rows == 3)
+    });
+    dispatch_grid_key(cx, "down", primary_mods);
+    cx.update(|cx| {
+        assert_eq!(view.read(cx).table.read(cx).selected_cell(), Some((2, 1)));
+    });
+}
+
+#[gpui_kit::test]
+fn opt_in_vim_motions_gg_timeout_input_isolation_and_voiceover_non_conflict(
+    cx: &mut TestAppContext,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("vim.csv");
+    std::fs::write(
+        &path,
+        "id,name,city\n1,alpha,Austin\n2,beta,Boston\n3,alpha,Chicago\n4,delta,Denver\n",
+    )
+    .unwrap();
+    let pref_path = dir.path().join("vim-motions-preference");
+
+    let (controller, win, view) = setup_window(cx, vec![path]);
+    wait_for_ui(cx, win, &controller, &view, |q, _, cx| {
+        q.snapshot(cx)
+            .is_some_and(|s| s.index_done && s.available_rows == 4)
+    });
+
+    // Attach temp preference file and verify Vim motions are OFF by default.
+    cx.update_window(win.into(), |_, window, cx| {
+        controller.update(cx, |c, _| {
+            c.set_vim_prefs_for_test(quarry_workbench::VimMotionPreferences::load(Some(
+                pref_path.clone(),
+            )));
+        });
+        view.update(cx, |q, cx| {
+            q.table.focus_handle(cx).focus(window, cx);
+            q.apply_display_cursor(1, 0, false, window, cx);
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update(|cx| assert!(!controller.read(cx).vim_motions_enabled()));
+
+    let send_grid =
+        |cx: &mut TestAppContext, key: &str, key_char: Option<&str>, mods: Modifiers| {
+            cx.update_window(win.into(), |_, window, cx| {
+                view.update(cx, |q, cx| {
+                    let event = KeyDownEvent {
+                        keystroke: Keystroke {
+                            modifiers: mods,
+                            key: key.to_owned(),
+                            key_char: key_char.map(str::to_owned),
+                        },
+                        is_held: false,
+                        prefer_character_input: false,
+                    };
+                    q.handle_grid_key_down(&event, window, cx);
+                });
+            })
+            .unwrap();
+            cx.run_until_parked();
+        };
+
+    // With Vim off, `j` and `l` do not move selection.
+    send_grid(cx, "j", Some("j"), Modifiers::default());
+    send_grid(cx, "l", Some("l"), Modifiers::default());
+    cx.update(|cx| {
+        assert_eq!(view.read(cx).table.read(cx).selected_cell(), Some((1, 1)));
+    });
+
+    // Enable Vim motions and confirm persistence on disk.
+    cx.update_window(win.into(), |_, window, cx| {
+        view.update(cx, |q, cx| {
+            q.toggle_vim_motions_action(&super::menus::ToggleVimMotions, window, cx);
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update(|cx| assert!(controller.read(cx).vim_motions_enabled()));
+    assert!(quarry_workbench::VimMotionPreferences::load(Some(pref_path)).enabled);
+
+    // hjkl, $, 0, G, gg with pending `g…` timeout.
+    send_grid(cx, "j", Some("j"), Modifiers::default());
+    send_grid(cx, "l", Some("l"), Modifiers::default());
+    cx.update(|cx| assert_eq!(view.read(cx).table.read(cx).selected_cell(), Some((2, 2))));
+
+    send_grid(cx, "k", Some("k"), Modifiers::default());
+    send_grid(cx, "h", Some("h"), Modifiers::default());
+    cx.update(|cx| assert_eq!(view.read(cx).table.read(cx).selected_cell(), Some((1, 1))));
+
+    let shift = Modifiers {
+        shift: true,
+        ..Modifiers::default()
+    };
+    send_grid(cx, "4", Some("$"), shift);
+    cx.update(|cx| assert_eq!(view.read(cx).table.read(cx).selected_cell(), Some((1, 3))));
+    send_grid(cx, "0", Some("0"), Modifiers::default());
+    cx.update(|cx| assert_eq!(view.read(cx).table.read(cx).selected_cell(), Some((1, 1))));
+    send_grid(cx, "g", Some("G"), shift);
+    cx.update(|cx| assert_eq!(view.read(cx).table.read(cx).selected_cell(), Some((3, 1))));
+
+    // Single `g` shows pending indicator `g…` and expires after VIM_GG_TIMEOUT.
+    send_grid(cx, "g", Some("g"), Modifiers::default());
+    cx.update(|cx| assert_eq!(view.read(cx).vim_state.pending_indicator(), Some("g…")));
+    cx.background_executor
+        .advance_clock(quarry_workbench::VIM_GG_TIMEOUT + Duration::from_millis(20));
+    cx.run_until_parked();
+    cx.update(|cx| {
+        assert_eq!(view.read(cx).vim_state.pending_indicator(), None);
+        assert_eq!(view.read(cx).table.read(cx).selected_cell(), Some((3, 1)));
+    });
+
+    // `gg` within timeout jumps to row 0 and clears pending indicator.
+    send_grid(cx, "g", Some("g"), Modifiers::default());
+    send_grid(cx, "g", Some("g"), Modifiers::default());
+    cx.update(|cx| {
+        assert_eq!(view.read(cx).vim_state.pending_indicator(), None);
+        assert_eq!(view.read(cx).table.read(cx).selected_cell(), Some((0, 1)));
+    });
+
+    // VoiceOver Quick Nav chord (`Ctrl+Option`) must never move cursor.
+    let vo_mods = Modifiers {
+        control: true,
+        alt: true,
+        ..Modifiers::default()
+    };
+    send_grid(cx, "j", Some("j"), vo_mods);
+    send_grid(cx, "/", Some("/"), vo_mods);
+    cx.update(|cx| {
+        assert_eq!(view.read(cx).table.read(cx).selected_cell(), Some((0, 1)));
+        assert!(!view.read(cx).query_bar.read(cx).is_open());
+    });
+
+    // `n` / `N` jump to next/previous Find match from focused grid when Find query is set.
+    cx.update_window(win.into(), |_, window, cx| {
+        view.update(cx, |q, cx| {
+            q.find_bar.update(cx, |bar, cx| {
+                bar.set_query_for_test("alpha", window, cx);
+            });
+            q.table.focus_handle(cx).focus(window, cx);
+        });
+    })
+    .unwrap();
+    send_grid(cx, "n", Some("n"), Modifiers::default());
+    wait_for_ui(cx, win, &controller, &view, |q, _, cx| {
+        q.snapshot(cx).is_some_and(|s| !s.search_running)
+            && q.table.read(cx).selected_cell() == Some((0, 2))
+    });
+    send_grid(cx, "n", Some("n"), Modifiers::default());
+    wait_for_ui(cx, win, &controller, &view, |q, _, cx| {
+        q.snapshot(cx).is_some_and(|s| !s.search_running)
+            && q.table.read(cx).selected_cell() == Some((2, 2))
+    });
+    send_grid(cx, "n", Some("N"), shift);
+    wait_for_ui(cx, win, &controller, &view, |q, _, cx| {
+        q.snapshot(cx).is_some_and(|s| !s.search_running)
+            && q.table.read(cx).selected_cell() == Some((0, 2))
+    });
+
+    // When a text input (`FindBar`) is focused, grid Vim motions & `/` do NOT fire.
+    cx.update_window(win.into(), |_, window, cx| {
+        view.update(cx, |q, cx| {
+            q.find_action(&super::menus::FindText, window, cx);
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+    send_grid(cx, "j", Some("j"), Modifiers::default());
+    send_grid(cx, "/", Some("/"), Modifiers::default());
+    cx.update(|cx| {
+        assert_eq!(view.read(cx).table.read(cx).selected_cell(), Some((0, 2)));
+        assert!(!view.read(cx).query_bar.read(cx).is_open());
+    });
+}
+
+#[gpui_kit::test]
+fn slash_quick_filter_and_find_filter_toggle(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("quick.csv");
+    std::fs::write(&path, "id,state\n1,TX\n2,CA\n").unwrap();
+
+    let (controller, win, view) = setup_window(cx, vec![path]);
+    wait_for_ui(cx, win, &controller, &view, |q, _, cx| {
+        q.snapshot(cx)
+            .is_some_and(|s| s.index_done && s.available_rows == 2)
+    });
+
+    // `/` on focused grid opens Quick Filter (Query Bar).
+    cx.update_window(win.into(), |_, window, cx| {
+        view.update(cx, |q, cx| {
+            q.table.focus_handle(cx).focus(window, cx);
+            let event = KeyDownEvent {
+                keystroke: Keystroke {
+                    modifiers: Modifiers::default(),
+                    key: "/".into(),
+                    key_char: Some("/".into()),
+                },
+                is_held: false,
+                prefer_character_input: false,
+            };
+            q.handle_grid_key_down(&event, window, cx);
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update(|cx| {
+        assert!(view.read(cx).query_bar.read(cx).is_open());
+        assert!(!view.read(cx).find_bar.read(cx).is_open());
+    });
+
+    // Explicit toggle from Query Bar -> Find Bar and back -> Query Bar.
+    cx.update_window(win.into(), |_, _, cx| {
+        view.update(cx, |q, cx| {
+            q.query_bar.update(cx, |_, cx| {
+                cx.emit(super::query_bar::QueryBarEvent::SwitchToFind)
+            });
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update(|cx| {
+        assert!(!view.read(cx).query_bar.read(cx).is_open());
+        assert!(view.read(cx).find_bar.read(cx).is_open());
+    });
+
+    cx.update_window(win.into(), |_, _, cx| {
+        view.update(cx, |q, cx| {
+            q.find_bar.update(cx, |_, cx| {
+                cx.emit(super::find_bar::FindBarEvent::SwitchToFilter)
+            });
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update(|cx| {
+        assert!(view.read(cx).query_bar.read(cx).is_open());
+        assert!(!view.read(cx).find_bar.read(cx).is_open());
+    });
+}
+
+#[gpui_kit::test]
+fn command_palette_captured_target_and_hash_column_jump_unhide_center(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let path_a = dir.path().join("wide.csv");
+    let path_b = dir.path().join("other.csv");
+    std::fs::write(
+        &path_a,
+        "id,amount,c3,c4,c5,c6,c7,c8,c9,amount,c11,c12\n\
+         1,10,101,102,103,104,105,106,107,999,111,112\n\
+         2,20,201,202,203,204,205,206,207,888,211,212\n\
+         3,30,301,302,303,304,305,306,307,777,311,312\n\
+         4,40,401,402,403,404,405,406,407,666,411,412\n",
+    )
+    .unwrap();
+    std::fs::write(&path_b, "k,v\n1,one\n").unwrap();
+
+    let controller = init_test_app(cx);
+    let (win, view) = open_test_window(cx, &controller);
+    cx.update_window(win.into(), |_, window, cx| {
+        view.update(cx, |q, cx| {
+            q.open_paths_direct(
+                vec![path_a, path_b],
+                OpenOptions {
+                    header_mode: HeaderMode::FirstRow,
+                    ..OpenOptions::default()
+                },
+                None,
+                window,
+                cx,
+            );
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+    let win_id = cx.update(|cx| view.read(cx).window_id);
+    wait_for_ui(cx, win, &controller, &view, |q, _, cx| {
+        q.snapshot(cx).is_some_and(|s| s.index_done)
+    });
+
+    // Switch to Tab A (`wide.csv`) and hide duplicate column #10 (source_col 9).
+    let (id_a, id_b) = cx.update(|cx| {
+        let tabs = controller.read(cx).tabs_for_window(win_id);
+        (tabs[0].id, tabs[1].id)
+    });
+    cx.update_window(win.into(), |_, window, cx| {
+        controller.update(cx, |c, cx| {
+            c.activate_tab(win_id, id_a, cx).unwrap();
+            c.set_active_shown_columns(win_id, vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 11], cx);
+        });
+        view.update(cx, |q, cx| q.sync_from_controller(window, cx));
+    })
+    .unwrap();
+    wait_for_ui(cx, win, &controller, &view, |q, _, cx| {
+        q.snapshot(cx)
+            .is_some_and(|s| s.document_id == id_a && s.index_done && s.shown_columns.len() == 11)
+    });
+
+    // Open Command Palette (`Cmd/Ctrl+K`), verify fuzzy match `"vim"` routes via CommandId.
+    cx.update_window(win.into(), |_, window, cx| {
+        view.update(cx, |q, cx| {
+            q.open_command_palette_action(&super::menus::OpenCommandPalette, window, cx);
+            assert!(q.command_palette.read(cx).is_open());
+            assert_eq!(q.command_palette.read(cx).captured_document(), Some(id_a));
+            q.command_palette.update(cx, |p, cx| {
+                p.set_query_for_test("vim", window, cx);
+                p.activate_selected(cx);
+            });
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update(|cx| {
+        assert!(!view.read(cx).command_palette.read(cx).is_open());
+        assert!(controller.read(cx).vim_motions_enabled());
+    });
+
+    // Open palette in `#` mode for Tab A: `#amount` distinguishes both #2 and hidden #10.
+    cx.update_window(win.into(), |_, window, cx| {
+        view.update(cx, |q, cx| {
+            q.open_command_palette_action(&super::menus::OpenCommandPalette, window, cx);
+            q.command_palette.update(cx, |p, cx| {
+                p.set_query_for_test("#amount", window, cx);
+                let titles = p.result_titles_for_test();
+                assert_eq!(titles.len(), 2);
+                assert!(titles[0].0.contains("#2: amount"));
+                assert!(titles[1].0.contains("#10: amount"));
+                // Jump directly to hidden `#10`.
+                p.set_query_for_test("#10", window, cx);
+                p.activate_selected(cx);
+            });
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    // Column #10 (source col 9) is now auto-shown, selected, and horizontal scroll moved to center it.
+    cx.update_window(win.into(), |_, window, cx| {
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(win.into(), |_, window, cx| {
+        window.render_frame(cx);
+        let snap = view.read(cx).snapshot(cx).unwrap();
+        assert!(snap.shown_columns.contains(&9));
+        let expected_table_col = snap.shown_columns.iter().position(|&c| c == 9).unwrap() + 1;
+        let table = view.read(cx).table.read(cx);
+        assert_eq!(table.selected_cell(), Some((0, expected_table_col)));
+        let viewport_width = table.horizontal_scroll_handle.bounds().size.width;
+        assert!(
+            f32::from(viewport_width) > 0.0,
+            "rendered table viewport width must be positive"
+        );
+        let expected_x = table
+            .delegate()
+            .horizontal_center_offset_for_col(expected_table_col, viewport_width, cx)
+            .unwrap();
+        let actual_x = table.horizontal_scroll_handle.offset().x;
+        assert!(
+            f32::from(actual_x) < 0.0,
+            "wide column #10 should scroll horizontally left (got actual_x={actual_x:?})"
+        );
+        assert!(
+            (f32::from(actual_x) - f32::from(expected_x)).abs() < 1.0,
+            "actual horizontal scroll {actual_x:?} must match centered offset {expected_x:?}"
+        );
+    })
+    .unwrap();
+
+    // `Cmd/Ctrl+L` Go to Row or Column jumps to Row 4.
+    cx.update_window(win.into(), |_, window, cx| {
+        view.update(cx, |q, cx| {
+            q.go_to_row_or_column_action(&super::menus::GoToRowOrColumn, window, cx);
+            q.command_palette.update(cx, |p, cx| {
+                p.set_query_for_test("4", window, cx);
+                p.activate_selected(cx);
+            });
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update(|cx| {
+        assert_eq!(
+            view.read(cx).table.read(cx).selected_cell().map(|(r, _)| r),
+            Some(3)
+        );
+    });
+
+    // Captured `(WindowId, DocumentId)` safety: palette opened on Tab A refuses a stale
+    // document-scoped command after switching active tab to Tab B.
+    cx.update_window(win.into(), |_, window, cx| {
+        view.update(cx, |q, cx| {
+            q.open_command_palette_action(&super::menus::OpenCommandPalette, window, cx);
+            assert_eq!(q.command_palette.read(cx).captured_document(), Some(id_a));
+        });
+        controller
+            .update(cx, |c, cx| c.activate_tab(win_id, id_b, cx))
+            .unwrap();
+        view.update(cx, |q, cx| {
+            q.sync_from_controller(window, cx);
+            q.execute_palette_command(
+                win_id,
+                Some(id_a),
+                quarry_workbench::CommandId::ToggleQueryBar,
+                window,
+                cx,
+            );
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update(|cx| {
+        assert!(
+            !view.read(cx).query_bar.read(cx).is_open(),
+            "stale captured doc command must not execute against newly switched Tab B"
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn explicit_tab_contract_outside_and_inside_edit_mode(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tab_contract.csv");
+    std::fs::write(&path, "a,b,c\n1,2,3\n4,5,6\n").unwrap();
+
+    let (controller, win, view) = setup_window(cx, vec![path]);
+    let win_id = cx.update(|cx| view.read(cx).window_id);
+    wait_for_ui(cx, win, &controller, &view, |q, _, cx| {
+        q.snapshot(cx)
+            .is_some_and(|s| s.index_done && s.available_rows == 2)
+    });
+
+    // Outside edit mode: focusing the grid and pressing Tab moves focus OUT of the grid.
+    cx.update_window(win.into(), |_, window, cx| {
+        view.update(cx, |q, cx| {
+            q.table.focus_handle(cx).focus(window, cx);
+            q.apply_display_cursor(0, 0, false, window, cx);
+            assert!(q.table.focus_handle(cx).is_focused(window));
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.dispatch_keystroke(
+        win.into(),
+        Keystroke {
+            modifiers: Modifiers::default(),
+            key: "tab".into(),
+            key_char: None,
+        },
+    );
+    cx.run_until_parked();
+    cx.update_window(win.into(), |_, window, cx| {
+        let grid_still_focused = view.read(cx).table.focus_handle(cx).is_focused(window);
+        assert!(
+            !grid_still_focused,
+            "Tab outside edit mode must move focus out of the grid for accessibility"
+        );
+        // Selection did not jump to column 2 while leaving the grid.
+        assert_eq!(view.read(cx).table.read(cx).selected_cell(), Some((0, 1)));
+    })
+    .unwrap();
+
+    // Inside edit mode: Tab commits the edit and moves one cell right to (0, 2).
+    cx.update_window(win.into(), |_, window, cx| {
+        view.update(cx, |q, cx| {
+            q.edit_cell(0, 1, window, cx);
+            assert!(q.editing);
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(win.into(), |_, window, cx| {
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.dispatch_keystroke(
+        win.into(),
+        Keystroke {
+            modifiers: Modifiers::default(),
+            key: "9".into(),
+            key_char: Some("9".into()),
+        },
+    );
+    cx.dispatch_keystroke(
+        win.into(),
+        Keystroke {
+            modifiers: Modifiers::default(),
+            key: "tab".into(),
+            key_char: None,
+        },
+    );
+    cx.run_until_parked();
+    cx.update_window(win.into(), |_, window, cx| {
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.update(|cx| {
+        assert!(
+            !view.read(cx).editing,
+            "Tab inside edit mode must commit and close editor"
+        );
+        assert_eq!(
+            view.read(cx).table.read(cx).selected_cell(),
+            Some((0, 2)),
+            "Tab inside edit mode must move one cell right"
+        );
+        let edited = controller
+            .read(cx)
+            .active_document(win_id)
+            .and_then(|d| d.effective_cell(1, 0))
+            .map(|b| String::from_utf8_lossy(b).into_owned());
+        assert_eq!(edited.as_deref(), Some("91"));
+    });
+
+    // Shift+Tab inside edit mode on (0, 2) commits and moves one cell left back to (0, 1).
+    cx.update_window(win.into(), |_, window, cx| {
+        view.update(cx, |q, cx| {
+            q.edit_cell(0, 2, window, cx);
+            assert!(q.editing);
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(win.into(), |_, window, cx| {
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.dispatch_keystroke(
+        win.into(),
+        Keystroke {
+            modifiers: Modifiers::default(),
+            key: "8".into(),
+            key_char: Some("8".into()),
+        },
+    );
+    cx.dispatch_keystroke(
+        win.into(),
+        Keystroke {
+            modifiers: Modifiers {
+                shift: true,
+                ..Modifiers::default()
+            },
+            key: "tab".into(),
+            key_char: None,
+        },
+    );
+    cx.run_until_parked();
+    cx.update_window(win.into(), |_, window, cx| {
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.update(|cx| {
+        assert!(!view.read(cx).editing);
+        assert_eq!(view.read(cx).table.read(cx).selected_cell(), Some((0, 1)));
+        let edited = controller
+            .read(cx)
+            .active_document(win_id)
+            .and_then(|d| d.effective_cell(1, 1))
+            .map(|b| String::from_utf8_lossy(b).into_owned());
+        assert_eq!(edited.as_deref(), Some("82"));
+    });
+
+    // Filtered edit + Tab: committing a cell edit while a filter is active queues an async
+    // filter refresh; once the refreshed rows arrive, the cursor still advances one cell right.
+    let filter_query = quarry_core::FilterQuery {
+        predicates: vec![quarry_core::FilterPredicate {
+            column: 2,
+            operator: quarry_core::FilterOperator::Equals,
+            upper_bound: None,
+            value: b"3".to_vec(),
+        }],
+        case_sensitivity: quarry_core::CaseSensitivity::Sensitive,
+    };
+    cx.update_window(win.into(), |_, window, cx| {
+        controller.update(cx, |c, cx| {
+            c.start_filter_active(win_id, filter_query, cx).unwrap();
+        });
+        view.update(cx, |q, cx| q.sync_from_controller(window, cx));
+    })
+    .unwrap();
+    wait_for_ui(cx, win, &controller, &view, |q, _, cx| {
+        q.snapshot(cx)
+            .is_some_and(|s| s.filter_active && s.filter_done && s.available_rows == 1)
+    });
+    cx.update_window(win.into(), |_, window, cx| {
+        view.update(cx, |q, cx| {
+            q.edit_cell(0, 1, window, cx);
+            assert!(q.editing);
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(win.into(), |_, window, cx| {
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.dispatch_keystroke(
+        win.into(),
+        Keystroke {
+            modifiers: Modifiers::default(),
+            key: "7".into(),
+            key_char: Some("7".into()),
+        },
+    );
+    cx.dispatch_keystroke(
+        win.into(),
+        Keystroke {
+            modifiers: Modifiers::default(),
+            key: "tab".into(),
+            key_char: None,
+        },
+    );
+    wait_for_ui(cx, win, &controller, &view, |q, _, cx| {
+        !q.editing
+            && q.pending_tab_advance_after_filter.is_none()
+            && q.snapshot(cx)
+                .is_some_and(|s| s.filter_active && s.filter_done && s.available_rows == 1)
+            && q.table.read(cx).selected_cell() == Some((0, 2))
+    });
+    cx.update(|cx| {
+        let edited = controller
+            .read(cx)
+            .active_document(win_id)
+            .and_then(|d| d.effective_cell(1, 0))
+            .map(|b| String::from_utf8_lossy(b).into_owned());
+        assert_eq!(edited.as_deref(), Some("791"));
+    });
+}
+
+#[gpui_kit::test]
+fn astra_review_regressions_stale_copy_deep_jump_tab_cursor_and_palette_scroll(
+    cx: &mut TestAppContext,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let path_a = dir.path().join("tab_a.csv");
+    let path_b = dir.path().join("tab_b.csv");
+    let mut csv_a = String::from("id,tag,val\n");
+    for i in 1..=120 {
+        // Only even rows through source row 118 match (59 matches total), keeping the final
+        // filtered display row (58) strictly distinct from its physical source row (118).
+        let tag = if i % 2 == 0 && i <= 118 {
+            "KEEP"
+        } else {
+            "DROP"
+        };
+        csv_a.push_str(&format!("{i},{tag},from_tab_a_{i}\n"));
+    }
+    std::fs::write(&path_a, csv_a).unwrap();
+    std::fs::write(
+        &path_b,
+        "id,val\n1,from_tab_b_1\n2,from_tab_b_2\n3,from_tab_b_3\n",
+    )
+    .unwrap();
+
+    // 1. Empty window palette (`captured_doc = None`) must NOT acquire a subsequently opened tab.
+    let controller = init_test_app(cx);
+    let (win, view) = open_test_window(cx, &controller);
+    let win_id = cx.update(|cx| view.read(cx).window_id);
+    cx.update_window(win.into(), |_, window, cx| {
+        cx.write_to_clipboard(ClipboardItem::new_string("sentinel".into()));
+        view.update(cx, |q, cx| {
+            q.open_command_palette_action(&super::menus::OpenCommandPalette, window, cx);
+            assert_eq!(q.command_palette.read(cx).captured_document(), None);
+            q.open_paths_direct(
+                vec![path_a.clone(), path_b.clone()],
+                OpenOptions::default(),
+                None,
+                window,
+                cx,
+            );
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+    wait_for_ui(cx, win, &controller, &view, |q, _, cx| {
+        q.snapshot(cx).is_some_and(|s| s.index_done)
+    });
+    let (id_a, id_b) = cx.update(|cx| {
+        let tabs = controller.read(cx).tabs_for_window(win_id);
+        (tabs[0].id, tabs[1].id)
+    });
+
+    // Execute Copy from the empty-window capture (`None`) while Tab B is now active: must be rejected.
+    cx.update_window(win.into(), |_, window, cx| {
+        controller.update(cx, |c, cx| {
+            c.activate_tab(win_id, id_b, cx).unwrap();
+        });
+        view.update(cx, |q, cx| {
+            q.sync_from_controller(window, cx);
+            q.apply_display_cursor(0, 1, false, window, cx);
+            q.execute_palette_command(win_id, None, quarry_workbench::CommandId::Copy, window, cx);
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update(|cx| {
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|c| c.text()),
+            Some("sentinel".into()),
+            "palette opened on empty window must not copy from a subsequently opened tab"
+        );
+    });
+
+    // 2. Stale Copy captured on Tab A must NOT copy Tab B's selection after tab switch.
+    cx.update_window(win.into(), |_, window, cx| {
+        view.update(cx, |q, cx| {
+            q.execute_palette_command(
+                win_id,
+                Some(id_a),
+                quarry_workbench::CommandId::Copy,
+                window,
+                cx,
+            );
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update(|cx| {
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|c| c.text()),
+            Some("sentinel".into()),
+            "stale Tab A palette Copy must not copy Tab B's cell"
+        );
+    });
+
+    // 3. Per-tab cursor isolation: set row 50 col 2 on Tab A, row 2 col 1 on Tab B, switch both ways.
+    cx.update_window(win.into(), |_, window, cx| {
+        controller.update(cx, |c, cx| {
+            c.activate_tab(win_id, id_a, cx).unwrap();
+        });
+        view.update(cx, |q, cx| {
+            q.sync_from_controller(window, cx);
+        });
+    })
+    .unwrap();
+    wait_for_ui(cx, win, &controller, &view, |q, _, cx| {
+        q.snapshot(cx)
+            .is_some_and(|s| s.document_id == id_a && s.index_done && s.available_rows == 120)
+    });
+    cx.update_window(win.into(), |_, window, cx| {
+        view.update(cx, |q, cx| {
+            q.apply_display_cursor(50, 2, false, window, cx);
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+    // Switch to Tab B (cursor was at row 0, col 1 -> table cell (0, 2)); verify Tab B does NOT inherit row 50.
+    cx.update_window(win.into(), |_, window, cx| {
+        controller.update(cx, |c, cx| {
+            c.activate_tab(win_id, id_b, cx).unwrap();
+        });
+        view.update(cx, |q, cx| q.sync_from_controller(window, cx));
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update(|cx| {
+        assert_eq!(
+            view.read(cx).table.read(cx).selected_cell(),
+            Some((0, 2)),
+            "switching to Tab B must restore Tab B's cursor instead of inheriting Tab A's row 50"
+        );
+    });
+    // Switch back to Tab A; verify Tab A's row 50 col 2 (table col 3) is restored.
+    cx.update_window(win.into(), |_, window, cx| {
+        controller.update(cx, |c, cx| {
+            c.activate_tab(win_id, id_a, cx).unwrap();
+        });
+        view.update(cx, |q, cx| q.sync_from_controller(window, cx));
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update(|cx| {
+        assert_eq!(
+            view.read(cx).table.read(cx).selected_cell(),
+            Some((50, 3)),
+            "switching back to Tab A must restore Tab A's cursor at row 50"
+        );
+    });
+
+    // 4. Deep jump beyond loaded 40-row buffer (unfiltered): jump to last row (row 120, source row 120)
+    //    and toggle bookmark; verify exact physical last row receives the bookmark.
+    cx.update_window(win.into(), |_, window, cx| {
+        view.update(cx, |q, cx| {
+            q.move_grid_cursor(quarry_workbench::CursorMotion::DocEnd, window, cx);
+        });
+    })
+    .unwrap();
+    wait_for_ui(cx, win, &controller, &view, |q, _, cx| {
+        q.table.read(cx).selected_cell() == Some((119, 3))
+            && controller.read(cx).active_cursor(win_id)
+                == Some(quarry_workbench::CellCoord::new(120, 2))
+    });
+    cx.update_window(win.into(), |_, window, cx| {
+        view.update(cx, |q, cx| {
+            q.toggle_bookmark_action(&super::menus::ToggleBookmark, window, cx);
+        });
+    })
+    .unwrap();
+    cx.update(|cx| {
+        let doc = controller.read(cx).active_document(win_id).unwrap();
+        assert!(
+            doc.bookmarks.contains_row(120),
+            "bookmark after unfiltered DocEnd must target physical row 120, not viewport row 1"
+        );
+    });
+
+    // 5. Deep jump beyond loaded filter buffer: filter 59 nonconsecutive matching rows
+    //    (even rows 2..=118), jump to DocEnd (display row 58 -> physical source row 118),
+    //    verify ToggleBookmark while pending does NOT bookmark the stale row, wait for async
+    //    filter read, then toggle bookmark and verify physical row 118 is bookmarked!
+    let query = quarry_core::FilterQuery {
+        predicates: vec![quarry_core::FilterPredicate {
+            column: 1,
+            operator: quarry_core::FilterOperator::Equals,
+            upper_bound: None,
+            value: b"KEEP".to_vec(),
+        }],
+        case_sensitivity: quarry_core::CaseSensitivity::Sensitive,
+    };
+    cx.update_window(win.into(), |_, window, cx| {
+        controller.update(cx, |c, cx| {
+            c.start_filter_active(win_id, query, cx).unwrap();
+        });
+        view.update(cx, |q, cx| q.sync_from_controller(window, cx));
+    })
+    .unwrap();
+    wait_for_ui(cx, win, &controller, &view, |q, _, cx| {
+        q.snapshot(cx)
+            .is_some_and(|s| s.filter_active && s.filter_done && s.available_rows == 59)
+    });
+    // Select display row 0 (physical source row 2) first, then jump to DocEnd (display row 58).
+    cx.update_window(win.into(), |_, window, cx| {
+        view.update(cx, |q, cx| {
+            q.apply_display_cursor(0, 1, false, window, cx);
+            q.move_grid_cursor(quarry_workbench::CursorMotion::DocEnd, window, cx);
+            // If the jump is still pending, ToggleBookmark must not bookmark stale row 2.
+            if q.pending_display_cursor.is_some() {
+                q.toggle_bookmark_action(&super::menus::ToggleBookmark, window, cx);
+                let doc = controller.read(cx).active_document(win_id).unwrap();
+                assert!(
+                    !doc.bookmarks.contains_row(2),
+                    "ToggleBookmark while filtered jump is pending must not bookmark the old row"
+                );
+            }
+        });
+    })
+    .unwrap();
+    wait_for_ui(cx, win, &controller, &view, |q, _, cx| {
+        q.table.read(cx).selected_cell().map(|(r, _)| r) == Some(58)
+            && q.pending_display_cursor.is_none()
+            && controller
+                .read(cx)
+                .active_cursor(win_id)
+                .is_some_and(|c| c.row == 118)
+    });
+    cx.update_window(win.into(), |_, window, cx| {
+        view.update(cx, |q, cx| {
+            q.toggle_bookmark_action(&super::menus::ToggleBookmark, window, cx);
+        });
+    })
+    .unwrap();
+    cx.update(|cx| {
+        let doc = controller.read(cx).active_document(win_id).unwrap();
+        assert!(
+            doc.bookmarks.contains_row(118),
+            "bookmark after filtered DocEnd beyond buffer must target physical row 118"
+        );
+    });
+    // Clear filter before testing Find Next focus preservation.
+    cx.update_window(win.into(), |_, window, cx| {
+        let _ = controller.update(cx, |c, cx| c.clear_filter_active(win_id, cx));
+        view.update(cx, |q, cx| q.sync_from_controller(window, cx));
+    })
+    .unwrap();
+    wait_for_ui(cx, win, &controller, &view, |q, _, cx| {
+        q.snapshot(cx).is_some_and(|s| !s.filter_active)
+    });
+
+    // 6. Command Palette wrap-around Up scrolls the selected last item into view, and
+    //    choosing Find Next from a fresh palette keeps focus in the Find input (not stolen by grid).
+    cx.update_window(win.into(), |_, window, cx| {
+        view.update(cx, |q, cx| {
+            q.open_command_palette_action(&super::menus::OpenCommandPalette, window, cx);
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.update_window(win.into(), |_, window, cx| {
+        view.update(cx, |q, cx| {
+            q.command_palette.update(cx, |p, cx| {
+                let total = p.result_titles_for_test().len();
+                assert!(total > 20);
+                p.move_selection(-1, cx);
+                assert_eq!(p.selected_index_for_test(), total - 1);
+            });
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.update_window(win.into(), |_, window, cx| {
+        window.render_frame(cx);
+        let offset_y = view
+            .read(cx)
+            .command_palette
+            .read(cx)
+            .scroll_offset_y_for_test();
+        assert!(
+            offset_y < 0.0,
+            "wrapping Up to last palette item must scroll the list (got offset_y={offset_y})"
+        );
+        view.update(cx, |q, cx| {
+            q.command_palette.update(cx, |p, cx| {
+                p.set_query_for_test("find next", window, cx);
+                p.activate_selected(cx);
+            });
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(win.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert!(view.read(cx).find_bar.read(cx).is_open());
+        assert!(
+            !view.read(cx).table.focus_handle(cx).is_focused(window),
+            "Find Next opened from fresh palette must keep focus in Find bar, not restore grid focus"
+        );
+    })
+    .unwrap();
+
+    // 7. Mouse row-gutter selection and deselection keep `doc.cursor` in sync so the next
+    //    arrow/Vim motion starts from the newly selected row (or resets when deselected).
+    cx.update_window(win.into(), |_, window, cx| {
+        view.update(cx, |q, cx| {
+            q.find_bar.update(cx, |bar, cx| bar.close_silent(cx));
+            q.apply_display_cursor(0, 1, false, window, cx);
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.update_window(win.into(), |_, window, cx| {
+        controller.update(cx, |c, cx| {
+            // Source row 6 corresponds to display row 5 (header is row 0).
+            c.select_row_active(win_id, 6, false, false, cx);
+        });
+        view.update(cx, |q, cx| {
+            q.table.update(cx, |table, cx| {
+                table.delegate().record_gutter_mouse_selection(5);
+                table.set_selected_cell(5, 0, cx);
+            });
+            q.move_grid_cursor(quarry_workbench::CursorMotion::Down, window, cx);
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.update(|cx| {
+        assert_eq!(
+            view.read(cx).table.read(cx).selected_cell(),
+            Some((6, 2)),
+            "Down after mouse-clicking row 5 gutter must step to display row 6, not from old cell (0, 2)"
+        );
+    });
+
+    // Clicking the same row's gutter again deselects it and clears `doc.cursor` so the next
+    // arrow motion starts fresh from (0, 1) rather than resurrecting the stale selection.
+    cx.update_window(win.into(), |_, window, cx| {
+        controller.update(cx, |c, cx| {
+            c.select_row_active(win_id, 6, false, false, cx);
+            c.select_row_active(win_id, 6, false, false, cx);
+        });
+        view.update(cx, |q, cx| {
+            q.table.update(cx, |table, cx| {
+                table.delegate().record_gutter_mouse_selection(5);
+                table.set_selected_cell(5, 0, cx);
+            });
+            assert_eq!(controller.read(cx).active_cursor(win_id), None);
+            q.move_grid_cursor(quarry_workbench::CursorMotion::Down, window, cx);
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.update(|cx| {
+        assert_eq!(
+            view.read(cx).table.read(cx).selected_cell(),
+            Some((0, 1)),
+            "Down after deselecting a gutter row must start fresh at (0, 1)"
+        );
+    });
+
+    // 8. Switching tabs preserves both whole-row selection (selected_rows + GridSelection::Row)
+    //    and column selection (selected_columns) without queued TableEvent delivery clearing them.
+    cx.update_window(win.into(), |_, window, cx| {
+        controller.update(cx, |c, cx| {
+            c.select_row_active(win_id, 4, false, false, cx);
+            c.activate_tab(win_id, id_b, cx).unwrap();
+        });
+        view.update(cx, |q, cx| q.sync_from_controller(window, cx));
+        controller.update(cx, |c, cx| {
+            c.select_column_active(win_id, 1, false, false, cx);
+            c.activate_tab(win_id, id_a, cx).unwrap();
+        });
+        view.update(cx, |q, cx| q.sync_from_controller(window, cx));
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update(|cx| {
+        let doc_a = controller.read(cx).active_document(win_id).unwrap();
+        assert_eq!(
+            doc_a.selection,
+            Some(quarry_workbench::GridSelection::Row { row: 4 }),
+            "returning to Tab A must keep whole-row selection intact"
+        );
+        assert!(
+            doc_a.selected_rows.contains(4),
+            "returning to Tab A must not clear selected_rows"
+        );
+    });
+    cx.update_window(win.into(), |_, window, cx| {
+        controller.update(cx, |c, cx| {
+            c.activate_tab(win_id, id_b, cx).unwrap();
+        });
+        view.update(cx, |q, cx| q.sync_from_controller(window, cx));
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update(|cx| {
+        let doc_b = controller.read(cx).active_document(win_id).unwrap();
+        assert!(
+            doc_b.selected_columns.contains(&1),
+            "returning to Tab B must not clear selected_columns"
+        );
     });
 }
