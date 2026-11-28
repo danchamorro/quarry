@@ -6516,13 +6516,17 @@ impl Document {
             return;
         };
         let row_visible = if self.filter_active() {
-            self.visible_filter_rows()
-                .iter()
-                .any(|row| row.row == selection.row())
+            self.filter_waiting_for_page()
+                || self
+                    .visible_filter_rows()
+                    .iter()
+                    .any(|row| row.row == selection.row())
         } else {
-            let row_end = self
-                .viewport_start
-                .saturating_add(self.visible_rows().len() as u64);
+            let row_end = self.viewport_start.saturating_add(
+                self.available_rows()
+                    .saturating_sub(self.viewport_start)
+                    .min(self.visible_rows.max(1) as u64),
+            );
             (self.viewport_start..row_end).contains(&selection.row())
         };
         let column_visible = match selection {
