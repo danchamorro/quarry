@@ -91,6 +91,7 @@ pub struct QuarryWindow {
     vim_state: VimKeyState,
     vim_timeout_task: Option<Task<()>>,
     pending_tab_advance: Option<bool>,
+    pending_tab_advance_after_filter: Option<PendingTabAdvance>,
     pending_display_cursor: Option<PendingDisplayCursor>,
     suppress_table_selection_depth: usize,
     last_synced_doc: Option<(DocumentId, u64)>,
@@ -119,6 +120,15 @@ struct PendingDisplayCursor {
     doc_id: DocumentId,
     display_row: usize,
     source_col: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PendingTabAdvance {
+    doc_id: DocumentId,
+    source_row: u64,
+    source_col: usize,
+    forward: bool,
+    fallback_display_row: usize,
 }
 
 #[derive(Default)]
@@ -237,6 +247,7 @@ impl QuarryWindow {
                 |this, _, event: &QueryBarEvent, window, cx| match event {
                     QueryBarEvent::Apply(query) => {
                         this.pending_display_cursor = None;
+                        this.pending_tab_advance_after_filter = None;
                         this.table
                             .update(cx, |table, cx| table.scroll_to_row(0, cx));
                         this.row_input
@@ -252,6 +263,7 @@ impl QuarryWindow {
                     }
                     QueryBarEvent::Clear => {
                         this.pending_display_cursor = None;
+                        this.pending_tab_advance_after_filter = None;
                         this.table
                             .update(cx, |table, cx| table.scroll_to_row(0, cx));
                         this.row_input
@@ -313,6 +325,7 @@ impl QuarryWindow {
                             return;
                         }
                         this.pending_display_cursor = None;
+                        this.pending_tab_advance_after_filter = None;
                         if table.read(cx).delegate().take_gutter_mouse_selection(*row) {
                             return;
                         }
@@ -327,6 +340,7 @@ impl QuarryWindow {
                             return;
                         }
                         this.pending_display_cursor = None;
+                        this.pending_tab_advance_after_filter = None;
                         table.read(cx).delegate().clear_gutter_mouse_selection();
                         this.controller.update(cx, |controller, cx| {
                             controller.clear_selection_active(this.window_id, cx);
@@ -336,6 +350,7 @@ impl QuarryWindow {
                         if this.suppress_table_selection_depth > 0 {
                             return;
                         }
+                        this.pending_tab_advance_after_filter = None;
                         if *column == 0 {
                             this.pending_display_cursor = None;
                             if table.read(cx).delegate().take_gutter_mouse_selection(*row) {
@@ -547,6 +562,7 @@ impl QuarryWindow {
             vim_state: VimKeyState::default(),
             vim_timeout_task: None,
             pending_tab_advance: None,
+            pending_tab_advance_after_filter: None,
             pending_display_cursor: None,
             suppress_table_selection_depth: 0,
             last_synced_doc: None,
@@ -748,6 +764,66 @@ impl QuarryWindow {
                     self.pending_display_cursor = None;
                 }
             }
+            if let Some(pending) = self.pending_tab_advance_after_filter {
+                if pending.doc_id != info.document_id {
+                    self.pending_tab_advance_after_filter = None;
+                } else {
+                    let filter_settling = info.filter_active
+                        && (!info.filter_done
+                            || self
+                                .controller
+                                .read(cx)
+                                .active_document(self.window_id)
+                                .is_some_and(|doc| {
+                                    doc.filter_refresh_pending || doc.filter_job.is_some()
+                                }));
+                    if !filter_settling {
+                        self.pending_tab_advance_after_filter = None;
+                        if let Some((total_rows, shown_cols)) = self.grid_dimensions(cx)
+                            && total_rows > 0
+                            && shown_cols > 0
+                            && let Some(cur_col_idx) = info
+                                .shown_columns
+                                .iter()
+                                .position(|&col| col == pending.source_col)
+                        {
+                            let target = if let Some(cur_row) = self
+                                .table
+                                .read(cx)
+                                .delegate()
+                                .display_row_for_source(pending.source_row, cx)
+                            {
+                                step_adjacent_cell(
+                                    cur_row,
+                                    cur_col_idx,
+                                    pending.forward,
+                                    total_rows,
+                                    shown_cols,
+                                )
+                            } else {
+                                let clamped_row = pending
+                                    .fallback_display_row
+                                    .min(total_rows.saturating_sub(1));
+                                let target_col = if pending.forward {
+                                    (cur_col_idx + 1).min(shown_cols.saturating_sub(1))
+                                } else {
+                                    cur_col_idx.saturating_sub(1)
+                                };
+                                Some((clamped_row, target_col))
+                            };
+                            if let Some((next_row, next_col_idx)) = target {
+                                self.apply_display_cursor(
+                                    next_row,
+                                    next_col_idx,
+                                    false,
+                                    window,
+                                    cx,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
             if info.live_watch.active {
                 let row_key = (info.document_id, info.available_rows);
                 let rows_changed = self.last_live_watch_rows != Some(row_key);
@@ -784,6 +860,7 @@ impl QuarryWindow {
             }
         } else {
             self.pending_display_cursor = None;
+            self.pending_tab_advance_after_filter = None;
             self.cancel_vim_pending(cx);
             self.close_grid_context_menu_and_restore_focus(window, cx);
             if self.last_synced_doc.is_some() {
@@ -1418,6 +1495,14 @@ impl QuarryWindow {
         let close = cx.weak_entity();
         let anchor = operations::DialogAnchor::new(cx);
         self.pending_tab_advance = None;
+        self.pending_tab_advance_after_filter = None;
+        let pre_edit_display_row = self
+            .table
+            .read(cx)
+            .delegate()
+            .display_row_for_source(row, cx)
+            .or_else(|| self.table.read(cx).selected_cell().map(|(r, _)| r))
+            .unwrap_or(0);
         if self.snapshot(cx).is_some() {
             self.table.focus_handle(cx).focus(window, cx);
         }
@@ -1565,7 +1650,15 @@ impl QuarryWindow {
                         this.set_editing(false, cx);
                         let tab_advance = this.pending_tab_advance.take();
                         if let Some(forward) = tab_advance {
-                            this.advance_cell_after_edit(row, column, forward, window, cx);
+                            this.advance_cell_after_edit(
+                                doc_id,
+                                row,
+                                column,
+                                pre_edit_display_row,
+                                forward,
+                                window,
+                                cx,
+                            );
                         }
                         let table_focus = this
                             .snapshot(cx)
@@ -1586,14 +1679,42 @@ impl QuarryWindow {
         focus_input.update(cx, |input, cx| input.focus(window, cx));
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn advance_cell_after_edit(
         &mut self,
+        doc_id: DocumentId,
         source_row: u64,
         source_col: usize,
+        fallback_display_row: usize,
         forward: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let filter_refreshing = self
+            .controller
+            .read(cx)
+            .active_document(self.window_id)
+            .is_some_and(|doc| {
+                self.controller
+                    .read(cx)
+                    .scheduler()
+                    .active_document(self.window_id)
+                    == Some(doc_id)
+                    && doc.filter_active()
+                    && (doc.filter_refresh_pending
+                        || doc.filter_job.is_some()
+                        || doc.grid_total_rows() == 0)
+            });
+        if filter_refreshing {
+            self.pending_tab_advance_after_filter = Some(PendingTabAdvance {
+                doc_id,
+                source_row,
+                source_col,
+                forward,
+                fallback_display_row,
+            });
+            return;
+        }
         let Some((total_rows, shown_cols)) = self.grid_dimensions(cx) else {
             return;
         };
@@ -2211,6 +2332,7 @@ impl QuarryWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.pending_tab_advance_after_filter = None;
         let table_col = target_col_idx + 1;
         let visible_rows = self.table.read(cx).delegate().visible_rows_count();
         let active_doc = self

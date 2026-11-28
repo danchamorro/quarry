@@ -6559,6 +6559,73 @@ fn explicit_tab_contract_outside_and_inside_edit_mode(cx: &mut TestAppContext) {
             .map(|b| String::from_utf8_lossy(b).into_owned());
         assert_eq!(edited.as_deref(), Some("82"));
     });
+
+    // Filtered edit + Tab: committing a cell edit while a filter is active queues an async
+    // filter refresh; once the refreshed rows arrive, the cursor still advances one cell right.
+    let filter_query = quarry_core::FilterQuery {
+        predicates: vec![quarry_core::FilterPredicate {
+            column: 2,
+            operator: quarry_core::FilterOperator::Equals,
+            upper_bound: None,
+            value: b"3".to_vec(),
+        }],
+        case_sensitivity: quarry_core::CaseSensitivity::Sensitive,
+    };
+    cx.update_window(win.into(), |_, window, cx| {
+        controller.update(cx, |c, cx| {
+            c.start_filter_active(win_id, filter_query, cx).unwrap();
+        });
+        view.update(cx, |q, cx| q.sync_from_controller(window, cx));
+    })
+    .unwrap();
+    wait_for_ui(cx, win, &controller, &view, |q, _, cx| {
+        q.snapshot(cx)
+            .is_some_and(|s| s.filter_active && s.filter_done && s.available_rows == 1)
+    });
+    cx.update_window(win.into(), |_, window, cx| {
+        view.update(cx, |q, cx| {
+            q.edit_cell(0, 1, window, cx);
+            assert!(q.editing);
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(win.into(), |_, window, cx| {
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.dispatch_keystroke(
+        win.into(),
+        Keystroke {
+            modifiers: Modifiers::default(),
+            key: "7".into(),
+            key_char: Some("7".into()),
+        },
+    );
+    cx.dispatch_keystroke(
+        win.into(),
+        Keystroke {
+            modifiers: Modifiers::default(),
+            key: "tab".into(),
+            key_char: None,
+        },
+    );
+    wait_for_ui(cx, win, &controller, &view, |q, _, cx| {
+        !q.editing
+            && q.pending_tab_advance_after_filter.is_none()
+            && q.snapshot(cx)
+                .is_some_and(|s| s.filter_active && s.filter_done && s.available_rows == 1)
+            && q.table.read(cx).selected_cell() == Some((0, 2))
+    });
+    cx.update(|cx| {
+        let edited = controller
+            .read(cx)
+            .active_document(win_id)
+            .and_then(|d| d.effective_cell(1, 0))
+            .map(|b| String::from_utf8_lossy(b).into_owned());
+        assert_eq!(edited.as_deref(), Some("791"));
+    });
 }
 
 #[gpui_kit::test]
