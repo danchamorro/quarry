@@ -5759,20 +5759,38 @@ fn query_bar_applies_syncs_rules_isolates_tabs_and_preserves_active_filter_on_er
         );
     });
 
-    // Live debounce mode applies a valid edit automatically after 180ms without pressing Enter,
-    // and closing Tab B prunes its saved draft from QueryBar::tab_drafts.
+    // Live debounce mode supersedes an earlier draft within 180ms and applies the final valid
+    // expression automatically once the debounce timer elapses without pressing Enter.
     cx.update_window(win.into(), |_, window, cx| {
         view.update(cx, |q, cx| {
             q.query_bar.update(cx, |bar, cx| {
                 bar.set_live_mode_for_test(true, window, cx);
+                bar.set_expression_for_test("province == \"FL\"", window, cx);
+            });
+        });
+    })
+    .unwrap();
+    cx.background_executor()
+        .advance_clock(Duration::from_millis(50));
+    cx.run_until_parked();
+    cx.update_window(win.into(), |_, window, cx| {
+        view.update(cx, |q, cx| {
+            q.query_bar.update(cx, |bar, cx| {
                 bar.set_expression_for_test("province == \"CA\"", window, cx);
             });
         });
     })
     .unwrap();
+    cx.background_executor()
+        .advance_clock(Duration::from_millis(250));
+    cx.run_until_parked();
     wait_for_ui(cx, win, &controller, &view, |q, _, cx| {
-        q.snapshot(cx)
-            .is_some_and(|s| s.filter_active && s.filter_done && s.available_rows == 1)
+        q.snapshot(cx).is_some_and(|s| {
+            s.filter_active
+                && s.filter_done
+                && s.available_rows == 1
+                && q.query_bar.read(cx).text_for_test(cx) == "province == \"CA\""
+        })
     });
 
     // Close Tab B and verify its draft entry is pruned from QueryBar.
