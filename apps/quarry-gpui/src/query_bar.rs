@@ -22,6 +22,7 @@ pub enum QueryBarEvent {
     Apply(FilterQuery),
     Clear,
     OpenRules,
+    SwitchToFind,
     Closed,
 }
 
@@ -135,6 +136,14 @@ impl QueryBar {
             self.open = false;
             self.debounce_task = None;
             cx.emit(QueryBarEvent::Closed);
+            cx.notify();
+        }
+    }
+
+    pub fn close_silent(&mut self, cx: &mut Context<Self>) {
+        if self.open {
+            self.open = false;
+            self.debounce_task = None;
             cx.notify();
         }
     }
@@ -693,6 +702,16 @@ impl Render for QueryBar {
                             .small()
                             .on_click(cx.listener(|_, _, _, cx| {
                                 cx.emit(QueryBarEvent::OpenRules);
+                            })),
+                    )
+                    .child(
+                        Button::new("query-bar-switch-to-find")
+                            .label("Find…")
+                            .ghost()
+                            .small()
+                            .accessibility_label("Switch to Find bar")
+                            .on_click(cx.listener(|_, _, _, cx| {
+                                cx.emit(QueryBarEvent::SwitchToFind);
                             })),
                     )
                     .when(info.filter_running, |row| {

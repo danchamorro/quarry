@@ -13,6 +13,7 @@ use quarry_workbench::{AppMessage, WindowId};
 use crate::workbench::WorkbenchController;
 
 pub enum FindBarEvent {
+    SwitchToFilter,
     Closed,
 }
 
@@ -79,6 +80,23 @@ impl FindBar {
         self.open
     }
 
+    pub fn has_query(&self, cx: &App) -> bool {
+        !self.find_input.read(cx).value().is_empty()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_query_for_test(
+        &mut self,
+        query: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.find_input.update(cx, |input, cx| {
+            input.set_value(query.to_owned(), window, cx)
+        });
+        cx.notify();
+    }
+
     pub fn open_find(&mut self, expand_replace: bool, window: &mut Window, cx: &mut Context<Self>) {
         self.open = true;
         if expand_replace {
@@ -100,6 +118,13 @@ impl FindBar {
         if self.open {
             self.open = false;
             cx.emit(FindBarEvent::Closed);
+            cx.notify();
+        }
+    }
+
+    pub fn close_silent(&mut self, cx: &mut Context<Self>) {
+        if self.open {
+            self.open = false;
             cx.notify();
         }
     }
@@ -285,6 +310,16 @@ impl Render for FindBar {
                         )
                     })
                     .child(div().flex_1())
+                    .child(
+                        Button::new("find-switch-to-filter")
+                            .label("Filter…")
+                            .ghost()
+                            .small()
+                            .accessibility_label("Switch to Filter Query Bar")
+                            .on_click(cx.listener(|_, _, _, cx| {
+                                cx.emit(FindBarEvent::SwitchToFilter);
+                            })),
+                    )
                     .child(
                         Button::new("close-find-bar")
                             .label("×")

@@ -166,6 +166,40 @@ impl Grid {
             .unwrap_or(124.0)
     }
 
+    /// Computes a clamped horizontal scroll offset that centers rendered `table_col` (`>= 1`)
+    /// within `viewport_width` (scrollable data area width, excluding the fixed row gutter).
+    pub fn horizontal_center_offset_for_col(
+        &self,
+        table_col: usize,
+        viewport_width: Pixels,
+        cx: &App,
+    ) -> Option<Pixels> {
+        if table_col == 0 || viewport_width <= px(0.) {
+            return None;
+        }
+        let shown = self.columns(cx);
+        let display_idx = table_col - 1;
+        if display_idx >= shown.len() {
+            return None;
+        }
+        let mut col_left = 0.0_f32;
+        let mut target_width = 124.0_f32;
+        let mut total_width = 0.0_f32;
+        for (ix, &source_col) in shown.iter().enumerate() {
+            let w = self.width_for_source_col(source_col);
+            if ix < display_idx {
+                col_left += w;
+            } else if ix == display_idx {
+                target_width = w;
+            }
+            total_width += w;
+        }
+        let vp = f32::from(viewport_width);
+        let max_scroll = (total_width - vp).max(0.0);
+        let desired_scroll = (col_left + target_width * 0.5 - vp * 0.5).clamp(0.0, max_scroll);
+        Some(px(-desired_scroll))
+    }
+
     pub fn visible_rows(&self) -> Range<usize> {
         self.visible_rows.clone()
     }

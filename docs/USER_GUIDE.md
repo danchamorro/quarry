@@ -710,6 +710,60 @@ Find actions become available after indexing finishes. Find is disabled while
 a filter is active. If the Find strip was already open, it remains visible but
 disabled until you clear the filter.
 
+Use the **Filter…** button in the Find bar (or press `/` while the data grid has
+focus outside text inputs) to switch directly to the inline Filter Query Bar,
+and use the **Find…** button in the Query Bar to switch back to Find.
+
+### Keyboard navigation, Vim motions, Command Palette, and column jump
+
+#### Native arrow cursor and Tab behavior
+
+With focus in the data grid:
+
+- **Arrow keys (`Up`, `Down`, `Left`, `Right`)** move cell by cell across
+  visible (including filtered) rows and shown columns without wrapping at edges
+  or entering the row-number gutter.
+- **`Home` / `End`** (or **`Command+Left` / `Command+Right`** on macOS,
+  **`Ctrl+Left` / `Ctrl+Right`** on Linux) jump to the first or last shown
+  column in the current row.
+- **`Command+Up` / `Command+Down`** on macOS (**`Ctrl+Up` / `Ctrl+Down`** or
+  **`Ctrl+Home` / `Ctrl+End`** on Linux) jump to the first or last visible row.
+- **`PageUp` / `PageDown`** step by one viewport page of rows.
+- **`Enter` or `F2`** opens the cell editor for the selected cell.
+- **`/`** opens and focuses the inline Filter Query Bar when the grid is focused
+  outside text fields and IME composition.
+- **`Tab`** follows an explicit accessibility contract: outside edit mode, `Tab`
+  moves focus out of the grid to the next control; inside the cell editor, `Tab`
+  commits the edit and moves one cell right (`Shift+Tab` commits and moves one
+  cell left).
+
+#### Opt-in Vim motions
+
+Vim motions are **off by default** and persisted when enabled via **View → Vim
+Motions** or the Command Palette (**Toggle Vim Motions**). When enabled (indicated
+by the `VIM` badge in the status bar), single-key motions work strictly while
+the data grid is focused and never fire inside text inputs, during IME
+composition, or with system/VoiceOver modifier chords (`Ctrl+Option`):
+
+- `h`, `j`, `k`, `l`: move left, down, up, right
+- `0` / `$`: jump to the first or last shown column in the current row
+- `gg` / `G`: jump to the first or last visible row (`g` displays a `g…`
+  pending-key badge in the status bar and expires after 800 ms)
+- `n` / `N`: jump to the next or previous Find match
+
+#### Command Palette (`Command+K` / `Ctrl+K`) and Go to Row / Column (`Command+L` / `Ctrl+L`)
+
+- Press **`Command+K`** on macOS (**`Ctrl+K`** on Linux) or choose **View →
+  Command Palette…** to fuzzy-search and run enabled commands for the active
+  window and tab.
+- Prefix a Command Palette query with **`#`** (for example `#142` or `#amount`)
+  or press **`Command+L`** / **`Ctrl+L`** (**Edit → Go to Row / Column…**) to
+  jump directly to a visible row (`42` or `row:42`) or 1-based source column
+  (`#142` or a column name).
+- Duplicate header names display their 1-based `#index` and occurrence count
+  (for example `#2: amount` and `#10: amount`). Jumping to a hidden column
+  automatically unhides it and centers it horizontally in the grid.
+
 ### Filter rows
 
 #### Build one or more rules

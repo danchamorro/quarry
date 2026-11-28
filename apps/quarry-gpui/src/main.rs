@@ -1,3 +1,4 @@
+mod command_palette;
 mod find_bar;
 mod grid;
 mod menus;
@@ -16,6 +17,7 @@ use std::cell::RefCell;
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::time::Instant;
 
 #[cfg(target_os = "macos")]
 const APP_ID: &str = "io.github.danchamorro.quarry";
@@ -23,10 +25,16 @@ const APP_ID: &str = "io.github.danchamorro.quarry";
 #[cfg(not(target_os = "macos"))]
 use gpui_kit::component::menu::AppMenuBar;
 use gpui_kit::{
+    base::actions::{
+        Cancel as TableCancel, SelectDown, SelectFirst, SelectLast, SelectNextColumn,
+        SelectPageDown, SelectPageUp, SelectPrevColumn, SelectUp,
+    },
     component::{
         ActiveTheme, Disableable, Root, Sizable, Size, Theme, ThemeMode, WindowExt,
         button::{Button, ButtonVariants},
-        input::{Input, InputEvent, InputState, Textarea, TextareaState},
+        input::{
+            IndentInline, Input, InputEvent, InputState, OutdentInline, Textarea, TextareaState,
+        },
         menu::{PopupMenu, PopupMenuItem},
         table::{DataTable, TableEvent, TableState},
     },
@@ -37,26 +45,29 @@ use quarry_core::{
     BoundaryTrust, CaseSensitivity, Encoding, OpenOptions, ProcessMemorySample, WatchAlert,
 };
 use quarry_workbench::{
-    AppMessage, CommandId, DocumentId, EffectiveWordWrap, FailedOpen, GridSelection,
-    MessageSeverity, ResidencyState, ResolvedTheme, SINGLE_LINE_ROW_HEIGHT_PX, ThemeAppearance,
-    ThemePreference, VolumeSpaceSample, WRAPPED_ROW_HEIGHT_PX, WindowId,
-    compressed::uncompressed_name, format_bytes,
+    AppMessage, CommandId, CursorMotion, DocumentId, EffectiveWordWrap, FailedOpen,
+    GridKeyModifiers, GridSelection, MessageSeverity, ResidencyState, ResolvedTheme,
+    SINGLE_LINE_ROW_HEIGHT_PX, ThemeAppearance, ThemePreference, VIM_GG_TIMEOUT, VimAction,
+    VimKeyState, VolumeSpaceSample, WRAPPED_ROW_HEIGHT_PX, WindowId, compressed::uncompressed_name,
+    conflicts_with_voiceover_or_shortcut, format_bytes, step_adjacent_cell, step_display_cursor,
 };
 
+use command_palette::{CommandPalette, CommandPaletteEvent, PaletteOpenMode};
 use find_bar::{FindBar, FindBarEvent};
 use grid::{Grid, GridAction, GridActionCallback};
 use menus::{
     AboutQuarry, CleanupColumns, ClearBookmarks, CloseTab, CloseWindow, CombineColumns,
     CombineFiles, CopySelection, DeleteSelectedColumns, DeleteSelectedRows, DiscardChanges,
-    EditCell, ExportFiltered, FindDuplicates, FindNext, FindPrevious, FindText, InsertColumns,
-    InsertRows, InspectFile, JoinFiles, MoveColumns, MoveTabToNewWindow, NewWindow, NextBookmark,
-    NextTab, OpenContextMenu, OpenFile, OpenIso88591, OpenSection, OpenUtf8, OpenUtf16Be,
-    OpenUtf16Le, OpenWindows1252, PauseResumeIndexing, PreviousBookmark, PreviousTab,
-    QUARRY_KEY_CONTEXT, QuitApp, RedoEdit, ReloadFromDisk, RenameHeader, ReplaceText, SaveAsFile,
-    SaveAsUtf8, SaveFile, ShowAllWhitespace, SortRows, SplitColumn, TemporaryStorage, ThemeDark,
-    ThemeLight, ThemeOmarchy, ThemeSystem, ToggleBookmark, ToggleBookmarks, ToggleColumns,
-    ToggleFilters, ToggleLiveWatch, ToggleQueryBar, ToggleWordWrap, UndoEdit,
-    VerifySectionBoundary, bind_shortcuts, encoding_label, install_menus,
+    EditCell, ExportFiltered, FindDuplicates, FindNext, FindPrevious, FindText, GoToRowOrColumn,
+    InsertColumns, InsertRows, InspectFile, JoinFiles, MoveColumns, MoveTabToNewWindow, NewWindow,
+    NextBookmark, NextTab, OpenCommandPalette, OpenContextMenu, OpenFile, OpenIso88591,
+    OpenSection, OpenUtf8, OpenUtf16Be, OpenUtf16Le, OpenWindows1252, PauseResumeIndexing,
+    PreviousBookmark, PreviousTab, QUARRY_KEY_CONTEXT, QuitApp, RedoEdit, ReloadFromDisk,
+    RenameHeader, ReplaceText, SaveAsFile, SaveAsUtf8, SaveFile, ShowAllWhitespace, SortRows,
+    SplitColumn, TemporaryStorage, ThemeDark, ThemeLight, ThemeOmarchy, ThemeSystem,
+    ToggleBookmark, ToggleBookmarks, ToggleColumns, ToggleFilters, ToggleLiveWatch, ToggleQueryBar,
+    ToggleVimMotions, ToggleWordWrap, UndoEdit, VerifySectionBoundary, bind_shortcuts,
+    encoding_label, install_menus,
 };
 use panels::{PanelEvent, Panels, Tool};
 use query_bar::{QueryBar, QueryBarEvent};
@@ -75,7 +86,11 @@ pub struct QuarryWindow {
     panels: Entity<Panels>,
     find_bar: Entity<FindBar>,
     query_bar: Entity<QueryBar>,
+    command_palette: Entity<CommandPalette>,
     row_input: Entity<InputState>,
+    vim_state: VimKeyState,
+    vim_timeout_task: Option<Task<()>>,
+    pending_tab_advance: Option<bool>,
     last_synced_doc: Option<(DocumentId, u64)>,
     last_headers: Vec<String>,
     last_shown_columns: Vec<usize>,
@@ -128,10 +143,13 @@ impl QuarryWindow {
             .cell_selectable(true)
             .row_header(false)
             .col_movable(false)
+            .loop_selection(false)
         });
         let panels = cx.new(|cx| Panels::new(window, cx));
         let find_bar = cx.new(|cx| FindBar::new(controller.clone(), window_id, window, cx));
         let query_bar = cx.new(|cx| QueryBar::new(controller.clone(), window_id, window, cx));
+        let command_palette =
+            cx.new(|cx| CommandPalette::new(controller.clone(), window_id, window, cx));
         let row_input = cx.new(|cx| InputState::new(window, cx).default_value("1"));
         let initial_appearance = window_appearance_to_theme(window.appearance());
         if let Some(resolved) =
@@ -156,20 +174,50 @@ impl QuarryWindow {
             cx.subscribe_in(
                 &find_bar,
                 window,
-                |this, _, event: &FindBarEvent, window, cx| {
-                    if matches!(event, FindBarEvent::Closed) {
-                        let table_focus = this
-                            .snapshot(cx)
-                            .is_some()
-                            .then(|| this.table.focus_handle(cx));
-                        let root_focus = this.focus_handle.clone();
-                        window.defer(cx, move |window, cx| {
-                            if let Some(tf) = table_focus {
-                                tf.focus(window, cx);
-                            } else {
-                                root_focus.focus(window, cx);
-                            }
-                        });
+                |this, _, event: &FindBarEvent, window, cx| match event {
+                    FindBarEvent::SwitchToFilter => {
+                        this.find_bar.update(cx, |bar, cx| bar.close_silent(cx));
+                        this.open_quick_filter(window, cx);
+                    }
+                    FindBarEvent::Closed => {
+                        this.restore_grid_focus(window, cx);
+                        cx.notify();
+                    }
+                },
+            ),
+            cx.subscribe_in(
+                &command_palette,
+                window,
+                |this, _, event: &CommandPaletteEvent, window, cx| match event {
+                    CommandPaletteEvent::ExecuteCommand {
+                        window_id,
+                        doc_id,
+                        command,
+                    } => {
+                        this.execute_palette_command(*window_id, *doc_id, *command, window, cx);
+                    }
+                    CommandPaletteEvent::JumpToColumn {
+                        window_id,
+                        doc_id,
+                        source_col,
+                    } => {
+                        this.jump_to_column_from_palette(
+                            *window_id,
+                            *doc_id,
+                            *source_col,
+                            window,
+                            cx,
+                        );
+                    }
+                    CommandPaletteEvent::JumpToRow {
+                        window_id,
+                        doc_id,
+                        row_1based,
+                    } => {
+                        this.jump_to_row_from_palette(*window_id, *doc_id, *row_1based, window, cx);
+                    }
+                    CommandPaletteEvent::Closed => {
+                        this.restore_grid_focus(window, cx);
                         cx.notify();
                     }
                 },
@@ -219,6 +267,13 @@ impl QuarryWindow {
                             this.panels.update(cx, |panels, cx| {
                                 panels.open_tool(Tool::Filters, window, cx)
                             });
+                        }
+                    }
+                    QueryBarEvent::SwitchToFind => {
+                        this.query_bar.update(cx, |bar, cx| bar.close_silent(cx));
+                        if this.snapshot(cx).is_some() && !this.confirming && !this.editing {
+                            this.find_bar
+                                .update(cx, |bar, cx| bar.open_find(false, window, cx));
                         }
                     }
                     QueryBarEvent::Closed => {
@@ -437,7 +492,11 @@ impl QuarryWindow {
             panels,
             find_bar,
             query_bar,
+            command_palette,
             row_input,
+            vim_state: VimKeyState::default(),
+            vim_timeout_task: None,
+            pending_tab_advance: None,
             last_synced_doc: None,
             last_headers: Vec::new(),
             last_shown_columns: Vec::new(),
@@ -537,6 +596,7 @@ impl QuarryWindow {
                 self.last_row_gutter_anchor = row_gutter_anchor;
                 self.last_word_wrap_active = info.word_wrap.is_active();
                 if doc_changed {
+                    self.cancel_vim_pending(cx);
                     self.close_grid_context_menu_and_restore_focus(window, cx);
                 }
                 self.table.update(cx, |table, cx| {
@@ -605,6 +665,7 @@ impl QuarryWindow {
                 self.last_word_wrap_auto_disabled_doc = None;
             }
         } else {
+            self.cancel_vim_pending(cx);
             self.close_grid_context_menu_and_restore_focus(window, cx);
             if self.last_synced_doc.is_some() {
                 self.last_synced_doc = None;
@@ -1231,8 +1292,10 @@ impl QuarryWindow {
         self.editor_status = Some(status.clone());
         let focus_input = input.clone();
         let apply = cx.weak_entity();
+        let tab_owner = cx.weak_entity();
         let close = cx.weak_entity();
         let anchor = operations::DialogAnchor::new(cx);
+        self.pending_tab_advance = None;
         if self.snapshot(cx).is_some() {
             self.table.focus_handle(cx).focus(window, cx);
         }
@@ -1240,12 +1303,14 @@ impl QuarryWindow {
             let input_value = input.clone();
             let input_view = input.clone();
             let apply = apply.clone();
+            let tab_owner = tab_owner.clone();
             let close = close.clone();
             let error = status.read(cx).error.clone();
             let apply_status = status.clone();
             let anchor_el = anchor.clone();
             let anchor_cancel = anchor.clone();
             let anchor_ok = anchor.clone();
+            let anchor_tab = anchor.clone();
             dialog
                 .title(format!("{} · source row {}", title, row + 1))
                 .w(px(480.))
@@ -1275,11 +1340,49 @@ impl QuarryWindow {
                 )
                 .content(move |content, _, cx| {
                     let too_large = input_view.read(cx).value().len() > MAX_EDIT_BYTES;
+                    let anchor_tab_fwd = anchor_tab.clone();
+                    let tab_owner_fwd = tab_owner.clone();
+                    let anchor_tab_back = anchor_tab.clone();
+                    let tab_owner_back = tab_owner.clone();
+                    let anchor_tab_key = anchor_tab.clone();
+                    let tab_owner_key = tab_owner.clone();
                     content
                         .child(
-                            Textarea::new(&input_view)
-                                .aria_label("Cell value")
-                                .h(px(116.)),
+                            div()
+                                .capture_action(move |_: &IndentInline, window, cx| {
+                                    cx.stop_propagation();
+                                    let _ = tab_owner_fwd.update(cx, |this, _| {
+                                        this.pending_tab_advance = Some(true);
+                                    });
+                                    anchor_tab_fwd.confirm(window, cx);
+                                })
+                                .capture_action(move |_: &OutdentInline, window, cx| {
+                                    cx.stop_propagation();
+                                    let _ = tab_owner_back.update(cx, |this, _| {
+                                        this.pending_tab_advance = Some(false);
+                                    });
+                                    anchor_tab_back.confirm(window, cx);
+                                })
+                                .capture_key_down(move |event: &KeyDownEvent, window, cx| {
+                                    let mods = event.keystroke.modifiers;
+                                    if event.keystroke.key == "tab"
+                                        && !mods.control
+                                        && !mods.alt
+                                        && !mods.platform
+                                    {
+                                        cx.stop_propagation();
+                                        let forward = !mods.shift;
+                                        let _ = tab_owner_key.update(cx, |this, _| {
+                                            this.pending_tab_advance = Some(forward);
+                                        });
+                                        anchor_tab_key.confirm(window, cx);
+                                    }
+                                })
+                                .child(
+                                    Textarea::new(&input_view)
+                                        .aria_label("Cell value")
+                                        .h(px(116.)),
+                                ),
                         )
                         .when(too_large, |content| {
                             content.child(
@@ -1307,6 +1410,9 @@ impl QuarryWindow {
                 .on_ok(move |_, window, cx| {
                     let value = input_value.read(cx).value().to_string();
                     if value.len() > MAX_EDIT_BYTES {
+                        let _ = apply.update(cx, |this, _| {
+                            this.pending_tab_advance = None;
+                        });
                         window.refresh();
                         return false;
                     }
@@ -1318,6 +1424,9 @@ impl QuarryWindow {
                     match outcome {
                         Ok(Ok(())) => true,
                         Ok(Err(err)) => {
+                            let _ = apply.update(cx, |this, _| {
+                                this.pending_tab_advance = None;
+                            });
                             apply_status.update(cx, |status, cx| {
                                 status.error = Some(err);
                                 cx.notify();
@@ -1332,6 +1441,10 @@ impl QuarryWindow {
                     let _ = close.update(cx, |this, cx| {
                         this.editor_status = None;
                         this.set_editing(false, cx);
+                        let tab_advance = this.pending_tab_advance.take();
+                        if let Some(forward) = tab_advance {
+                            this.advance_cell_after_edit(row, column, forward, window, cx);
+                        }
                         let table_focus = this
                             .snapshot(cx)
                             .is_some()
@@ -1349,6 +1462,40 @@ impl QuarryWindow {
                 })
         });
         focus_input.update(cx, |input, cx| input.focus(window, cx));
+    }
+
+    fn advance_cell_after_edit(
+        &mut self,
+        source_row: u64,
+        source_col: usize,
+        forward: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((total_rows, shown_cols)) = self.grid_dimensions(cx) else {
+            return;
+        };
+        let current = self
+            .table
+            .read(cx)
+            .delegate()
+            .display_position_for_source(source_row, source_col, cx)
+            .and_then(|(r, c)| c.checked_sub(1).map(|dc| (r, dc)))
+            .or_else(|| {
+                self.table
+                    .read(cx)
+                    .selected_cell()
+                    .and_then(|(r, c)| c.checked_sub(1).map(|dc| (r, dc)))
+            });
+        let Some((cur_row, cur_col_idx)) = current else {
+            return;
+        };
+        let Some((next_row, next_col_idx)) =
+            step_adjacent_cell(cur_row, cur_col_idx, forward, total_rows, shown_cols)
+        else {
+            return;
+        };
+        self.apply_display_cursor(next_row, next_col_idx, false, window, cx);
     }
 
     fn show_header_rename_dialog(
@@ -1742,6 +1889,623 @@ impl QuarryWindow {
             table.scroll_to_row(top_row, cx);
             cx.notify();
         });
+    }
+
+    fn toggle_vim_motions_action(
+        &mut self,
+        _: &ToggleVimMotions,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (enabled, warning) = self.controller.update(cx, |controller, cx| {
+            controller.toggle_vim_motions(self.window_id, cx)
+        });
+        if !enabled {
+            self.cancel_vim_pending(cx);
+        }
+        if let Some(warning) = warning {
+            self.set_message(AppMessage::warning(warning), cx);
+        } else {
+            self.set_message(
+                AppMessage::status(if enabled {
+                    "Vim motions enabled (hjkl, gg, G, 0, $, n/N)."
+                } else {
+                    "Vim motions disabled."
+                }),
+                cx,
+            );
+        }
+        cx.notify();
+    }
+
+    fn open_command_palette_action(
+        &mut self,
+        _: &OpenCommandPalette,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.editing || self.confirming {
+            return;
+        }
+        self.cancel_vim_pending(cx);
+        self.close_grid_context_menu(cx);
+        let captured_doc = self
+            .controller
+            .read(cx)
+            .scheduler()
+            .active_document(self.window_id);
+        self.command_palette.update(cx, |palette, cx| {
+            palette.open(PaletteOpenMode::Commands, captured_doc, "", window, cx);
+        });
+        cx.notify();
+    }
+
+    fn go_to_row_or_column_action(
+        &mut self,
+        _: &GoToRowOrColumn,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.editing || self.confirming {
+            return;
+        }
+        let Some(captured_doc) = self
+            .controller
+            .read(cx)
+            .scheduler()
+            .active_document(self.window_id)
+        else {
+            return;
+        };
+        self.cancel_vim_pending(cx);
+        self.close_grid_context_menu(cx);
+        self.command_palette.update(cx, |palette, cx| {
+            palette.open(
+                PaletteOpenMode::GoToRowOrColumn,
+                Some(captured_doc),
+                "",
+                window,
+                cx,
+            );
+        });
+        cx.notify();
+    }
+
+    fn open_quick_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.editing || self.confirming {
+            return;
+        }
+        if self.command_enabled(CommandId::Filters, cx) {
+            self.find_bar.update(cx, |bar, cx| bar.close_silent(cx));
+            self.query_bar
+                .update(cx, |bar, cx| bar.open_and_focus(window, cx));
+        }
+    }
+
+    fn cancel_vim_pending(&mut self, cx: &mut Context<Self>) -> bool {
+        self.vim_timeout_task = None;
+        let cleared = self.vim_state.cancel();
+        if cleared {
+            cx.notify();
+        }
+        cleared
+    }
+
+    fn grid_dimensions(&self, cx: &App) -> Option<(usize, usize)> {
+        let controller = self.controller.read(cx);
+        let doc = controller.active_document(self.window_id)?;
+        let rows = usize::try_from(doc.grid_total_rows()).unwrap_or(usize::MAX);
+        let cols = doc.columns.visible.len();
+        Some((rows, cols))
+    }
+
+    fn current_display_cursor(&self, cx: &App) -> Option<(usize, usize)> {
+        if let Some((row, col)) = self.table.read(cx).selected_cell()
+            && col > 0
+        {
+            return Some((row, col - 1));
+        }
+        let coord = self.controller.read(cx).active_cursor(self.window_id)?;
+        let (table_row, table_col) = self.table.read(cx).delegate().display_position_for_source(
+            coord.row,
+            coord.column,
+            cx,
+        )?;
+        table_col.checked_sub(1).map(|dc| (table_row, dc))
+    }
+
+    fn apply_display_cursor(
+        &mut self,
+        target_row: usize,
+        target_col_idx: usize,
+        center_column: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let table_col = target_col_idx + 1;
+        let visible_rows = self.table.read(cx).delegate().visible_rows_count();
+        self.controller.update(cx, |controller, cx| {
+            controller.request_viewport_rows(self.window_id, target_row as u64, visible_rows, cx);
+            controller.select_display_cell_active(self.window_id, target_row, target_col_idx, cx);
+        });
+        self.table.update(cx, |table, cx| {
+            table.set_selected_cell(target_row, table_col, cx);
+            if center_column {
+                let viewport_width = table.horizontal_scroll_handle.bounds().size.width;
+                if let Some(centered_x) =
+                    table
+                        .delegate()
+                        .horizontal_center_offset_for_col(table_col, viewport_width, cx)
+                {
+                    let mut offset = table.horizontal_scroll_handle.offset();
+                    offset.x = centered_x;
+                    table.horizontal_scroll_handle.set_offset(offset);
+                }
+            }
+            cx.notify();
+        });
+        if center_column {
+            let table = self.table.clone();
+            window.defer(cx, move |_, cx| {
+                table.update(cx, |table, cx| {
+                    let viewport_width = table.horizontal_scroll_handle.bounds().size.width;
+                    if let Some(centered_x) = table.delegate().horizontal_center_offset_for_col(
+                        table_col,
+                        viewport_width,
+                        cx,
+                    ) {
+                        let mut offset = table.horizontal_scroll_handle.offset();
+                        offset.x = centered_x;
+                        table.horizontal_scroll_handle.set_offset(offset);
+                        cx.notify();
+                    }
+                });
+            });
+        }
+        self.row_input.update(cx, |state, cx| {
+            state.set_value((target_row + 1).to_string(), window, cx);
+        });
+        cx.notify();
+    }
+
+    fn move_grid_cursor(
+        &mut self,
+        motion: CursorMotion,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((total_rows, shown_cols)) = self.grid_dimensions(cx) else {
+            return;
+        };
+        let current = self.current_display_cursor(cx);
+        let Some((next_row, next_col_idx)) =
+            step_display_cursor(current, motion, total_rows, shown_cols)
+        else {
+            return;
+        };
+        self.apply_display_cursor(next_row, next_col_idx, false, window, cx);
+    }
+
+    fn handle_grid_table_motion(
+        &mut self,
+        motion: CursorMotion,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.table.focus_handle(cx).is_focused(window)
+            || self.editing
+            || self.confirming
+            || self.command_palette.read(cx).is_open()
+            || self.grid_context_menu.is_some()
+            || self.snapshot(cx).is_none()
+        {
+            return;
+        }
+        self.cancel_vim_pending(cx);
+        self.move_grid_cursor(motion, window, cx);
+        cx.stop_propagation();
+    }
+
+    fn handle_grid_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.table.focus_handle(cx).is_focused(window)
+            || self.editing
+            || self.confirming
+            || self.command_palette.read(cx).is_open()
+            || self.grid_context_menu.is_some()
+            || self.snapshot(cx).is_none()
+        {
+            return;
+        }
+        let ks = &event.keystroke;
+        let mods = GridKeyModifiers {
+            control: ks.modifiers.control,
+            alt: ks.modifiers.alt,
+            shift: ks.modifiers.shift,
+            platform: ks.modifiers.platform,
+            function: ks.modifiers.function,
+        };
+
+        // Explicit Tab contract: outside edit mode, Tab moves focus out of the grid.
+        if ks.key == "tab" {
+            self.cancel_vim_pending(cx);
+            return;
+        }
+
+        // Escape cancels pending Vim `g` first; otherwise lets DataTable clear selection.
+        if ks.key == "escape" {
+            if self.cancel_vim_pending(cx) {
+                cx.stop_propagation();
+            }
+            return;
+        }
+
+        #[cfg(target_os = "macos")]
+        let primary = mods.platform && !mods.control && !mods.alt;
+        #[cfg(not(target_os = "macos"))]
+        let primary = mods.control && !mods.platform && !mods.alt;
+        let plain = !mods.control && !mods.alt && !mods.platform && !mods.shift && !mods.function;
+
+        // Native arrow & navigation keys (always active when grid is focused).
+        let page_step = self.table.read(cx).delegate().visible_rows().len().max(1);
+        let native_motion = match ks.key.as_str() {
+            "up" if plain => Some(CursorMotion::Up),
+            "down" if plain => Some(CursorMotion::Down),
+            "left" if plain => Some(CursorMotion::Left),
+            "right" if plain => Some(CursorMotion::Right),
+            "up" if primary => Some(CursorMotion::DocStart),
+            "down" if primary => Some(CursorMotion::DocEnd),
+            "left" if primary => Some(CursorMotion::RowStart),
+            "right" if primary => Some(CursorMotion::RowEnd),
+            "home" if primary => Some(CursorMotion::DocStart),
+            "end" if primary => Some(CursorMotion::DocEnd),
+            "home" if plain => Some(CursorMotion::RowStart),
+            "end" if plain => Some(CursorMotion::RowEnd),
+            "pageup" if plain => Some(CursorMotion::PageUp(page_step)),
+            "pagedown" if plain => Some(CursorMotion::PageDown(page_step)),
+            _ => None,
+        };
+        if let Some(motion) = native_motion {
+            self.cancel_vim_pending(cx);
+            self.move_grid_cursor(motion, window, cx);
+            cx.stop_propagation();
+            return;
+        }
+
+        if ks.key == "enter" && plain {
+            self.cancel_vim_pending(cx);
+            self.edit_action(&EditCell, window, cx);
+            cx.stop_propagation();
+            return;
+        }
+
+        // `/` opens Quick Filter (Query Bar) from focused grid outside text inputs & IME.
+        if !event.prefer_character_input
+            && (ks.key == "/" || ks.key_char.as_deref() == Some("/"))
+            && !mods.shift
+            && !conflicts_with_voiceover_or_shortcut(mods)
+        {
+            self.cancel_vim_pending(cx);
+            self.open_quick_filter(window, cx);
+            cx.stop_propagation();
+            return;
+        }
+
+        // Opt-in Vim motions (strictly off by default, never firing under IME or VoiceOver chords).
+        let vim_enabled = self.controller.read(cx).vim_motions_enabled();
+        match self.vim_state.handle_key_at(
+            vim_enabled,
+            &ks.key,
+            ks.key_char.as_deref(),
+            mods,
+            event.prefer_character_input,
+            Instant::now(),
+        ) {
+            VimAction::Move(motion) => {
+                self.vim_timeout_task = None;
+                self.move_grid_cursor(motion, window, cx);
+                cx.stop_propagation();
+            }
+            VimAction::FindNext => {
+                self.vim_timeout_task = None;
+                self.find_next_action(&FindNext, window, cx);
+                cx.stop_propagation();
+            }
+            VimAction::FindPrevious => {
+                self.vim_timeout_task = None;
+                self.find_previous_action(&FindPrevious, window, cx);
+                cx.stop_propagation();
+            }
+            VimAction::PendingKey(_) => {
+                let pending_gen = self.vim_state.pending_generation();
+                self.vim_timeout_task = Some(cx.spawn_in(window, async move |this, cx| {
+                    cx.background_executor().timer(VIM_GG_TIMEOUT).await;
+                    let _ = this.update(cx, |this, cx| {
+                        if this.vim_state.expire_generation(pending_gen) {
+                            this.vim_timeout_task = None;
+                            cx.notify();
+                        }
+                    });
+                }));
+                cx.notify();
+                cx.stop_propagation();
+            }
+            VimAction::ClearedPending => {
+                self.vim_timeout_task = None;
+                cx.notify();
+            }
+            VimAction::Ignored => {}
+        }
+    }
+
+    fn jump_to_column_from_palette(
+        &mut self,
+        window_id: WindowId,
+        doc_id: DocumentId,
+        source_col: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if window_id != self.window_id {
+            return;
+        }
+        let result = self.controller.update(cx, |controller, cx| {
+            controller.jump_to_source_column_active(window_id, doc_id, source_col, cx)
+        });
+        match result {
+            Ok((table_col, was_hidden, col_name)) => {
+                if was_hidden {
+                    self.table.update(cx, |table, cx| {
+                        table.refresh(cx);
+                        cx.notify();
+                    });
+                }
+                let target_row = self.current_display_cursor(cx).map_or(0, |(row, _)| row);
+                let display_col_idx = table_col.saturating_sub(1);
+                self.apply_display_cursor(target_row, display_col_idx, true, window, cx);
+                if was_hidden {
+                    self.set_message(
+                        AppMessage::status(format!(
+                            "Shown and jumped to column #{} ({col_name}).",
+                            source_col + 1
+                        )),
+                        cx,
+                    );
+                } else {
+                    self.controller.update(cx, |controller, cx| {
+                        controller.set_window_message(self.window_id, None, cx);
+                    });
+                }
+                self.restore_grid_focus(window, cx);
+            }
+            Err(error) => {
+                self.set_message(AppMessage::warning(error), cx);
+                self.restore_grid_focus(window, cx);
+            }
+        }
+    }
+
+    fn jump_to_row_from_palette(
+        &mut self,
+        window_id: WindowId,
+        doc_id: DocumentId,
+        row_1based: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if window_id != self.window_id {
+            return;
+        }
+        let result = self
+            .controller
+            .read(cx)
+            .jump_to_display_row_active(window_id, doc_id, row_1based);
+        match result {
+            Ok(table_row) => {
+                let target_col_idx = self.current_display_cursor(cx).map_or(0, |(_, col)| col);
+                self.apply_display_cursor(table_row, target_col_idx, false, window, cx);
+                self.controller.update(cx, |controller, cx| {
+                    controller.set_window_message(self.window_id, None, cx);
+                });
+                self.restore_grid_focus(window, cx);
+            }
+            Err(error) => {
+                self.set_message(AppMessage::error(error), cx);
+                self.restore_grid_focus(window, cx);
+            }
+        }
+    }
+
+    fn execute_palette_command(
+        &mut self,
+        window_id: WindowId,
+        doc_id: Option<DocumentId>,
+        command: CommandId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if window_id != self.window_id {
+            return;
+        }
+        let (enabled, reason) = self
+            .controller
+            .read(cx)
+            .evaluate_command_for_captured_document(window_id, doc_id, command);
+        if !enabled {
+            if let Some(reason) = reason {
+                self.set_message(AppMessage::warning(reason), cx);
+            }
+            self.restore_grid_focus(window, cx);
+            return;
+        }
+        let mut restore_focus = true;
+        match command {
+            CommandId::GoToRowOrColumn => {
+                restore_focus = false;
+                self.go_to_row_or_column_action(&GoToRowOrColumn, window, cx);
+            }
+            CommandId::Find => {
+                restore_focus = false;
+                self.find_action(&FindText, window, cx);
+            }
+            CommandId::FindNext => self.find_next_action(&FindNext, window, cx),
+            CommandId::FindPrevious => self.find_previous_action(&FindPrevious, window, cx),
+            CommandId::Replace => {
+                restore_focus = false;
+                self.replace_action(&ReplaceText, window, cx);
+            }
+            CommandId::ToggleQueryBar => {
+                let will_open = !self.query_bar.read(cx).is_open();
+                restore_focus = !will_open;
+                self.toggle_query_bar_action(&ToggleQueryBar, window, cx);
+            }
+            CommandId::Filters => {
+                restore_focus = false;
+                self.toggle_filters_action(&ToggleFilters, window, cx);
+            }
+            CommandId::Columns => {
+                restore_focus = false;
+                self.toggle_columns_action(&ToggleColumns, window, cx);
+            }
+            CommandId::ToggleVimMotions => {
+                self.toggle_vim_motions_action(&ToggleVimMotions, window, cx);
+            }
+            CommandId::ToggleWordWrap => self.toggle_word_wrap_action(&ToggleWordWrap, window, cx),
+            CommandId::ShowAllWhitespace => {
+                self.toggle_whitespace_action(&ShowAllWhitespace, window, cx);
+            }
+            CommandId::ToggleBookmark => {
+                self.toggle_bookmark_action(&ToggleBookmark, window, cx);
+            }
+            CommandId::NextBookmark => self.next_bookmark_action(&NextBookmark, window, cx),
+            CommandId::PreviousBookmark => {
+                self.previous_bookmark_action(&PreviousBookmark, window, cx);
+            }
+            CommandId::ClearBookmarks => self.clear_bookmarks_action(&ClearBookmarks, window, cx),
+            CommandId::ToggleBookmarksPanel => {
+                restore_focus = false;
+                self.toggle_bookmarks_action(&ToggleBookmarks, window, cx);
+            }
+            CommandId::EditCell => {
+                restore_focus = false;
+                self.edit_action(&EditCell, window, cx);
+            }
+            CommandId::RenameHeader => {
+                restore_focus = false;
+                self.rename_header_action(&RenameHeader, window, cx);
+            }
+            CommandId::Copy => self.copy_action(&CopySelection, window, cx),
+            CommandId::Undo => self.undo_action(&UndoEdit, window, cx),
+            CommandId::Redo => self.redo_action(&RedoEdit, window, cx),
+            CommandId::SortRows => {
+                restore_focus = false;
+                self.sort_rows_action(&SortRows, window, cx);
+            }
+            CommandId::FindDuplicates => {
+                restore_focus = false;
+                self.find_duplicates_action(&FindDuplicates, window, cx);
+            }
+            CommandId::CleanupColumns => {
+                restore_focus = false;
+                self.cleanup_columns_action(&CleanupColumns, window, cx);
+            }
+            CommandId::InsertRows => {
+                restore_focus = false;
+                self.insert_rows_action(&InsertRows, window, cx);
+            }
+            CommandId::InsertColumns => {
+                restore_focus = false;
+                self.insert_columns_action(&InsertColumns, window, cx);
+            }
+            CommandId::DeleteSelectedRows => {
+                self.delete_selected_rows_action(&DeleteSelectedRows, window, cx);
+            }
+            CommandId::DeleteSelectedColumns => {
+                self.delete_selected_columns_action(&DeleteSelectedColumns, window, cx);
+            }
+            CommandId::MoveColumns => {
+                restore_focus = false;
+                self.move_columns_action(&MoveColumns, window, cx);
+            }
+            CommandId::SplitColumn => {
+                restore_focus = false;
+                self.split_column_action(&SplitColumn, window, cx);
+            }
+            CommandId::CombineColumns => {
+                restore_focus = false;
+                self.combine_columns_action(&CombineColumns, window, cx);
+            }
+            CommandId::ToggleLiveWatch => {
+                self.toggle_live_watch_action(&ToggleLiveWatch, window, cx);
+            }
+            CommandId::PauseResumeIndexing => {
+                self.pause_resume_indexing_action(&PauseResumeIndexing, window, cx);
+            }
+            CommandId::VerifySectionBoundary => {
+                self.verify_section_boundary_action(&VerifySectionBoundary, window, cx);
+            }
+            CommandId::Open => {
+                restore_focus = false;
+                self.open_action(&OpenFile, window, cx);
+            }
+            CommandId::OpenSection => {
+                restore_focus = false;
+                self.open_section_action(&OpenSection, window, cx);
+            }
+            CommandId::Save => self.save_action(&SaveFile, window, cx),
+            CommandId::SaveAs => {
+                restore_focus = false;
+                self.save_as_action(&SaveAsFile, window, cx);
+            }
+            CommandId::SaveAsUtf8 => {
+                restore_focus = false;
+                self.save_as_utf8_action(&SaveAsUtf8, window, cx);
+            }
+            CommandId::ExportFiltered => {
+                restore_focus = false;
+                self.export_filtered_action(&ExportFiltered, window, cx);
+            }
+            CommandId::ReloadFromDisk => self.reload_action(&ReloadFromDisk, window, cx),
+            CommandId::DiscardChanges => self.discard_action(&DiscardChanges, window, cx),
+            CommandId::CombineFiles => {
+                restore_focus = false;
+                self.combine_files_action(&CombineFiles, window, cx);
+            }
+            CommandId::JoinFiles => {
+                restore_focus = false;
+                self.join_files_action(&JoinFiles, window, cx);
+            }
+            CommandId::InspectFile => {
+                restore_focus = false;
+                self.inspect_file_action(&InspectFile, window, cx);
+            }
+            CommandId::TemporaryStorage => {
+                restore_focus = false;
+                self.temporary_storage_action(&TemporaryStorage, window, cx);
+            }
+            CommandId::ThemeSystem => self.theme_system_action(&ThemeSystem, window, cx),
+            CommandId::ThemeLight => self.theme_light_action(&ThemeLight, window, cx),
+            CommandId::ThemeDark => self.theme_dark_action(&ThemeDark, window, cx),
+            CommandId::ThemeOmarchy => self.theme_omarchy_action(&ThemeOmarchy, window, cx),
+            CommandId::NewWindow => {
+                restore_focus = false;
+                self.new_window_action(&NewWindow, window, cx);
+            }
+            CommandId::CloseTab => self.close_tab_action(&CloseTab, window, cx),
+            CommandId::MoveTabToNewWindow => {
+                self.move_tab_to_new_window_action(&MoveTabToNewWindow, window, cx);
+            }
+            CommandId::NextTab => self.next_tab_action(&NextTab, window, cx),
+            CommandId::PreviousTab => self.previous_tab_action(&PreviousTab, window, cx),
+            _ => {}
+        }
+        if restore_focus {
+            self.restore_grid_focus(window, cx);
+        }
     }
 
     fn restore_grid_focus(&self, window: &mut Window, cx: &mut Context<Self>) {
@@ -2873,7 +3637,7 @@ impl QuarryWindow {
         if self.snapshot(cx).is_none() || self.confirming || self.editing {
             return;
         }
-        if !self.find_bar.read(cx).is_open() {
+        if !self.find_bar.read(cx).is_open() && !self.find_bar.read(cx).has_query(cx) {
             self.find_bar
                 .update(cx, |bar, cx| bar.open_find(false, window, cx));
         } else {
@@ -2890,7 +3654,7 @@ impl QuarryWindow {
         if self.snapshot(cx).is_none() || self.confirming || self.editing {
             return;
         }
-        if !self.find_bar.read(cx).is_open() {
+        if !self.find_bar.read(cx).is_open() && !self.find_bar.read(cx).has_query(cx) {
             self.find_bar
                 .update(cx, |bar, cx| bar.open_find(false, window, cx));
         } else {
@@ -4908,6 +5672,38 @@ impl QuarryWindow {
             );
         }
 
+        if let Some(pending) = self.vim_state.pending_indicator() {
+            status_bar = status_bar.child(
+                div()
+                    .id("vim-pending-key")
+                    .role(Role::Status)
+                    .px_1p5()
+                    .py_0p5()
+                    .rounded(px(4.))
+                    .bg(cx.theme().primary)
+                    .text_color(cx.theme().primary_foreground)
+                    .text_size(px(11.))
+                    .child(pending),
+            );
+        }
+
+        if self.controller.read(cx).vim_motions_enabled() {
+            status_bar = status_bar.child(
+                div()
+                    .id("vim-mode-indicator")
+                    .role(Role::Status)
+                    .px_1p5()
+                    .py_0p5()
+                    .rounded(px(4.))
+                    .bg(cx.theme().secondary)
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .text_size(px(11.))
+                    .text_color(cx.theme().foreground)
+                    .child("VIM"),
+            );
+        }
+
         status_bar.child(div().child(tabs_badge)).into_any_element()
     }
 }
@@ -4984,6 +5780,9 @@ impl Render for QuarryWindow {
             .on_action(cx.listener(Self::find_next_action))
             .on_action(cx.listener(Self::find_previous_action))
             .on_action(cx.listener(Self::replace_action))
+            .on_action(cx.listener(Self::open_command_palette_action))
+            .on_action(cx.listener(Self::go_to_row_or_column_action))
+            .on_action(cx.listener(Self::toggle_vim_motions_action))
             .on_action(cx.listener(Self::toggle_bookmark_action))
             .on_action(cx.listener(Self::next_bookmark_action))
             .on_action(cx.listener(Self::previous_bookmark_action))
@@ -5125,10 +5924,45 @@ impl Render for QuarryWindow {
             };
             body = body.child(
                 div()
+                    .id("quarry-grid-container")
                     .relative()
                     .flex_1()
                     .min_h_0()
                     .overflow_hidden()
+                    .capture_action(cx.listener(|this, _: &TableCancel, window, cx| {
+                        if this.table.focus_handle(cx).is_focused(window)
+                            && this.cancel_vim_pending(cx)
+                        {
+                            cx.stop_propagation();
+                        }
+                    }))
+                    .capture_action(cx.listener(|this, _: &SelectUp, window, cx| {
+                        this.handle_grid_table_motion(CursorMotion::Up, window, cx);
+                    }))
+                    .capture_action(cx.listener(|this, _: &SelectDown, window, cx| {
+                        this.handle_grid_table_motion(CursorMotion::Down, window, cx);
+                    }))
+                    .capture_action(cx.listener(|this, _: &SelectPrevColumn, window, cx| {
+                        this.handle_grid_table_motion(CursorMotion::Left, window, cx);
+                    }))
+                    .capture_action(cx.listener(|this, _: &SelectNextColumn, window, cx| {
+                        this.handle_grid_table_motion(CursorMotion::Right, window, cx);
+                    }))
+                    .capture_action(cx.listener(|this, _: &SelectFirst, window, cx| {
+                        this.handle_grid_table_motion(CursorMotion::RowStart, window, cx);
+                    }))
+                    .capture_action(cx.listener(|this, _: &SelectLast, window, cx| {
+                        this.handle_grid_table_motion(CursorMotion::RowEnd, window, cx);
+                    }))
+                    .capture_action(cx.listener(|this, _: &SelectPageUp, window, cx| {
+                        let step = this.table.read(cx).delegate().visible_rows().len().max(1);
+                        this.handle_grid_table_motion(CursorMotion::PageUp(step), window, cx);
+                    }))
+                    .capture_action(cx.listener(|this, _: &SelectPageDown, window, cx| {
+                        let step = this.table.read(cx).delegate().visible_rows().len().max(1);
+                        this.handle_grid_table_motion(CursorMotion::PageDown(step), window, cx);
+                    }))
+                    .capture_key_down(cx.listener(Self::handle_grid_key_down))
                     .child(shift_horizontal_scroll)
                     .child(data_table),
             );
@@ -5148,6 +5982,40 @@ impl Render for QuarryWindow {
         }
 
         body = body.child(self.render_status_bar(info.as_ref(), total_open_tabs, &tokens, cx));
+
+        if self.command_palette.read(cx).is_open() {
+            let palette = self.command_palette.clone();
+            let win_size = window.bounds().size;
+            body = body.child(
+                deferred(
+                    anchored().child(
+                        div()
+                            .id("command-palette-backdrop")
+                            .w(win_size.width)
+                            .h(win_size.height)
+                            .flex()
+                            .justify_center()
+                            .items_start()
+                            .pt(px(56.))
+                            .bg(hsla(0., 0., 0., 0.25))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.command_palette.update(cx, |p, cx| p.close(cx));
+                                }),
+                            )
+                            .child(
+                                div()
+                                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                        cx.stop_propagation();
+                                    })
+                                    .child(palette),
+                            ),
+                    ),
+                )
+                .with_priority(gpui_kit::base::POPUP_PRIORITY),
+            );
+        }
 
         if let Some(active_menu) = &self.grid_context_menu {
             let menu = active_menu.menu.clone();

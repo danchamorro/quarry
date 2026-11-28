@@ -6,6 +6,8 @@ pub mod compressed;
 pub mod document;
 pub mod dormancy;
 pub mod history;
+pub mod navigation;
+pub mod palette;
 pub mod resource_hud;
 pub mod selection;
 pub mod storage_prefs;
@@ -21,7 +23,7 @@ pub use bookmarks::{
 };
 pub use command::{
     CloseCommandOutcome, CommandContext, CommandId, CommandResolution, CommandTarget, DocumentId,
-    FileCommands, WindowId, evaluate_command,
+    FileCommands, WindowId, command_disabled_reason, evaluate_command,
 };
 pub use compressed::CompressedDormancyPolicy;
 pub use dormancy::{
@@ -31,6 +33,16 @@ pub use dormancy::{
     SaveCompletion, SchedulerError, SearchCompletion, SectionVerifyCompletion,
     StructuralCompletion, WakeKind, WakeOutcome, WorkbenchScheduler, WorkbenchSchedulerConfig,
     document_overlay_bytes,
+};
+pub use navigation::{
+    CursorMotion, GridKeyModifiers, VIM_GG_TIMEOUT, VimAction, VimKeyState, VimMotionPreferences,
+    conflicts_with_voiceover_or_shortcut, is_voiceover_quick_nav_chord, step_adjacent_cell,
+    step_display_cursor, unix_vim_preferences_path,
+};
+pub use palette::{
+    JumpMatch, JumpTarget, MAX_PALETTE_QUERY_CHARS, PaletteCommand, PaletteMatch, PaletteQuery,
+    fuzzy_score, jump_empty_message, palette_commands, parse_palette_input, rank_palette_commands,
+    resolve_jump_targets,
 };
 pub use storage_prefs::{
     ADAPTIVE_MEMORY_BUDGET_BYTES, StoragePreferences, clear_index_cache_summary,

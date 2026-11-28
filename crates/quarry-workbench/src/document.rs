@@ -5182,6 +5182,24 @@ impl Document {
             })
     }
 
+    /// Ensures physical `source_col` is visible in `self.columns`, auto-unhiding it if hidden,
+    /// and returns `(display_col_index, was_hidden)`.
+    pub fn reveal_column(&mut self, source_col: usize) -> Option<(usize, bool)> {
+        if source_col >= self.columns.hidden.len() {
+            return None;
+        }
+        let was_hidden = self.columns.hidden[source_col];
+        if !self.columns.view(source_col) {
+            return None;
+        }
+        let display_col_idx = self
+            .columns
+            .visible
+            .iter()
+            .position(|&col| col == source_col)?;
+        Some((display_col_idx, was_hidden))
+    }
+
     pub fn current_header_fields(&self) -> Vec<Vec<u8>> {
         let mut fields = self
             .live_watch_header_row
