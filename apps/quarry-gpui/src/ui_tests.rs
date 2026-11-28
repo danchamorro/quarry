@@ -5721,6 +5721,44 @@ fn query_bar_applies_syncs_rules_isolates_tabs_and_preserves_active_filter_on_er
         );
     });
 
+    // External query exceeding expression printer limits clears stale input text, retains the
+    // omission warning, and does not clear the active filter on bare Enter (`apply_now`).
+    cx.update(|cx| {
+        controller.update(cx, |c, cx| {
+            c.start_filter_active(
+                win_id,
+                quarry_core::FilterQuery::single(
+                    0,
+                    quarry_core::FilterOperator::Equals,
+                    vec![b'x'; 5_000],
+                ),
+                cx,
+            )
+            .unwrap();
+        });
+    });
+    wait_for_ui(cx, win, &controller, &view, |q, _, cx| {
+        q.snapshot(cx)
+            .is_some_and(|s| s.filter_active && s.filter_done)
+            && q.query_bar
+                .read(cx)
+                .print_omitted_reason_for_test()
+                .is_some()
+    });
+    cx.update_window(win.into(), |_, _, cx| {
+        view.update(cx, |q, cx| {
+            assert_eq!(q.query_bar.read(cx).text_for_test(cx), "");
+            q.query_bar.update(cx, |bar, cx| bar.apply_now(cx));
+        });
+    })
+    .unwrap();
+    cx.update(|cx| {
+        assert!(
+            view.read(cx).snapshot(cx).is_some_and(|s| s.filter_active),
+            "pressing Enter on omitted expression must not clear active filter"
+        );
+    });
+
     // Live debounce mode applies a valid edit automatically after 180ms without pressing Enter,
     // and closing Tab B prunes its saved draft from QueryBar::tab_drafts.
     cx.update_window(win.into(), |_, window, cx| {
