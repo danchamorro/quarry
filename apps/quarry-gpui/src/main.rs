@@ -91,8 +91,8 @@ pub struct QuarryWindow {
     vim_state: VimKeyState,
     vim_timeout_task: Option<Task<()>>,
     pending_tab_advance: Option<bool>,
-    pending_display_cursor: Option<(DocumentId, usize, usize)>,
-    suppress_table_selection_event: bool,
+    pending_display_cursor: Option<PendingDisplayCursor>,
+    suppress_table_selection_depth: usize,
     last_synced_doc: Option<(DocumentId, u64)>,
     last_headers: Vec<String>,
     last_shown_columns: Vec<usize>,
@@ -112,6 +112,13 @@ struct ActiveGridContextMenu {
     menu: Entity<PopupMenu>,
     position: Point<Pixels>,
     _dismiss_sub: Subscription,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PendingDisplayCursor {
+    doc_id: DocumentId,
+    display_row: usize,
+    source_col: usize,
 }
 
 #[derive(Default)]
@@ -302,7 +309,7 @@ impl QuarryWindow {
                 window,
                 |this, table, event, window, cx| match event {
                     TableEvent::SelectRow(row) => {
-                        if this.suppress_table_selection_event {
+                        if this.suppress_table_selection_depth > 0 {
                             return;
                         }
                         this.pending_display_cursor = None;
@@ -316,7 +323,7 @@ impl QuarryWindow {
                         }
                     }
                     TableEvent::ClearSelection => {
-                        if this.suppress_table_selection_event {
+                        if this.suppress_table_selection_depth > 0 {
                             return;
                         }
                         this.pending_display_cursor = None;
@@ -326,7 +333,7 @@ impl QuarryWindow {
                         });
                     }
                     TableEvent::SelectCell(row, column) => {
-                        if this.suppress_table_selection_event {
+                        if this.suppress_table_selection_depth > 0 {
                             return;
                         }
                         if *column == 0 {
@@ -348,6 +355,11 @@ impl QuarryWindow {
                         }
                         table.read(cx).delegate().clear_gutter_mouse_selection();
                         let display_col_idx = *column - 1;
+                        let source_col = this
+                            .controller
+                            .read(cx)
+                            .active_document(this.window_id)
+                            .and_then(|doc| doc.columns.visible.get(display_col_idx).copied());
                         let resolved = this.controller.update(cx, |controller, cx| {
                             controller.select_display_cell_active(
                                 this.window_id,
@@ -358,13 +370,18 @@ impl QuarryWindow {
                         });
                         if resolved.is_some() {
                             this.pending_display_cursor = None;
-                        } else if let Some(doc_id) = this
-                            .controller
-                            .read(cx)
-                            .scheduler()
-                            .active_document(this.window_id)
-                        {
-                            this.pending_display_cursor = Some((doc_id, *row, display_col_idx));
+                        } else if let (Some(doc_id), Some(source_col)) = (
+                            this.controller
+                                .read(cx)
+                                .scheduler()
+                                .active_document(this.window_id),
+                            source_col,
+                        ) {
+                            this.pending_display_cursor = Some(PendingDisplayCursor {
+                                doc_id,
+                                display_row: *row,
+                                source_col,
+                            });
                         }
                     }
                     TableEvent::DoubleClickedCell(row, column) => {
@@ -531,7 +548,7 @@ impl QuarryWindow {
             vim_timeout_task: None,
             pending_tab_advance: None,
             pending_display_cursor: None,
-            suppress_table_selection_event: false,
+            suppress_table_selection_depth: 0,
             last_synced_doc: None,
             last_headers: Vec::new(),
             last_shown_columns: Vec::new(),
@@ -637,36 +654,41 @@ impl QuarryWindow {
                 }
                 let incoming_pos = doc_changed
                     .then(|| {
-                        self.controller
-                            .read(cx)
-                            .active_cursor(self.window_id)
-                            .and_then(|coord| {
-                                self.table.read(cx).delegate().display_position_for_source(
-                                    coord.row,
-                                    coord.column,
-                                    cx,
-                                )
-                            })
+                        let selection =
+                            self.controller.read(cx).active_selection(self.window_id)?;
+                        match selection {
+                            quarry_workbench::GridSelection::Cell { row, column } => self
+                                .table
+                                .read(cx)
+                                .delegate()
+                                .display_position_for_source(row, column, cx),
+                            quarry_workbench::GridSelection::Row { row } => self
+                                .table
+                                .read(cx)
+                                .delegate()
+                                .display_row_for_source(row, cx)
+                                .map(|table_row| (table_row, 0)),
+                        }
                     })
                     .flatten();
-                self.suppress_table_selection_event = true;
-                self.table.update(cx, |table, cx| {
-                    if doc_changed {
-                        table.delegate_mut().reset_widths();
-                        table.scroll_to_row(0, cx);
-                        table.scroll_to_col(0, cx);
-                    }
-                    table.refresh(cx);
-                    if doc_changed {
-                        if let Some((row, col)) = incoming_pos {
-                            table.set_selected_cell(row, col, cx);
-                        } else {
-                            table.clear_selection(cx);
+                self.with_suppressed_table_selection(cx, |this, cx| {
+                    this.table.update(cx, |table, cx| {
+                        if doc_changed {
+                            table.delegate_mut().reset_widths();
+                            table.scroll_to_row(0, cx);
+                            table.scroll_to_col(0, cx);
                         }
-                    }
-                    cx.notify();
+                        table.refresh(cx);
+                        if doc_changed {
+                            if let Some((row, col)) = incoming_pos {
+                                table.set_selected_cell(row, col, cx);
+                            } else {
+                                table.clear_selection(cx);
+                            }
+                        }
+                        cx.notify();
+                    });
                 });
-                self.suppress_table_selection_event = false;
                 if doc_changed {
                     let visible_rows = self.table.read(cx).delegate().visible_rows_count();
                     let start_row = incoming_pos.map_or(0, |(row, _)| row);
@@ -696,21 +718,34 @@ impl QuarryWindow {
                     self.table.update(cx, |_, cx| cx.notify());
                 }
             }
-            if let Some((pending_doc, target_row, target_col_idx)) = self.pending_display_cursor {
-                if pending_doc != info.document_id {
+            if let Some(pending) = self.pending_display_cursor {
+                if pending.doc_id != info.document_id {
                     self.pending_display_cursor = None;
-                } else {
+                } else if let Some(display_col_idx) = info
+                    .shown_columns
+                    .iter()
+                    .position(|&col| col == pending.source_col)
+                {
                     let resolved = self.controller.update(cx, |controller, cx| {
                         controller.select_display_cell_active(
                             self.window_id,
-                            target_row,
-                            target_col_idx,
+                            pending.display_row,
+                            display_col_idx,
                             cx,
                         )
                     });
                     if resolved.is_some() {
                         self.pending_display_cursor = None;
+                        let table_col = display_col_idx + 1;
+                        self.with_suppressed_table_selection(cx, |this, cx| {
+                            this.table.update(cx, |table, cx| {
+                                table.set_selected_cell(pending.display_row, table_col, cx);
+                                cx.notify();
+                            });
+                        });
                     }
+                } else {
+                    self.pending_display_cursor = None;
                 }
             }
             if info.live_watch.active {
@@ -760,14 +795,14 @@ impl QuarryWindow {
                     .update(cx, |panels, cx| panels.clear_document(window, cx));
                 self.query_bar
                     .update(cx, |bar, cx| bar.clear_document(window, cx));
-                self.suppress_table_selection_event = true;
-                self.table.update(cx, |table, cx| {
-                    table.delegate_mut().reset_widths();
-                    table.clear_selection(cx);
-                    table.refresh(cx);
-                    cx.notify();
+                self.with_suppressed_table_selection(cx, |this, cx| {
+                    this.table.update(cx, |table, cx| {
+                        table.delegate_mut().reset_widths();
+                        table.clear_selection(cx);
+                        table.refresh(cx);
+                        cx.notify();
+                    });
                 });
-                self.suppress_table_selection_event = false;
             }
             window.set_window_title("Quarry");
         }
@@ -1883,6 +1918,13 @@ impl QuarryWindow {
         if self.editing {
             return;
         }
+        if self.has_pending_cursor_for_active_doc(cx) {
+            self.set_message(
+                AppMessage::status("Waiting for the selected row to finish loading…"),
+                cx,
+            );
+            return;
+        }
         let existing_selection = self.controller.read(cx).active_selection(self.window_id);
         if existing_selection.is_none()
             && let Some((row, col)) = self.table.read(cx).selected_cell()
@@ -2086,16 +2128,50 @@ impl QuarryWindow {
         Some((rows, cols))
     }
 
+    fn with_suppressed_table_selection(
+        &mut self,
+        cx: &mut Context<Self>,
+        f: impl FnOnce(&mut Self, &mut Context<Self>),
+    ) {
+        self.suppress_table_selection_depth += 1;
+        f(self, cx);
+        cx.defer(|this, _| {
+            this.suppress_table_selection_depth =
+                this.suppress_table_selection_depth.saturating_sub(1);
+        });
+    }
+
+    fn has_pending_cursor_for_active_doc(&self, cx: &App) -> bool {
+        let Some(pending) = self.pending_display_cursor else {
+            return false;
+        };
+        self.controller
+            .read(cx)
+            .scheduler()
+            .active_document(self.window_id)
+            == Some(pending.doc_id)
+    }
+
     fn current_display_cursor(&self, cx: &App) -> Option<(usize, usize)> {
         let active_doc = self
             .controller
             .read(cx)
             .scheduler()
             .active_document(self.window_id);
-        if let Some((pending_doc, row, col_idx)) = self.pending_display_cursor
-            && Some(pending_doc) == active_doc
+        if let Some(pending) = self.pending_display_cursor
+            && Some(pending.doc_id) == active_doc
+            && let Some(col_idx) = self
+                .controller
+                .read(cx)
+                .active_document(self.window_id)
+                .and_then(|doc| {
+                    doc.columns
+                        .visible
+                        .iter()
+                        .position(|&c| c == pending.source_col)
+                })
         {
-            return Some((row, col_idx));
+            return Some((pending.display_row, col_idx));
         }
         if let Some(coord) = self.controller.read(cx).active_cursor(self.window_id) {
             if let Some((table_row, table_col)) = self
@@ -2139,6 +2215,11 @@ impl QuarryWindow {
             .read(cx)
             .scheduler()
             .active_document(self.window_id);
+        let source_col = self
+            .controller
+            .read(cx)
+            .active_document(self.window_id)
+            .and_then(|doc| doc.columns.visible.get(target_col_idx).copied());
         let resolved = self.controller.update(cx, |controller, cx| {
             controller.request_viewport_rows(self.window_id, target_row as u64, visible_rows, cx);
             controller.select_display_cell_active(self.window_id, target_row, target_col_idx, cx)
@@ -2147,26 +2228,32 @@ impl QuarryWindow {
             self.pending_display_cursor = None;
         } else {
             self.pending_display_cursor =
-                active_doc.map(|doc_id| (doc_id, target_row, target_col_idx));
+                active_doc
+                    .zip(source_col)
+                    .map(|(doc_id, source_col)| PendingDisplayCursor {
+                        doc_id,
+                        display_row: target_row,
+                        source_col,
+                    });
         }
-        self.suppress_table_selection_event = true;
-        self.table.update(cx, |table, cx| {
-            table.set_selected_cell(target_row, table_col, cx);
-            if center_column {
-                let viewport_width = table.horizontal_scroll_handle.bounds().size.width;
-                if let Some(centered_x) =
-                    table
-                        .delegate()
-                        .horizontal_center_offset_for_col(table_col, viewport_width, cx)
-                {
-                    let mut offset = table.horizontal_scroll_handle.offset();
-                    offset.x = centered_x;
-                    table.horizontal_scroll_handle.set_offset(offset);
+        self.with_suppressed_table_selection(cx, |this, cx| {
+            this.table.update(cx, |table, cx| {
+                table.set_selected_cell(target_row, table_col, cx);
+                if center_column {
+                    let viewport_width = table.horizontal_scroll_handle.bounds().size.width;
+                    if let Some(centered_x) = table.delegate().horizontal_center_offset_for_col(
+                        table_col,
+                        viewport_width,
+                        cx,
+                    ) {
+                        let mut offset = table.horizontal_scroll_handle.offset();
+                        offset.x = centered_x;
+                        table.horizontal_scroll_handle.set_offset(offset);
+                    }
                 }
-            }
-            cx.notify();
+                cx.notify();
+            });
         });
-        self.suppress_table_selection_event = false;
         if center_column {
             let table = self.table.clone();
             window.defer(cx, move |_, cx| {
@@ -3317,6 +3404,13 @@ impl QuarryWindow {
         cx: &mut Context<Self>,
     ) {
         if !self.command_enabled(CommandId::ToggleBookmark, cx) {
+            return;
+        }
+        if self.has_pending_cursor_for_active_doc(cx) {
+            self.set_message(
+                AppMessage::status("Waiting for the selected row to finish loading…"),
+                cx,
+            );
             return;
         }
         let result = self.controller.update(cx, |controller, cx| {

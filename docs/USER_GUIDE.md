@@ -757,9 +757,10 @@ composition, or with system/VoiceOver modifier chords (`Ctrl+Option`):
   Command Palette…** to fuzzy-search and run enabled commands for the active
   window and tab.
 - Prefix a Command Palette query with **`#`** (for example `#142` or `#amount`)
-  or press **`Command+L`** / **`Ctrl+L`** (**Edit → Go to Row / Column…**) to
-  jump directly to a visible row (`42` or `row:42`) or 1-based source column
-  (`#142` or a column name).
+  to search and jump directly to a 1-based source column by index or header name.
+- Press **`Command+L`** on macOS (**`Ctrl+L`** on Linux) or choose **Edit → Go
+  to Row / Column…** to jump directly to a visible row (`42` or `row:42`) or a
+  1-based source column (`#142` or a column name).
 - Duplicate header names display their 1-based `#index` and occurrence count
   (for example `#2: amount` and `#10: amount`). Jumping to a hidden column
   automatically unhides it and centers it horizontally in the grid.

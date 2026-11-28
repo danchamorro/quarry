@@ -133,8 +133,8 @@ impl QueryBar {
 
     pub fn close(&mut self, cx: &mut Context<Self>) {
         if self.open {
+            self.flush_pending_live_apply(cx);
             self.open = false;
-            self.debounce_task = None;
             cx.emit(QueryBarEvent::Closed);
             cx.notify();
         }
@@ -142,9 +142,40 @@ impl QueryBar {
 
     pub fn close_silent(&mut self, cx: &mut Context<Self>) {
         if self.open {
+            self.flush_pending_live_apply(cx);
             self.open = false;
-            self.debounce_task = None;
             cx.notify();
+        }
+    }
+
+    fn flush_pending_live_apply(&mut self, cx: &mut Context<Self>) {
+        let had_pending = self.debounce_task.take().is_some();
+        if !had_pending || !self.live_mode {
+            return;
+        }
+        let Some(current) = self.controller.read(cx).active_snapshot(self.window_id) else {
+            return;
+        };
+        if current.busy
+            || current.export_running
+            || current.search_running
+            || current.source_changed
+        {
+            return;
+        }
+        match self.revalidate_current(cx) {
+            Some(Ok(reparsed)) => {
+                if current.filter_query.as_ref() != Some(&reparsed) {
+                    self.pending_applied_query = Some(reparsed.clone());
+                    cx.emit(QueryBarEvent::Apply(reparsed));
+                }
+            }
+            None => {
+                if current.filter_active {
+                    cx.emit(QueryBarEvent::Clear);
+                }
+            }
+            Some(Err(_)) => {}
         }
     }
 

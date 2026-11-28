@@ -390,9 +390,7 @@ pub fn evaluate_command(command: CommandId, ctx: &CommandContext<'_>) -> Command
         CommandId::Save => files.save,
         CommandId::SaveAs => files.save_as,
         CommandId::SaveAsUtf8 => files.save_as_utf8,
-        CommandId::ExportFiltered => document.is_some_and(|doc| {
-            doc.filter_active() && doc.is_filter_ready() && doc.export_job.is_none()
-        }),
+        CommandId::ExportFiltered => document.is_some_and(Document::is_filtered_export_ready),
         CommandId::DiscardChanges => files.discard,
         CommandId::InspectFile => files.inspect,
         CommandId::TemporaryStorage => files.temporary_storage,
@@ -472,7 +470,25 @@ pub fn command_disabled_reason(
         }
         CommandId::Save => "No unsaved changes or save unavailable",
         CommandId::SaveAsUtf8 => "File is already UTF-8 or busy",
-        CommandId::ExportFiltered => "Apply a filter first",
+        CommandId::ExportFiltered => {
+            if !doc.filter_active() {
+                "Apply a filter first"
+            } else if doc.filter_paused_row_limit.is_some() {
+                "Resume indexing before exporting filtered rows"
+            } else if doc.filter_job.is_some() || doc.filter_refresh_pending {
+                "Wait for the active filter to finish"
+            } else if doc.filter_progress.is_some_and(|p| p.cancelled) {
+                "Reapply the cancelled filter before exporting"
+            } else if doc.export_job.is_some() || doc.save_job.is_some() {
+                "Wait for the active file operation to finish"
+            } else if doc.is_live_watching() {
+                "Stop Live Watch before exporting filtered rows"
+            } else if doc.source_changed {
+                "Reload the changed file before exporting"
+            } else {
+                "Filtered export is unavailable right now"
+            }
+        }
         CommandId::DiscardChanges => "No unsaved changes",
         CommandId::Undo => "Nothing to undo",
         CommandId::Redo => "Nothing to redo",

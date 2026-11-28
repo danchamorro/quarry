@@ -1469,10 +1469,24 @@ impl WorkbenchController {
                 show_all_whitespace: self.whitespace_prefs.show_all,
             };
             let res = evaluate_command(command, &ctx);
-            let is_app_or_window = matches!(
-                res.target,
-                Some(CommandTarget::Application | CommandTarget::Window(_))
-            );
+            let word_wrap_targets_tab = command == CommandId::ToggleWordWrap
+                && [active_doc, captured_doc]
+                    .into_iter()
+                    .flatten()
+                    .any(|doc_id| {
+                        self.scheduler.tab(doc_id).is_some_and(|tab| {
+                            let bytes = tab.document.as_ref().map(|d| d.session.active_byte_len());
+                            let next = self
+                                .word_wrap_prefs
+                                .toggle_for_tab(tab.word_wrap_override, bytes);
+                            next.next_tab_override != tab.word_wrap_override
+                        })
+                    });
+            let is_app_or_window = !word_wrap_targets_tab
+                && matches!(
+                    res.target,
+                    Some(CommandTarget::Application | CommandTarget::Window(_))
+                );
             if !is_app_or_window {
                 return (false, Some("The target tab is no longer active"));
             }
@@ -1519,7 +1533,7 @@ impl WorkbenchController {
             return None;
         }
         let doc = self.scheduler.tab(doc_id)?.document.as_ref()?;
-        let width = doc.known_width();
+        let width = doc.total_columns;
         let headers = (0..width).map(|col| doc.column_name(col)).collect();
         let hidden = (0..width)
             .map(|col| doc.columns.hidden.get(col).copied().unwrap_or(false))

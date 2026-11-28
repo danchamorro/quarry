@@ -6331,27 +6331,39 @@ fn command_palette_captured_target_and_hash_column_jump_unhide_center(cx: &mut T
     .unwrap();
     cx.run_until_parked();
 
-    // Column #10 (source col 9) is now auto-shown, selected, and horizontal scroll moved.
-    cx.update(|cx| {
+    // Column #10 (source col 9) is now auto-shown, selected, and horizontal scroll moved to center it.
+    cx.update_window(win.into(), |_, window, cx| {
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(win.into(), |_, window, cx| {
+        window.render_frame(cx);
         let snap = view.read(cx).snapshot(cx).unwrap();
         assert!(snap.shown_columns.contains(&9));
         let expected_table_col = snap.shown_columns.iter().position(|&c| c == 9).unwrap() + 1;
-        assert_eq!(
-            view.read(cx).table.read(cx).selected_cell(),
-            Some((0, expected_table_col))
-        );
-        let center = view
-            .read(cx)
-            .table
-            .read(cx)
-            .delegate()
-            .horizontal_center_offset_for_col(expected_table_col, px(500.), cx)
-            .unwrap();
+        let table = view.read(cx).table.read(cx);
+        assert_eq!(table.selected_cell(), Some((0, expected_table_col)));
+        let viewport_width = table.horizontal_scroll_handle.bounds().size.width;
         assert!(
-            f32::from(center) < 0.0,
-            "wide column #10 should center left"
+            f32::from(viewport_width) > 0.0,
+            "rendered table viewport width must be positive"
         );
-    });
+        let expected_x = table
+            .delegate()
+            .horizontal_center_offset_for_col(expected_table_col, viewport_width, cx)
+            .unwrap();
+        let actual_x = table.horizontal_scroll_handle.offset().x;
+        assert!(
+            f32::from(actual_x) < 0.0,
+            "wide column #10 should scroll horizontally left (got actual_x={actual_x:?})"
+        );
+        assert!(
+            (f32::from(actual_x) - f32::from(expected_x)).abs() < 1.0,
+            "actual horizontal scroll {actual_x:?} must match centered offset {expected_x:?}"
+        );
+    })
+    .unwrap();
 
     // `Cmd/Ctrl+L` Go to Row or Column jumps to Row 4.
     cx.update_window(win.into(), |_, window, cx| {
@@ -6558,7 +6570,13 @@ fn astra_review_regressions_stale_copy_deep_jump_tab_cursor_and_palette_scroll(
     let path_b = dir.path().join("tab_b.csv");
     let mut csv_a = String::from("id,tag,val\n");
     for i in 1..=120 {
-        let tag = if i <= 90 { "KEEP" } else { "DROP" };
+        // Only even rows through source row 118 match (59 matches total), keeping the final
+        // filtered display row (58) strictly distinct from its physical source row (118).
+        let tag = if i % 2 == 0 && i <= 118 {
+            "KEEP"
+        } else {
+            "DROP"
+        };
         csv_a.push_str(&format!("{i},{tag},from_tab_a_{i}\n"));
     }
     std::fs::write(&path_a, csv_a).unwrap();
@@ -6720,9 +6738,10 @@ fn astra_review_regressions_stale_copy_deep_jump_tab_cursor_and_palette_scroll(
         );
     });
 
-    // 5. Deep jump beyond loaded filter buffer: filter 90 matching rows (`tag == "KEEP"`),
-    //    jump to DocEnd (display row 89 -> physical source row 90), wait for async filter read,
-    //    then toggle bookmark and verify physical row 90 is bookmarked!
+    // 5. Deep jump beyond loaded filter buffer: filter 59 nonconsecutive matching rows
+    //    (even rows 2..=118), jump to DocEnd (display row 58 -> physical source row 118),
+    //    verify ToggleBookmark while pending does NOT bookmark the stale row, wait for async
+    //    filter read, then toggle bookmark and verify physical row 118 is bookmarked!
     let query = quarry_core::FilterQuery {
         predicates: vec![quarry_core::FilterPredicate {
             column: 1,
@@ -6741,21 +6760,32 @@ fn astra_review_regressions_stale_copy_deep_jump_tab_cursor_and_palette_scroll(
     .unwrap();
     wait_for_ui(cx, win, &controller, &view, |q, _, cx| {
         q.snapshot(cx)
-            .is_some_and(|s| s.filter_active && s.filter_done && s.available_rows == 90)
+            .is_some_and(|s| s.filter_active && s.filter_done && s.available_rows == 59)
     });
+    // Select display row 0 (physical source row 2) first, then jump to DocEnd (display row 58).
     cx.update_window(win.into(), |_, window, cx| {
         view.update(cx, |q, cx| {
+            q.apply_display_cursor(0, 1, false, window, cx);
             q.move_grid_cursor(quarry_workbench::CursorMotion::DocEnd, window, cx);
+            // If the jump is still pending, ToggleBookmark must not bookmark stale row 2.
+            if q.pending_display_cursor.is_some() {
+                q.toggle_bookmark_action(&super::menus::ToggleBookmark, window, cx);
+                let doc = controller.read(cx).active_document(win_id).unwrap();
+                assert!(
+                    !doc.bookmarks.contains_row(2),
+                    "ToggleBookmark while filtered jump is pending must not bookmark the old row"
+                );
+            }
         });
     })
     .unwrap();
     wait_for_ui(cx, win, &controller, &view, |q, _, cx| {
-        q.table.read(cx).selected_cell().map(|(r, _)| r) == Some(89)
+        q.table.read(cx).selected_cell().map(|(r, _)| r) == Some(58)
             && q.pending_display_cursor.is_none()
             && controller
                 .read(cx)
                 .active_cursor(win_id)
-                .is_some_and(|c| c.row == 90)
+                .is_some_and(|c| c.row == 118)
     });
     cx.update_window(win.into(), |_, window, cx| {
         view.update(cx, |q, cx| {
@@ -6766,8 +6796,8 @@ fn astra_review_regressions_stale_copy_deep_jump_tab_cursor_and_palette_scroll(
     cx.update(|cx| {
         let doc = controller.read(cx).active_document(win_id).unwrap();
         assert!(
-            doc.bookmarks.contains_row(90),
-            "bookmark after filtered DocEnd beyond buffer must target physical row 90"
+            doc.bookmarks.contains_row(118),
+            "bookmark after filtered DocEnd beyond buffer must target physical row 118"
         );
     });
     // Clear filter before testing Find Next focus preservation.
@@ -6888,6 +6918,50 @@ fn astra_review_regressions_stale_copy_deep_jump_tab_cursor_and_palette_scroll(
             view.read(cx).table.read(cx).selected_cell(),
             Some((0, 1)),
             "Down after deselecting a gutter row must start fresh at (0, 1)"
+        );
+    });
+
+    // 8. Switching tabs preserves both whole-row selection (selected_rows + GridSelection::Row)
+    //    and column selection (selected_columns) without queued TableEvent delivery clearing them.
+    cx.update_window(win.into(), |_, window, cx| {
+        controller.update(cx, |c, cx| {
+            c.select_row_active(win_id, 4, false, false, cx);
+            c.activate_tab(win_id, id_b, cx).unwrap();
+        });
+        view.update(cx, |q, cx| q.sync_from_controller(window, cx));
+        controller.update(cx, |c, cx| {
+            c.select_column_active(win_id, 1, false, false, cx);
+            c.activate_tab(win_id, id_a, cx).unwrap();
+        });
+        view.update(cx, |q, cx| q.sync_from_controller(window, cx));
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update(|cx| {
+        let doc_a = controller.read(cx).active_document(win_id).unwrap();
+        assert_eq!(
+            doc_a.selection,
+            Some(quarry_workbench::GridSelection::Row { row: 4 }),
+            "returning to Tab A must keep whole-row selection intact"
+        );
+        assert!(
+            doc_a.selected_rows.contains(4),
+            "returning to Tab A must not clear selected_rows"
+        );
+    });
+    cx.update_window(win.into(), |_, window, cx| {
+        controller.update(cx, |c, cx| {
+            c.activate_tab(win_id, id_b, cx).unwrap();
+        });
+        view.update(cx, |q, cx| q.sync_from_controller(window, cx));
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update(|cx| {
+        let doc_b = controller.read(cx).active_document(win_id).unwrap();
+        assert!(
+            doc_b.selected_columns.contains(&1),
+            "returning to Tab B must not clear selected_columns"
         );
     });
 }

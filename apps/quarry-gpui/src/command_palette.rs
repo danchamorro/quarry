@@ -87,22 +87,29 @@ impl CommandPalette {
             InputState::new(window, cx)
                 .placeholder("Type a command or #column (e.g. #142, amount)…")
         });
-        let subscriptions = vec![cx.subscribe_in(
-            &input,
-            window,
-            |this, _, event: &InputEvent, _, cx| match event {
-                InputEvent::Change => {
-                    this.selected_index = 0;
-                    this.rebuild_cache(cx);
-                    this.results_scroll.scroll_to_item(0);
-                    cx.notify();
+        let subscriptions = vec![
+            cx.subscribe_in(
+                &input,
+                window,
+                |this, _, event: &InputEvent, _, cx| match event {
+                    InputEvent::Change => {
+                        this.selected_index = 0;
+                        this.rebuild_cache(cx);
+                        this.results_scroll.scroll_to_item(0);
+                        cx.notify();
+                    }
+                    InputEvent::PressEnter { .. } => {
+                        this.activate_selected(cx);
+                    }
+                    _ => {}
+                },
+            ),
+            cx.observe(&controller, |this, _, cx| {
+                if this.open {
+                    this.refresh_command_states(cx);
                 }
-                InputEvent::PressEnter { .. } => {
-                    this.activate_selected(cx);
-                }
-                _ => {}
-            },
-        )];
+            }),
+        ];
         Self {
             controller,
             window_id,
@@ -233,6 +240,37 @@ impl CommandPalette {
         self.cached_empty_msg = format!("No commands match \"{}\".", query.trim());
     }
 
+    fn refresh_command_states(&mut self, cx: &mut Context<Self>) {
+        if self.cached_is_jump {
+            return;
+        }
+        let controller = self.controller.read(cx);
+        let mut changed = false;
+        for row in &mut self.cached_rows {
+            if let PaletteRow::Command {
+                matched,
+                enabled,
+                disabled_reason,
+            } = row
+            {
+                let (next_enabled, next_reason) = controller
+                    .evaluate_command_for_captured_document(
+                        self.window_id,
+                        self.captured_doc,
+                        matched.command.id,
+                    );
+                if *enabled != next_enabled || *disabled_reason != next_reason {
+                    *enabled = next_enabled;
+                    *disabled_reason = next_reason;
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            cx.notify();
+        }
+    }
+
     pub fn move_selection(&mut self, delta: isize, cx: &mut Context<Self>) {
         if self.cached_rows.is_empty() {
             self.selected_index = 0;
@@ -251,10 +289,26 @@ impl CommandPalette {
             return;
         };
         match row {
-            PaletteRow::Command {
-                matched, enabled, ..
-            } => {
+            PaletteRow::Command { matched, .. } => {
+                let (enabled, disabled_reason) = self
+                    .controller
+                    .read(cx)
+                    .evaluate_command_for_captured_document(
+                        self.window_id,
+                        self.captured_doc,
+                        matched.command.id,
+                    );
+                if let Some(PaletteRow::Command {
+                    enabled: cached_enabled,
+                    disabled_reason: cached_reason,
+                    ..
+                }) = self.cached_rows.get_mut(index)
+                {
+                    *cached_enabled = enabled;
+                    *cached_reason = disabled_reason;
+                }
                 if !enabled {
+                    cx.notify();
                     return;
                 }
                 let cmd = matched.command.id;

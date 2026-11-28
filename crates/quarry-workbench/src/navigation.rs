@@ -228,7 +228,7 @@ impl VimKeyState {
             return VimAction::Ignored;
         }
 
-        self.expire_if_elapsed(now);
+        let expired = self.expire_if_elapsed(now);
 
         let is_lower_g = !mods.shift && key == "g" && key_char.is_none_or(|c| c == "g");
         let is_upper_g =
@@ -251,7 +251,7 @@ impl VimKeyState {
             return VimAction::PendingKey("g…");
         }
 
-        let had_pending = self.cancel();
+        let had_pending = self.cancel() || expired;
 
         if !mods.shift {
             match key {
@@ -627,5 +627,40 @@ mod tests {
         prefs.set_enabled(false).unwrap();
         let reloaded_off = VimMotionPreferences::load(Some(path));
         assert!(!reloaded_off.enabled);
+    }
+
+    #[test]
+    fn vim_gg_expiration_reports_cleared_pending_on_late_unrecognized_key() {
+        let mut state = VimKeyState::default();
+        let none = GridKeyModifiers::default();
+        let t0 = Instant::now();
+        let after = t0 + VIM_GG_TIMEOUT + Duration::from_millis(5);
+
+        assert_eq!(
+            state.handle_key_at(true, "g", Some("g"), none, false, t0),
+            VimAction::PendingKey("g…")
+        );
+        // Late unrecognized key after deadline must report ClearedPending so the UI repaints.
+        assert_eq!(
+            state.handle_key_at(true, "x", Some("x"), none, false, after),
+            VimAction::ClearedPending
+        );
+        assert_eq!(state.pending_indicator(), None);
+
+        // Late `g` after deadline starts a new pending sequence instead of DocStart.
+        assert_eq!(
+            state.handle_key_at(true, "g", Some("g"), none, false, t0),
+            VimAction::PendingKey("g…")
+        );
+        assert_eq!(
+            state.handle_key_at(true, "g", Some("g"), none, false, after),
+            VimAction::PendingKey("g…")
+        );
+
+        // Late recognized motion after deadline still executes the motion.
+        assert_eq!(
+            state.handle_key_at(true, "j", Some("j"), none, false, after + VIM_GG_TIMEOUT),
+            VimAction::Move(CursorMotion::Down)
+        );
     }
 }
