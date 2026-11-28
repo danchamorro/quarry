@@ -6343,6 +6343,28 @@ impl Document {
         }
     }
 
+    /// Returns a zero-copy shared handle (`Arc<Row>`, `Arc<FilterMatch>`, or `Arc<Vec<u8>>`) for
+    /// `(row, column)` when loaded, avoiding full-cell copies on the UI thread for huge cells.
+    pub fn cell_inspector_input(&self, row: u64, column: usize) -> Option<whitespace::Input> {
+        if let Some(value) = self.cell_edits.get(&(row, column)) {
+            return Some(whitespace::Input::Owned(value.clone()));
+        }
+        if self.filter_active() {
+            let found = self.filtered_rows.iter().find(|value| value.row == row)?;
+            if column >= found.fields.len() {
+                return None;
+            }
+            Some(whitespace::Input::Filtered(found.clone(), column))
+        } else {
+            let index = usize::try_from(row.checked_sub(self.buffer_start)?).ok()?;
+            let loaded = self.buffered_rows.get(index)?;
+            if column >= loaded.fields.len() {
+                return None;
+            }
+            Some(whitespace::Input::Row(loaded.clone(), column))
+        }
+    }
+
     pub fn whitespace_header_input(&self, column: usize) -> whitespace::Input {
         self.header_renames.get(&column).map_or_else(
             || whitespace::Input::Header(self.session.clone(), column),

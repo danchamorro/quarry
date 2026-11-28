@@ -1,6 +1,6 @@
-//! Docked, keyboard-accessible Cell Inspector drawer backed by bounded lexers
-//! and cancellable background line-start indexing / JSON pretty-printing in
-//! `quarry_workbench::cell_inspector`.
+//! Docked, keyboard-accessible Cell Inspector drawer backed by bounded lexers,
+//! zero-copy shared cell inputs, and cancellable background line-start indexing /
+//! JSON pretty-printing in `quarry_workbench::cell_inspector`.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -16,9 +16,12 @@ use quarry_workbench::{
     inspector_token_color, tokenize_line,
 };
 
+use crate::menus::CopySelection;
 use crate::workbench::WorkbenchController;
 
 const INSPECTOR_LINE_HEIGHT_PX: f32 = 20.0;
+const INSPECTOR_HPAN_STEP_CHARS: usize = 24;
+const INSPECTOR_PAGE_LINES: usize = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InspectorViewMode {
@@ -40,7 +43,7 @@ struct InspectedTarget {
     source_row: u64,
     source_col: usize,
     edit_revision: u64,
-    data_row_1based: u64,
+    display_row_number: u64,
     column_name: String,
     can_edit: bool,
 }
@@ -51,6 +54,7 @@ pub struct CellInspector {
     focus_handle: FocusHandle,
     open: bool,
     view_mode: InspectorViewMode,
+    force_json: bool,
     target: Option<InspectedTarget>,
     absent_cell: bool,
     waiting_for_row: bool,
@@ -59,6 +63,8 @@ pub struct CellInspector {
     active_task: Option<Task<()>>,
     snapshot: Option<CellInspectorSnapshot>,
     loading: bool,
+    top_line: usize,
+    h_offset_chars: usize,
     scroll_handle: UniformListScrollHandle,
     _subscriptions: Vec<Subscription>,
 }
@@ -83,6 +89,7 @@ impl CellInspector {
             focus_handle,
             open: false,
             view_mode: InspectorViewMode::Raw,
+            force_json: false,
             target: None,
             absent_cell: false,
             waiting_for_row: false,
@@ -91,6 +98,8 @@ impl CellInspector {
             active_task: None,
             snapshot: None,
             loading: false,
+            top_line: 0,
+            h_offset_chars: 0,
             scroll_handle: UniformListScrollHandle::new(),
             _subscriptions: subscriptions,
         }
@@ -134,6 +143,9 @@ impl CellInspector {
         self.waiting_for_row = false;
         self.loading = false;
         self.view_mode = InspectorViewMode::Raw;
+        self.force_json = false;
+        self.top_line = 0;
+        self.h_offset_chars = 0;
         cx.emit(CellInspectorEvent::Closed);
         cx.notify();
     }
@@ -146,6 +158,9 @@ impl CellInspector {
         self.waiting_for_row = false;
         self.loading = false;
         self.view_mode = InspectorViewMode::Raw;
+        self.force_json = false;
+        self.top_line = 0;
+        self.h_offset_chars = 0;
         if self.open {
             self.open = false;
         }
@@ -167,8 +182,18 @@ impl CellInspector {
             return;
         }
         self.view_mode = mode;
+        self.top_line = 0;
+        self.h_offset_chars = 0;
         self.scroll_handle.scroll_to_item(0, ScrollStrategy::Top);
         cx.notify();
+    }
+
+    pub fn toggle_force_json(&mut self, cx: &mut Context<Self>) {
+        self.force_json = !self.force_json;
+        self.view_mode = InspectorViewMode::Raw;
+        self.top_line = 0;
+        self.h_offset_chars = 0;
+        self.start_job_for_current_target(cx);
     }
 
     fn has_ready_pretty_json(&self) -> bool {
@@ -176,6 +201,41 @@ impl CellInspector {
             .as_ref()
             .and_then(|s| s.pretty_json.as_ref())
             .is_some_and(|p| matches!(p, PrettyJsonResult::Ready { .. }))
+    }
+
+    fn active_line_count(&self) -> usize {
+        let Some(snap) = &self.snapshot else {
+            return 0;
+        };
+        if self.view_mode == InspectorViewMode::Pretty
+            && let Some(PrettyJsonResult::Ready { lines, .. }) = &snap.pretty_json
+        {
+            return lines.len();
+        }
+        snap.raw_lines.len()
+    }
+
+    fn scroll_vertical(&mut self, next_top: usize, cx: &mut Context<Self>) {
+        let count = self.active_line_count();
+        if count == 0 {
+            return;
+        }
+        let clamped = next_top.min(count.saturating_sub(1));
+        if clamped != self.top_line {
+            self.top_line = clamped;
+            self.scroll_handle
+                .scroll_to_item(clamped, ScrollStrategy::Top);
+            cx.notify();
+        }
+    }
+
+    fn pan_horizontal(&mut self, next_col: usize, cx: &mut Context<Self>) {
+        let max_col = MAX_INSPECTOR_LINE_BYTES.saturating_sub(16);
+        let clamped = next_col.min(max_col);
+        if clamped != self.h_offset_chars {
+            self.h_offset_chars = clamped;
+            cx.notify();
+        }
     }
 
     pub fn copy_current_view(&mut self, cx: &mut Context<Self>) {
@@ -197,13 +257,14 @@ impl CellInspector {
             });
             return;
         }
-        if snap.raw.len() > MAX_COPY_BYTES {
+        let raw_bytes = snap.raw.bytes();
+        if raw_bytes.len() > MAX_COPY_BYTES {
             cx.emit(CellInspectorEvent::CopyError(
                 "Cell exceeds the 64 MiB clipboard limit.".into(),
             ));
             return;
         }
-        match std::str::from_utf8(&snap.raw) {
+        match std::str::from_utf8(raw_bytes) {
             Ok(text) => {
                 cx.emit(CellInspectorEvent::CopyText {
                     text: text.to_owned(),
@@ -222,39 +283,35 @@ impl CellInspector {
         if !self.open {
             return;
         }
-        let lookup = {
+        // Step 1: Lightweight metadata-only lookup (ZERO cell byte allocations/copies!).
+        let meta_lookup = {
             let controller = self.controller.read(cx);
             let active_doc_id = controller.scheduler().active_document(self.window_id);
             active_doc_id.and_then(|doc_id| {
                 let doc = controller.active_document(self.window_id)?;
                 let Some(GridSelection::Cell { row, column }) = doc.selection else {
-                    return Some((None, None, false));
+                    return Some(None);
                 };
-                let target = InspectedTarget {
+                let display_row_number = doc
+                    .global_data_row_number(row)
+                    .unwrap_or_else(|| row.saturating_sub(doc.data_start).saturating_add(1));
+                let can_edit = doc
+                    .cell_edit_disabled_reason(doc.effective_cell(row, column))
+                    .is_none();
+                Some(Some(InspectedTarget {
                     doc_id,
                     instance_id: doc.instance_id,
                     source_row: row,
                     source_col: column,
                     edit_revision: doc.edit_revision,
-                    data_row_1based: row.saturating_sub(doc.data_start).saturating_add(1),
+                    display_row_number,
                     column_name: doc.column_name(column),
-                    can_edit: !doc.source_changed && !doc.is_live_watching(),
-                };
-                let bytes = doc.effective_cell(row, column).map(Arc::<[u8]>::from);
-                let row_loaded = if doc.filter_active() {
-                    doc.filtered_rows.iter().any(|m| m.row == row)
-                } else {
-                    row >= doc.buffer_start
-                        && row
-                            < doc
-                                .buffer_start
-                                .saturating_add(doc.buffered_rows.len() as u64)
-                };
-                Some((Some(target), bytes, row_loaded))
+                    can_edit,
+                }))
             })
         };
 
-        let Some((Some(next_target), raw_opt, row_loaded)) = lookup else {
+        let Some(Some(next_target)) = meta_lookup else {
             if self.target.is_some()
                 || self.snapshot.is_some()
                 || self.loading
@@ -268,6 +325,9 @@ impl CellInspector {
                 self.waiting_for_row = false;
                 self.loading = false;
                 self.view_mode = InspectorViewMode::Raw;
+                self.force_json = false;
+                self.top_line = 0;
+                self.h_offset_chars = 0;
                 cx.notify();
             }
             return;
@@ -288,13 +348,45 @@ impl CellInspector {
             return;
         }
 
-        self.cancel_in_flight();
+        if content_changed {
+            self.force_json = false;
+            self.view_mode = InspectorViewMode::Raw;
+            self.top_line = 0;
+            self.h_offset_chars = 0;
+        }
         self.target = Some(next_target);
+        self.start_job_for_current_target(cx);
+    }
+
+    fn start_job_for_current_target(&mut self, cx: &mut Context<Self>) {
+        let Some(target) = self.target.clone() else {
+            return;
+        };
+        // Step 2: Zero-copy Arc handle lookup (`Arc<Row>`, `Arc<FilterMatch>`, or `Arc<Vec<u8>>`).
+        let (input_opt, row_loaded) = {
+            let controller = self.controller.read(cx);
+            controller
+                .active_document(self.window_id)
+                .map_or((None, false), |doc| {
+                    let input = doc.cell_inspector_input(target.source_row, target.source_col);
+                    let row_loaded = if doc.filter_active() {
+                        doc.filtered_rows.iter().any(|m| m.row == target.source_row)
+                    } else {
+                        target.source_row >= doc.buffer_start
+                            && target.source_row
+                                < doc
+                                    .buffer_start
+                                    .saturating_add(doc.buffered_rows.len() as u64)
+                    };
+                    (input, row_loaded)
+                })
+        };
+
+        self.cancel_in_flight();
         self.snapshot = None;
-        self.view_mode = InspectorViewMode::Raw;
         self.scroll_handle.scroll_to_item(0, ScrollStrategy::Top);
 
-        let Some(raw) = raw_opt else {
+        let Some(raw) = input_opt else {
             if row_loaded {
                 self.absent_cell = true;
                 self.waiting_for_row = false;
@@ -313,6 +405,7 @@ impl CellInspector {
         self.loading = true;
         self.generation = self.generation.wrapping_add(1);
         let job_gen = self.generation;
+        let force_json = self.force_json;
         let cancel = Arc::new(AtomicBool::new(false));
         self.active_cancel = Some(Arc::clone(&cancel));
 
@@ -320,7 +413,9 @@ impl CellInspector {
             let cancel_bg = Arc::clone(&cancel);
             let snapshot = cx
                 .background_executor()
-                .spawn(async move { build_inspector_snapshot(job_gen, raw, &cancel_bg) })
+                .spawn(
+                    async move { build_inspector_snapshot(job_gen, raw, force_json, &cancel_bg) },
+                )
                 .await;
             let Some(snapshot) = snapshot else {
                 return;
@@ -338,34 +433,70 @@ impl CellInspector {
         cx.notify();
     }
 
-    fn render_line_row(&self, line_idx: usize, cx: &App) -> AnyElement {
-        let resolved = self.controller.read(cx).resolved_theme();
-        let tokens = resolved.palette;
-        let appearance = resolved.appearance;
-        let Some(snap) = &self.snapshot else {
-            return div().h(px(INSPECTOR_LINE_HEIGHT_PX)).into_any_element();
-        };
-
+    fn slice_line_with_pan(
+        &self,
+        line_idx: usize,
+    ) -> Option<(String, Vec<quarry_workbench::TokenSpan>, usize, usize, bool)> {
+        let snap = self.snapshot.as_ref()?;
         let (bytes, line_index, format): (&[u8], &quarry_workbench::LineIndex, CellFormat) =
             if self.view_mode == InspectorViewMode::Pretty
                 && let Some(PrettyJsonResult::Ready { text, lines }) = &snap.pretty_json
             {
                 (text.as_bytes(), lines, CellFormat::Json)
             } else {
-                (&snap.raw, &snap.raw_lines, snap.detected_format)
+                (snap.raw.bytes(), &snap.raw_lines, snap.detected_format)
             };
 
         let in_fence = format == CellFormat::Markdown && line_index.in_code_fence_before(line_idx);
-        let Some(slice) = line_index.line_slice(bytes, line_idx, MAX_INSPECTOR_LINE_BYTES) else {
-            return div().h(px(INSPECTOR_LINE_HEIGHT_PX)).into_any_element();
-        };
+        let slice = line_index.line_slice(bytes, line_idx, MAX_INSPECTOR_LINE_BYTES)?;
         let tokenized = tokenize_line(&slice.text, format, in_fence, MAX_INSPECTOR_LINE_BYTES);
         let total_truncated = slice
             .truncated_bytes
             .saturating_add(tokenized.truncated_bytes);
 
-        let highlights: Vec<(std::ops::Range<usize>, HighlightStyle)> = tokenized
+        let pan_byte_start = tokenized
+            .text
+            .char_indices()
+            .nth(self.h_offset_chars)
+            .map_or(tokenized.text.len(), |(idx, _)| idx);
+        let visible_text = tokenized.text[pan_byte_start..].to_owned();
+        let spans = tokenized
             .spans
+            .into_iter()
+            .filter_map(|span| {
+                if span.range.end <= pan_byte_start {
+                    return None;
+                }
+                let start = span.range.start.saturating_sub(pan_byte_start);
+                let end = span.range.end.saturating_sub(pan_byte_start);
+                (start < end && end <= visible_text.len()).then_some(quarry_workbench::TokenSpan {
+                    range: start..end,
+                    kind: span.kind,
+                })
+            })
+            .collect();
+        let overflows_drawer = visible_text.chars().count() > 44;
+
+        Some((
+            visible_text,
+            spans,
+            total_truncated,
+            slice.total_line_bytes,
+            overflows_drawer,
+        ))
+    }
+
+    fn render_line_row(&self, line_idx: usize, cx: &App) -> AnyElement {
+        let resolved = self.controller.read(cx).resolved_theme();
+        let tokens = resolved.palette;
+        let appearance = resolved.appearance;
+        let Some((mut text_content, spans, total_truncated, total_line_bytes, overflows_drawer)) =
+            self.slice_line_with_pan(line_idx)
+        else {
+            return div().h(px(INSPECTOR_LINE_HEIGHT_PX)).into_any_element();
+        };
+
+        let highlights: Vec<(std::ops::Range<usize>, HighlightStyle)> = spans
             .into_iter()
             .map(|span| {
                 let color = inspector_token_color(span.kind, appearance, &tokens);
@@ -379,11 +510,10 @@ impl CellInspector {
             })
             .collect();
 
-        let mut text_content = tokenized.text;
         let truncation_suffix = if total_truncated > 0 {
             Some(format!(
                 " … (showing first {} of {} bytes on this line)",
-                MAX_INSPECTOR_LINE_BYTES, slice.total_line_bytes
+                MAX_INSPECTOR_LINE_BYTES, total_line_bytes
             ))
         } else {
             None
@@ -413,7 +543,7 @@ impl CellInspector {
                     .w(px(44.))
                     .flex_shrink_0()
                     .text_right()
-                    .text_color(rgb(tokens.text_tertiary.to_rgb_hex()))
+                    .text_color(rgb(tokens.text_secondary.to_rgb_hex()))
                     .text_size(px(11.))
                     .child((line_idx + 1).to_string()),
             )
@@ -435,6 +565,14 @@ impl CellInspector {
                     .text_color(rgb(tokens.warning_text.to_rgb_hex()))
                     .child(suffix),
             );
+        } else if overflows_drawer {
+            row = row.child(
+                div()
+                    .flex_shrink_0()
+                    .text_size(px(11.))
+                    .text_color(rgb(tokens.text_secondary.to_rgb_hex()))
+                    .child("→"),
+            );
         }
 
         row.into_any_element()
@@ -443,6 +581,21 @@ impl CellInspector {
     #[cfg(test)]
     pub fn is_loading_for_test(&self) -> bool {
         self.loading
+    }
+
+    #[cfg(test)]
+    pub fn generation_for_test(&self) -> u64 {
+        self.generation
+    }
+
+    #[cfg(test)]
+    pub fn top_line_for_test(&self) -> usize {
+        self.top_line
+    }
+
+    #[cfg(test)]
+    pub fn h_offset_chars_for_test(&self) -> usize {
+        self.h_offset_chars
     }
 
     #[cfg(test)]
@@ -468,30 +621,13 @@ impl CellInspector {
 
     #[cfg(test)]
     pub fn line_count_for_test(&self) -> usize {
-        let Some(snap) = &self.snapshot else {
-            return 0;
-        };
-        if self.view_mode == InspectorViewMode::Pretty
-            && let Some(PrettyJsonResult::Ready { lines, .. }) = &snap.pretty_json
-        {
-            return lines.len();
-        }
-        snap.raw_lines.len()
+        self.active_line_count()
     }
 
     #[cfg(test)]
     pub fn line_preview_for_test(&self, line_idx: usize) -> Option<(String, usize)> {
-        let snap = self.snapshot.as_ref()?;
-        let (bytes, lines): (&[u8], &quarry_workbench::LineIndex) = if self.view_mode
-            == InspectorViewMode::Pretty
-            && let Some(PrettyJsonResult::Ready { text, lines }) = &snap.pretty_json
-        {
-            (text.as_bytes(), lines)
-        } else {
-            (&snap.raw, &snap.raw_lines)
-        };
-        let slice = lines.line_slice(bytes, line_idx, MAX_INSPECTOR_LINE_BYTES)?;
-        Some((slice.text.into_owned(), slice.truncated_bytes))
+        let (text, _, truncated, _, _) = self.slice_line_with_pan(line_idx)?;
+        Some((text, truncated))
     }
 
     #[cfg(test)]
@@ -514,18 +650,20 @@ impl Render for CellInspector {
         let is_json = self
             .snapshot
             .as_ref()
-            .is_some_and(|s| s.detected_format == CellFormat::Json);
+            .is_some_and(|s| s.detected_format == CellFormat::Json)
+            || self.force_json;
         let has_pretty = self.has_ready_pretty_json();
 
         let (format_label, stats_label) = if let Some(snap) = &self.snapshot {
-            let line_count = if self.view_mode == InspectorViewMode::Pretty
+            let active_lines = if self.view_mode == InspectorViewMode::Pretty
                 && let Some(PrettyJsonResult::Ready { lines, .. }) = &snap.pretty_json
             {
-                lines.len()
+                lines
             } else {
-                snap.raw_lines.len()
+                &snap.raw_lines
             };
-            let truncated_note = if snap.raw_lines.truncated_lines() {
+            let line_count = active_lines.len();
+            let truncated_note = if active_lines.truncated_lines() {
                 "+"
             } else {
                 ""
@@ -534,7 +672,7 @@ impl Render for CellInspector {
                 Some(snap.detected_format.label()),
                 Some(format!(
                     "{} · {}{} {}",
-                    format_byte_count(snap.raw.len()),
+                    format_byte_count(snap.raw.bytes().len()),
                     line_count,
                     truncated_note,
                     if line_count == 1 { "line" } else { "lines" }
@@ -549,6 +687,17 @@ impl Render for CellInspector {
                 .as_ref()
                 .and_then(|s| match s.pretty_json.as_ref() {
                     Some(PrettyJsonResult::Invalid(err)) => Some((true, err.display_summary())),
+                    Some(PrettyJsonResult::DepthLimitExceeded {
+                        max_depth,
+                        line,
+                        column,
+                        ..
+                    }) => Some((
+                        false,
+                        format!(
+                            "JSON nesting exceeds {max_depth}-level limit (line {line}, column {column}); showing bounded raw view."
+                        ),
+                    )),
                     Some(PrettyJsonResult::TooLarge { limit_bytes, .. }) => Some((
                         false,
                         format!(
@@ -576,17 +725,82 @@ impl Render for CellInspector {
             .bg(rgb(tokens.canvas.to_rgb_hex()))
             .border_l_1()
             .border_color(rgb(tokens.separator.to_rgb_hex()))
+            .on_action(cx.listener(|this, _: &CopySelection, _, cx| {
+                this.copy_current_view(cx);
+            }))
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
-                if event.keystroke.key == "escape" {
-                    cx.stop_propagation();
-                    this.close(cx);
+                let mods = event.keystroke.modifiers;
+                match event.keystroke.key.as_str() {
+                    "escape" => {
+                        cx.stop_propagation();
+                        this.close(cx);
+                    }
+                    "down" => {
+                        cx.stop_propagation();
+                        if mods.platform || mods.control {
+                            let end = this.active_line_count().saturating_sub(1);
+                            this.scroll_vertical(end, cx);
+                        } else {
+                            this.scroll_vertical(this.top_line.saturating_add(1), cx);
+                        }
+                    }
+                    "up" => {
+                        cx.stop_propagation();
+                        if mods.platform || mods.control {
+                            this.scroll_vertical(0, cx);
+                        } else {
+                            this.scroll_vertical(this.top_line.saturating_sub(1), cx);
+                        }
+                    }
+                    "pagedown" => {
+                        cx.stop_propagation();
+                        this.scroll_vertical(
+                            this.top_line.saturating_add(INSPECTOR_PAGE_LINES),
+                            cx,
+                        );
+                    }
+                    "pageup" => {
+                        cx.stop_propagation();
+                        this.scroll_vertical(
+                            this.top_line.saturating_sub(INSPECTOR_PAGE_LINES),
+                            cx,
+                        );
+                    }
+                    "right" => {
+                        cx.stop_propagation();
+                        this.pan_horizontal(
+                            this.h_offset_chars
+                                .saturating_add(INSPECTOR_HPAN_STEP_CHARS),
+                            cx,
+                        );
+                    }
+                    "left" => {
+                        cx.stop_propagation();
+                        this.pan_horizontal(
+                            this.h_offset_chars
+                                .saturating_sub(INSPECTOR_HPAN_STEP_CHARS),
+                            cx,
+                        );
+                    }
+                    "home" => {
+                        cx.stop_propagation();
+                        this.pan_horizontal(0, cx);
+                    }
+                    "end" => {
+                        cx.stop_propagation();
+                        if let Some((text, _, _, _, _)) = this.slice_line_with_pan(this.top_line) {
+                            let total_chars = self_line_chars(this.h_offset_chars, &text);
+                            this.pan_horizontal(total_chars.saturating_sub(32), cx);
+                        }
+                    }
+                    _ => {}
                 }
             }));
 
         // Header
         let subtitle = target
             .as_ref()
-            .map(|t| format!("Row {} · {}", t.data_row_1based, t.column_name))
+            .map(|t| format!("Row {} · {}", t.display_row_number, t.column_name))
             .unwrap_or_else(|| "No cell selected".into());
 
         drawer = drawer.child(
@@ -678,8 +892,9 @@ impl Render for CellInspector {
             .border_color(rgb(tokens.separator.to_rgb_hex()))
             .flex()
             .flex_row()
+            .flex_wrap()
             .items_center()
-            .gap_1p5();
+            .gap_1();
 
         if is_json {
             let raw_btn = Button::new("cell-inspector-raw")
@@ -708,6 +923,57 @@ impl Render for CellInspector {
             };
 
             actions = actions.child(raw_btn).child(pretty_btn);
+        } else if self.snapshot.is_some() {
+            actions = actions.child(
+                Button::new("cell-inspector-try-json")
+                    .label("Parse JSON")
+                    .ghost()
+                    .xsmall()
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.toggle_force_json(cx);
+                    })),
+            );
+        }
+
+        if self.snapshot.is_some() {
+            actions = actions
+                .child(
+                    Button::new("cell-inspector-pan-left")
+                        .label("◀")
+                        .accessibility_label("Pan line left")
+                        .ghost()
+                        .xsmall()
+                        .disabled(self.h_offset_chars == 0)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.pan_horizontal(
+                                this.h_offset_chars
+                                    .saturating_sub(INSPECTOR_HPAN_STEP_CHARS),
+                                cx,
+                            );
+                        })),
+                )
+                .child(
+                    Button::new("cell-inspector-pan-right")
+                        .label("▶")
+                        .accessibility_label("Pan line right")
+                        .ghost()
+                        .xsmall()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.pan_horizontal(
+                                this.h_offset_chars
+                                    .saturating_add(INSPECTOR_HPAN_STEP_CHARS),
+                                cx,
+                            );
+                        })),
+                );
+            if self.h_offset_chars > 0 {
+                actions = actions.child(
+                    div()
+                        .text_size(px(11.))
+                        .text_color(rgb(tokens.text_secondary.to_rgb_hex()))
+                        .child(format!("Col {}", self.h_offset_chars + 1)),
+                );
+            }
         }
 
         let copy_label = if self.view_mode == InspectorViewMode::Pretty && has_pretty {
@@ -744,7 +1010,7 @@ impl Render for CellInspector {
             );
         drawer = drawer.child(actions);
 
-        // Diagnostic banners (invalid JSON error position, size cap, invalid UTF-8)
+        // Diagnostic banners (invalid JSON error position, nesting/size caps, invalid UTF-8)
         if let Some((is_error, notice)) = json_notice {
             let (bg, fg) = if is_error {
                 (tokens.error_fill, tokens.error_text)
@@ -811,15 +1077,7 @@ impl Render for CellInspector {
                     .child("Indexing cell…"),
             );
         } else {
-            let line_count = self.snapshot.as_ref().map_or(0, |snap| {
-                if self.view_mode == InspectorViewMode::Pretty
-                    && let Some(PrettyJsonResult::Ready { lines, .. }) = &snap.pretty_json
-                {
-                    lines.len()
-                } else {
-                    snap.raw_lines.len()
-                }
-            });
+            let line_count = self.active_line_count();
             let entity = cx.entity().clone();
             drawer = drawer.child(
                 div()
@@ -844,6 +1102,10 @@ impl Render for CellInspector {
 
         drawer
     }
+}
+
+fn self_line_chars(offset: usize, visible_tail: &str) -> usize {
+    offset.saturating_add(visible_tail.chars().count())
 }
 
 fn format_byte_count(bytes: usize) -> String {

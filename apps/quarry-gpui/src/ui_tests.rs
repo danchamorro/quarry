@@ -7043,6 +7043,13 @@ fn cell_inspector_drawer_json_pretty_invalid_stack_markdown_10mib_and_escape_foc
     let invalid_json = "{\"a\": 1, \"b\": [1, ]}";
     let stack = "Traceback (most recent call last):\n  File \"worker.py\", line 42, in run\nValueError: boom";
     let markdown = "# Heading\n```rust\nlet v = 1;\n```\n- item";
+    let long_and_multiline = {
+        let mut s = format!("{}TAIL_MARKER\n", "a".repeat(190));
+        for n in 2..=60 {
+            s.push_str(&format!("multiline_row_{n}\n"));
+        }
+        s
+    };
     let ten_mib = "x".repeat(10 * 1024 * 1024);
 
     let quote = |s: &str| format!("\"{}\"", s.replace('"', "\"\""));
@@ -7051,6 +7058,7 @@ fn cell_inspector_drawer_json_pretty_invalid_stack_markdown_10mib_and_escape_foc
     csv.push_str(&format!("invalid_json,{}\n", quote(invalid_json)));
     csv.push_str(&format!("stack,{}\n", quote(stack)));
     csv.push_str(&format!("markdown,{}\n", quote(markdown)));
+    csv.push_str(&format!("long_multi,{}\n", quote(&long_and_multiline)));
     csv.push_str(&format!("ten_mib,{ten_mib}\n"));
     std::fs::write(&csv_path, csv).unwrap();
 
@@ -7066,18 +7074,58 @@ fn cell_inspector_drawer_json_pretty_invalid_stack_markdown_10mib_and_escape_foc
     .unwrap();
     wait_for_ui(cx, win, &controller, &view, |q, _, cx| {
         q.snapshot(cx)
-            .is_some_and(|s| s.index_done && s.available_rows == 5)
+            .is_some_and(|s| s.index_done && s.available_rows == 6)
     });
 
-    // 1. Select valid JSON cell (row 0, col 1 -> table col 2) and open Cell Inspector via Cmd/Ctrl+I action.
+    // 1. Select valid JSON cell and verify Cmd/Ctrl+I shortcut opens and focuses the drawer,
+    //    and is blocked while the Command Palette overlay is open.
+    #[cfg(target_os = "macos")]
+    let primary_mods = Modifiers {
+        platform: true,
+        ..Modifiers::default()
+    };
+    #[cfg(not(target_os = "macos"))]
+    let primary_mods = Modifiers {
+        control: true,
+        ..Modifiers::default()
+    };
+
     cx.update_window(win.into(), |_, window, cx| {
         view.update(cx, |q, cx| {
             q.apply_display_cursor(0, 1, false, window, cx);
-            q.toggle_cell_inspector_action(&super::menus::ToggleCellInspector, window, cx);
+            q.open_command_palette_action(&super::menus::OpenCommandPalette, window, cx);
         });
         window.render_frame(cx);
     })
     .unwrap();
+    // Cmd/Ctrl+I while palette is open must NOT open the drawer behind the palette.
+    cx.dispatch_keystroke(
+        win.into(),
+        Keystroke {
+            modifiers: primary_mods,
+            key: "i".into(),
+            key_char: None,
+        },
+    );
+    cx.run_until_parked();
+    cx.update_window(win.into(), |_, window, cx| {
+        assert!(!view.read(cx).cell_inspector.read(cx).is_open());
+        view.update(cx, |q, cx| {
+            q.command_palette.update(cx, |p, cx| p.close(cx));
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+
+    // Real Cmd/Ctrl+I shortcut now opens and focuses the Cell Inspector drawer.
+    cx.dispatch_keystroke(
+        win.into(),
+        Keystroke {
+            modifiers: primary_mods,
+            key: "i".into(),
+            key_char: None,
+        },
+    );
     wait_for_ui(cx, win, &controller, &view, |q, _, cx| {
         let insp = q.cell_inspector.read(cx);
         insp.is_open()
@@ -7085,7 +7133,22 @@ fn cell_inspector_drawer_json_pretty_invalid_stack_markdown_10mib_and_escape_foc
             && insp.detected_format_for_test() == Some(quarry_workbench::CellFormat::Json)
     });
 
-    // Raw text is visible initially; switching to Pretty JSON preserves duplicate keys & exact numbers.
+    // Unrelated controller notification must NOT re-spawn an inspector job (generation unchanged).
+    let gen_before = cx.update(|cx| view.read(cx).cell_inspector.read(cx).generation_for_test());
+    cx.update(|cx| {
+        controller.update(cx, |_, cx| cx.notify());
+    });
+    cx.run_until_parked();
+    cx.update(|cx| {
+        assert_eq!(
+            view.read(cx).cell_inspector.read(cx).generation_for_test(),
+            gen_before,
+            "unrelated controller notification must not re-copy or re-index unchanged cell"
+        );
+    });
+
+    // Switch to Pretty JSON and press real Cmd/Ctrl+C inside the focused drawer: clipboard must
+    // receive the formatted Pretty JSON (not the raw grid cell), preserving duplicate keys & numbers.
     cx.update_window(win.into(), |_, window, cx| {
         let insp = view.read(cx).cell_inspector.read(cx);
         assert_eq!(
@@ -7096,12 +7159,24 @@ fn cell_inspector_drawer_json_pretty_invalid_stack_markdown_10mib_and_escape_foc
         view.update(cx, |q, cx| {
             q.cell_inspector.update(cx, |i, cx| {
                 i.set_view_mode(super::cell_inspector::InspectorViewMode::Pretty, cx);
-                i.copy_current_view(cx);
             });
         });
+        view.read(cx)
+            .cell_inspector
+            .read(cx)
+            .focus_handle()
+            .focus(window, cx);
         window.render_frame(cx);
     })
     .unwrap();
+    cx.dispatch_keystroke(
+        win.into(),
+        Keystroke {
+            modifiers: primary_mods,
+            key: "c".into(),
+            key_char: None,
+        },
+    );
     cx.run_until_parked();
     cx.update(|cx| {
         let insp = view.read(cx).cell_inspector.read(cx);
@@ -7111,6 +7186,10 @@ fn cell_inspector_drawer_json_pretty_invalid_stack_markdown_10mib_and_escape_foc
         );
         assert!(insp.line_count_for_test() >= 5);
         let clip = cx.read_from_clipboard().and_then(|c| c.text()).unwrap();
+        assert!(
+            clip.contains('\n'),
+            "Cmd/Ctrl+C in Pretty JSON mode must copy formatted multi-line JSON, got: {clip}"
+        );
         assert_eq!(
             clip.matches("\"id\":").count(),
             2,
@@ -7189,7 +7268,8 @@ fn cell_inspector_drawer_json_pretty_invalid_stack_markdown_10mib_and_escape_foc
         );
     });
 
-    // 4. 10 MiB single-line cell stays bounded to MAX_INSPECTOR_LINE_BYTES and renders cleanly.
+    // 4. Horizontal panning (Right) reaches TAIL_MARKER at col 190 of a 200-char line, and
+    //    vertical keyboard scrolling (PageDown) advances top_line below the first screen.
     cx.update_window(win.into(), |_, window, cx| {
         view.update(cx, |q, cx| {
             q.apply_display_cursor(4, 1, false, window, cx);
@@ -7200,6 +7280,67 @@ fn cell_inspector_drawer_json_pretty_invalid_stack_markdown_10mib_and_escape_foc
     wait_for_ui(cx, win, &controller, &view, |q, _, cx| {
         let insp = q.cell_inspector.read(cx);
         insp.inspected_coord_for_test() == Some((5, 1))
+            && !insp.is_loading_for_test()
+            && insp.line_count_for_test() >= 60
+    });
+    cx.update_window(win.into(), |_, window, cx| {
+        view.read(cx)
+            .cell_inspector
+            .read(cx)
+            .focus_handle()
+            .focus(window, cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    // Pan right 8 times (8 * 24 = 192 chars) so TAIL_MARKER is at the leading edge of line 0.
+    for _ in 0..8 {
+        cx.dispatch_keystroke(
+            win.into(),
+            Keystroke {
+                modifiers: Modifiers::default(),
+                key: "right".into(),
+                key_char: None,
+            },
+        );
+    }
+    // Page down 3 times (3 * 16 = line 48) below the first screen.
+    for _ in 0..3 {
+        cx.dispatch_keystroke(
+            win.into(),
+            Keystroke {
+                modifiers: Modifiers::default(),
+                key: "pagedown".into(),
+                key_char: None,
+            },
+        );
+    }
+    cx.run_until_parked();
+    cx.update(|cx| {
+        let insp = view.read(cx).cell_inspector.read(cx);
+        assert!(insp.h_offset_chars_for_test() >= 180);
+        let (panned_line, _) = insp.line_preview_for_test(0).unwrap();
+        assert!(
+            panned_line.contains("TAIL_MARKER") || panned_line.contains("MARKER"),
+            "horizontal panning must reach TAIL_MARKER at end of 200-char line (got {panned_line:?})"
+        );
+        assert!(
+            insp.top_line_for_test() >= 48,
+            "PageDown must scroll below the first screen (got top_line={})",
+            insp.top_line_for_test()
+        );
+    });
+
+    // 5. 10 MiB single-line cell stays bounded to MAX_INSPECTOR_LINE_BYTES and renders cleanly.
+    cx.update_window(win.into(), |_, window, cx| {
+        view.update(cx, |q, cx| {
+            q.apply_display_cursor(5, 1, false, window, cx);
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+    wait_for_ui(cx, win, &controller, &view, |q, _, cx| {
+        let insp = q.cell_inspector.read(cx);
+        insp.inspected_coord_for_test() == Some((6, 1))
             && !insp.is_loading_for_test()
             && insp.line_count_for_test() == 1
     });
@@ -7215,7 +7356,7 @@ fn cell_inspector_drawer_json_pretty_invalid_stack_markdown_10mib_and_escape_foc
     })
     .unwrap();
 
-    // 5. Pressing Escape inside the focused Cell Inspector closes it and restores grid focus.
+    // 6. Pressing Escape inside the focused Cell Inspector closes it and restores grid focus.
     cx.update_window(win.into(), |_, window, cx| {
         view.read(cx)
             .cell_inspector

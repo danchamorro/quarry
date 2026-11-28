@@ -779,14 +779,19 @@ composition, or with system/VoiceOver modifier chords (`Ctrl+Option`):
   **Java/Python/Rust stack traces**, and **Markdown** (headings, fenced code
   blocks, inline code, lists, and blockquotes) using bounded per-line byte and
   token budgets so multi-megabyte single-line cells stay responsive.
-- **JSON Raw / Pretty view:** Valid JSON cells (up to 4 MiB) are pretty-printed
-  in the background while preserving duplicate keys and exact numeric lexemes
-  (`1.00`, arbitrary-precision integers, large exponents). Invalid JSON keeps
-  the raw text visible and displays the exact line, column, and byte offset of
-  the syntax error.
-- **Actions & focus:** Use **Copy Raw** / **Copy Pretty** to copy the displayed
-  view (up to 64 MiB), **Edit…** to open the inline cell editor, and press
-  **`Escape`** inside the drawer to close it and return focus to the data grid.
+- **JSON Raw / Pretty view:** Valid JSON cells (up to 4 MiB and 256 nesting
+  levels) are pretty-printed in the background while preserving duplicate keys
+  and exact numeric lexemes (`1.00`, arbitrary-precision integers, large
+  exponents). Invalid JSON keeps the raw text visible and displays the exact
+  line, column, and byte offset of the syntax error. Click **Parse JSON** to
+  validate and format ambiguous cells or top-level JSON values explicitly.
+- **Navigation, actions, & focus:** Use `Up`/`Down`/`PageUp`/`PageDown` to
+  scroll lines and `Left`/`Right`/`Home`/`End` (or **`◀`** / **`▶`**) to pan
+  horizontally across long lines up to the 4 KiB per-line budget. Press
+  **`Command+C`** / **`Ctrl+C`** (or click **Copy Raw** / **Copy Pretty**) to
+  copy the active view (up to 64 MiB), **Edit…** to open the inline cell
+  editor, and **`Escape`** inside the drawer to close it and return focus to
+  the data grid.
 
 ### Filter rows
 

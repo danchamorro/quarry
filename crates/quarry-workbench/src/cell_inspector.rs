@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
 use crate::theme::{Palette, Rgba, ThemeAppearance};
+use crate::whitespace;
 use crate::word_wrap::utf8_bounded_prefix_len;
 
 /// Maximum prefix inspected on the UI thread to classify cell format.
@@ -112,10 +113,13 @@ pub struct BoundedLineSlice<'a> {
 /// Compact line-start index built on a background worker thread.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LineIndex {
-    /// Byte offset where each line begins (always starts with `0` for non-empty buffers).
+    /// Byte offset where each line begins (always starts with `0`).
     starts: Vec<usize>,
-    /// Line indices whose trimmed text opens or closes a Markdown code fence (```` ``` ```` / `~~~`).
-    fence_lines: Vec<usize>,
+    /// Exclusive end byte offset of the last indexed line (including its trailing `\n` if any)
+    /// so hitting [`MAX_INSPECTOR_LINE_OFFSETS`] never merges unindexed tail lines into the last line.
+    last_line_end: usize,
+    /// Disjoint sorted line ranges `[first_body_line..closing_fence_line)` inside Markdown code fences.
+    fenced_body_ranges: Vec<Range<usize>>,
     total_bytes: usize,
     truncated_lines: bool,
 }
@@ -124,18 +128,31 @@ impl LineIndex {
     /// Builds a line-start index for `bytes`, checking `cancel` periodically.
     /// Returns `None` if cancelled before completion.
     pub fn build_cancellable(bytes: &[u8], cancel: &AtomicBool) -> Option<Self> {
+        Self::build_cancellable_with_limit(bytes, cancel, MAX_INSPECTOR_LINE_OFFSETS)
+    }
+
+    /// Builds a line-start index capped at `max_lines` entries.
+    pub fn build_cancellable_with_limit(
+        bytes: &[u8],
+        cancel: &AtomicBool,
+        max_lines: usize,
+    ) -> Option<Self> {
+        let cap = max_lines.max(1);
         if bytes.is_empty() {
             return Some(Self {
                 starts: vec![0],
-                fence_lines: Vec::new(),
+                last_line_end: 0,
+                fenced_body_ranges: Vec::new(),
                 total_bytes: 0,
                 truncated_lines: false,
             });
         }
 
         let mut starts = vec![0usize];
-        let mut fence_lines = Vec::new();
+        let mut fenced_body_ranges: Vec<Range<usize>> = Vec::new();
+        let mut active_fence: Option<(u8, usize, usize)> = None; // (char, run_len, body_start_line)
         let mut truncated_lines = false;
+        let mut last_line_end = bytes.len();
         let mut line_start = 0usize;
         let mut line_idx = 0usize;
 
@@ -144,12 +161,17 @@ impl LineIndex {
                 return None;
             }
             if b == b'\n' {
-                if is_fence_delimiter_bytes(&bytes[line_start..i]) {
-                    fence_lines.push(line_idx);
-                }
+                let line_bytes = strip_trailing_cr(&bytes[line_start..i]);
+                update_fence_state(
+                    line_bytes,
+                    line_idx,
+                    &mut active_fence,
+                    &mut fenced_body_ranges,
+                );
                 if i + 1 < bytes.len() {
-                    if starts.len() >= MAX_INSPECTOR_LINE_OFFSETS {
+                    if starts.len() >= cap {
                         truncated_lines = true;
+                        last_line_end = i + 1;
                         break;
                     }
                     starts.push(i + 1);
@@ -157,19 +179,29 @@ impl LineIndex {
                     line_idx += 1;
                 } else {
                     line_start = bytes.len();
+                    last_line_end = bytes.len();
                 }
             }
         }
-        if !truncated_lines
-            && line_start < bytes.len()
-            && is_fence_delimiter_bytes(&bytes[line_start..])
+        if !truncated_lines && line_start < bytes.len() {
+            let line_bytes = strip_trailing_cr(&bytes[line_start..]);
+            update_fence_state(
+                line_bytes,
+                line_idx,
+                &mut active_fence,
+                &mut fenced_body_ranges,
+            );
+        }
+        if let Some((_, _, body_start)) = active_fence
+            && body_start < starts.len()
         {
-            fence_lines.push(line_idx);
+            fenced_body_ranges.push(body_start..starts.len());
         }
 
         Some(Self {
             starts,
-            fence_lines,
+            last_line_end,
+            fenced_body_ranges,
             total_bytes: bytes.len(),
             truncated_lines,
         })
@@ -191,9 +223,14 @@ impl LineIndex {
         self.truncated_lines
     }
 
-    /// Returns whether `line_idx` starts inside a fenced Markdown code block in O(log F).
+    /// Returns whether `line_idx` is inside a fenced Markdown code block in O(log F).
     pub fn in_code_fence_before(&self, line_idx: usize) -> bool {
-        self.fence_lines.partition_point(|&l| l < line_idx) % 2 == 1
+        let pos = self
+            .fenced_body_ranges
+            .partition_point(|range| range.end <= line_idx);
+        self.fenced_body_ranges
+            .get(pos)
+            .is_some_and(|range| range.contains(&line_idx))
     }
 
     /// Returns the raw byte range (excluding trailing `\r`/`\n`) for `line_idx`.
@@ -203,7 +240,7 @@ impl LineIndex {
             .starts
             .get(line_idx + 1)
             .copied()
-            .unwrap_or(bytes.len())
+            .unwrap_or(self.last_line_end)
             .min(bytes.len());
         if start > raw_end {
             return Some(raw_end..raw_end);
@@ -255,6 +292,55 @@ impl LineIndex {
     }
 }
 
+fn strip_trailing_cr(line: &[u8]) -> &[u8] {
+    line.strip_suffix(b"\r").unwrap_or(line)
+}
+
+/// Parses a CommonMark-compatible code fence opener/closer delimiter (`char`, `run_len`, `has_info`).
+fn parse_fence_delimiter(line: &[u8]) -> Option<(u8, usize, bool)> {
+    let trimmed = trim_ascii_start(line);
+    let &ch = trimmed.first()?;
+    if ch != b'`' && ch != b'~' {
+        return None;
+    }
+    let run_len = trimmed.iter().take_while(|&&b| b == ch).count();
+    if run_len < 3 {
+        return None;
+    }
+    let rest = &trimmed[run_len..];
+    // Per CommonMark, backtick fence info strings cannot contain backticks.
+    if ch == b'`' && rest.contains(&b'`') {
+        return None;
+    }
+    let has_info = rest.iter().any(|b| !b.is_ascii_whitespace());
+    Some((ch, run_len, has_info))
+}
+
+fn update_fence_state(
+    line: &[u8],
+    line_idx: usize,
+    active_fence: &mut Option<(u8, usize, usize)>,
+    fenced_body_ranges: &mut Vec<Range<usize>>,
+) {
+    let Some((ch, run_len, has_info)) = parse_fence_delimiter(line) else {
+        return;
+    };
+    match *active_fence {
+        None => {
+            *active_fence = Some((ch, run_len, line_idx + 1));
+        }
+        Some((open_ch, open_len, body_start)) => {
+            // Closing fence must use the same character, have >= opening length, and have no info string.
+            if ch == open_ch && run_len >= open_len && !has_info {
+                if body_start < line_idx {
+                    fenced_body_ranges.push(body_start..line_idx);
+                }
+                *active_fence = None;
+            }
+        }
+    }
+}
+
 fn bounded_slice_end(bytes: &[u8], cap: usize) -> usize {
     if bytes.len() <= cap {
         return bytes.len();
@@ -271,11 +357,6 @@ fn bounded_slice_end(bytes: &[u8], cap: usize) -> usize {
             }
         }
     }
-}
-
-fn is_fence_delimiter_bytes(line: &[u8]) -> bool {
-    let trimmed = trim_ascii_start(line);
-    trimmed.starts_with(b"```") || trimmed.starts_with(b"~~~")
 }
 
 fn trim_ascii_start(mut bytes: &[u8]) -> &[u8] {
@@ -326,7 +407,13 @@ fn looks_like_json_prefix(trimmed: &str) -> bool {
         return true;
     };
     if first == b'{' {
-        matches!(second, b'"' | b'}')
+        if matches!(second, b'"' | b'}') {
+            return true;
+        }
+        // Treat `{...}` or `{key: ...}` payloads (like malformed `{oops}` / `{a: 1}`) as JSON
+        // so the inspector shows exact JSON diagnostics while keeping raw text visible.
+        let trimmed_end = trimmed.trim_end_matches(|c: char| c.is_ascii_whitespace());
+        trimmed_end.ends_with('}') || rest.contains(':')
     } else {
         matches!(
             second,
@@ -402,7 +489,7 @@ fn looks_like_markdown(text: &str) -> bool {
         if is_markdown_heading(trimmed) {
             has_heading = true;
         }
-        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+        if parse_fence_delimiter(trimmed.as_bytes()).is_some() {
             has_fence = true;
         }
         if trimmed.starts_with("- ")
@@ -566,7 +653,6 @@ fn tokenize_stack_trace_line(line: &str) -> Vec<TokenSpan> {
         return spans;
     }
 
-    // Python traceback header / Rust panic / Java Caused by / Exception header.
     if trimmed.starts_with("Traceback (most recent call last):")
         || trimmed.starts_with("Caused by:")
         || (trimmed.starts_with("thread '") && trimmed.contains("panicked at"))
@@ -577,7 +663,6 @@ fn tokenize_stack_trace_line(line: &str) -> Vec<TokenSpan> {
         return spans;
     }
 
-    // Python frame: `  File "/path/foo.py", line 42, in func_name`
     if let Some(rest) = trimmed.strip_prefix("File \"") {
         let file_start = leading + 5;
         if let Some(close_quote) = rest.find('"') {
@@ -599,7 +684,6 @@ fn tokenize_stack_trace_line(line: &str) -> Vec<TokenSpan> {
         }
     }
 
-    // Java / Kotlin / Rust `at ...` frame.
     if let Some(after_at) = trimmed.strip_prefix("at ") {
         let at_start = leading;
         let sym_start = at_start + 3;
@@ -611,7 +695,6 @@ fn tokenize_stack_trace_line(line: &str) -> Vec<TokenSpan> {
             push_span(&mut spans, paren_abs..line.len(), TokenKind::StackLocation);
             return spans;
         }
-        // Rust backtrace location line: `             at /path/file.rs:12:5`
         if after_at.contains(':') && (after_at.contains('/') || after_at.contains('\\')) {
             push_span(&mut spans, sym_start..line.len(), TokenKind::StackLocation);
             return spans;
@@ -620,7 +703,6 @@ fn tokenize_stack_trace_line(line: &str) -> Vec<TokenSpan> {
         return spans;
     }
 
-    // Rust numbered frame: `   0: crate::module::func`
     if is_rust_numbered_frame(trimmed)
         && let Some(colon) = trimmed.find(": ")
     {
@@ -643,14 +725,15 @@ fn tokenize_markdown_line(line: &str, in_code_fence: bool) -> (Vec<TokenSpan>, b
     let leading = line.len() - line.trim_start().len();
     let trimmed = &line[leading..];
 
-    if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
-        push_span(&mut spans, leading..line.len(), TokenKind::MarkdownFence);
-        return (spans, !in_code_fence);
-    }
     if in_code_fence {
         if !line.is_empty() {
             push_span(&mut spans, 0..line.len(), TokenKind::MarkdownCode);
         }
+        return (spans, true);
+    }
+
+    if parse_fence_delimiter(trimmed.as_bytes()).is_some() {
+        push_span(&mut spans, leading..line.len(), TokenKind::MarkdownFence);
         return (spans, true);
     }
     if is_markdown_heading(trimmed) {
@@ -671,7 +754,6 @@ fn tokenize_markdown_line(line: &str, in_code_fence: bool) -> (Vec<TokenSpan>, b
         content_start = leading + marker_len;
     }
 
-    // Highlight inline `code` spans on the remaining text.
     let bytes = line.as_bytes();
     let mut i = content_start;
     while i < bytes.len() && spans.len() < MAX_INSPECTOR_TOKENS_PER_LINE {
@@ -721,6 +803,12 @@ pub enum PrettyJsonResult {
         lines: LineIndex,
     },
     Invalid(JsonPrettyError),
+    DepthLimitExceeded {
+        max_depth: usize,
+        byte_offset: usize,
+        line: usize,
+        column: usize,
+    },
     TooLarge {
         actual_bytes: usize,
         limit_bytes: usize,
@@ -751,13 +839,19 @@ pub fn pretty_print_json_streaming(input: &[u8], cancel: &AtomicBool) -> PrettyJ
             limit_bytes: MAX_PRETTY_JSON_INPUT_BYTES,
         };
     }
-    let Ok(text) = std::str::from_utf8(input) else {
-        return PrettyJsonResult::Invalid(JsonPrettyError {
-            message: "cell contains invalid UTF-8 bytes".into(),
-            byte_offset: 0,
-            line: 1,
-            column: 1,
-        });
+    let text = match std::str::from_utf8(input) {
+        Ok(text) => text,
+        Err(err) => {
+            let offset = err.valid_up_to();
+            let valid_prefix = std::str::from_utf8(&input[..offset]).unwrap_or("");
+            let (line, column) = line_col_at_offset(valid_prefix, offset);
+            return PrettyJsonResult::Invalid(JsonPrettyError {
+                message: "cell contains invalid UTF-8 bytes".into(),
+                byte_offset: offset,
+                line,
+                column,
+            });
+        }
     };
 
     let bytes = text.as_bytes();
@@ -824,7 +918,6 @@ pub fn pretty_print_json_streaming(input: &[u8], cancel: &AtomicBool) -> PrettyJ
                                 *expect_key_or_end = true;
                             }
                             expect_comma_or_end = false;
-                            // Peek next non-ws to reject trailing comma before `}`.
                             skip_json_ws(bytes, &mut pos);
                             if bytes.get(pos) == Some(&b'}') {
                                 return make_err(pos, "trailing comma before '}'");
@@ -951,7 +1044,13 @@ pub fn pretty_print_json_streaming(input: &[u8], cancel: &AtomicBool) -> PrettyJ
         match b {
             b'{' => {
                 if stack.len() >= MAX_JSON_NESTING_DEPTH {
-                    return make_err(pos, "JSON nesting exceeds 256-level limit");
+                    let (line, column) = line_col_at_offset(text, pos);
+                    return PrettyJsonResult::DepthLimitExceeded {
+                        max_depth: MAX_JSON_NESTING_DEPTH,
+                        byte_offset: pos,
+                        line,
+                        column,
+                    };
                 }
                 pos += 1;
                 out.push('{');
@@ -963,7 +1062,13 @@ pub fn pretty_print_json_streaming(input: &[u8], cancel: &AtomicBool) -> PrettyJ
             }
             b'[' => {
                 if stack.len() >= MAX_JSON_NESTING_DEPTH {
-                    return make_err(pos, "JSON nesting exceeds 256-level limit");
+                    let (line, column) = line_col_at_offset(text, pos);
+                    return PrettyJsonResult::DepthLimitExceeded {
+                        max_depth: MAX_JSON_NESTING_DEPTH,
+                        byte_offset: pos,
+                        line,
+                        column,
+                    };
                 }
                 pos += 1;
                 out.push('[');
@@ -1151,8 +1256,15 @@ fn line_col_at_offset(text: &str, byte_offset: usize) -> (usize, usize) {
     let prefix = &text[..safe_end];
     let mut line = 1usize;
     let mut col = 1usize;
-    for ch in prefix.chars() {
+    let mut chars = prefix.chars().peekable();
+    while let Some(ch) = chars.next() {
         if ch == '\n' {
+            line += 1;
+            col = 1;
+        } else if ch == '\r' {
+            if chars.peek() == Some(&'\n') {
+                chars.next();
+            }
             line += 1;
             col = 1;
         } else {
@@ -1162,11 +1274,11 @@ fn line_col_at_offset(text: &str, byte_offset: usize) -> (usize, usize) {
     (line, col)
 }
 
-/// Completed immutable snapshot produced by [`CellInspectorJob`].
-#[derive(Debug, Clone)]
+/// Completed immutable snapshot produced by [`build_inspector_snapshot`] / [`CellInspectorJob`].
+#[derive(Clone)]
 pub struct CellInspectorSnapshot {
     pub generation: u64,
-    pub raw: Arc<[u8]>,
+    pub raw: whitespace::Input,
     pub raw_lines: LineIndex,
     pub detected_format: CellFormat,
     pub valid_utf8: bool,
@@ -1175,22 +1287,29 @@ pub struct CellInspectorSnapshot {
 
 /// Builds an immutable [`CellInspectorSnapshot`] synchronously (intended to run on a background
 /// thread or executor), returning `None` if `cancel` is signalled before completion.
+///
+/// When `force_json` is true (user explicitly selected JSON interpretation), runs the streaming
+/// JSON validator/formatter even if prefix detection classified the cell as plain text.
 pub fn build_inspector_snapshot(
     generation: u64,
-    raw: Arc<[u8]>,
+    raw: whitespace::Input,
+    force_json: bool,
     cancel: &AtomicBool,
 ) -> Option<CellInspectorSnapshot> {
-    let raw_lines = LineIndex::build_cancellable(&raw, cancel)?;
+    let bytes = raw.bytes();
+    let raw_lines = LineIndex::build_cancellable(bytes, cancel)?;
     if cancel.load(Ordering::Relaxed) {
         return None;
     }
-    let valid_utf8 = std::str::from_utf8(&raw).is_ok();
-    let mut detected_format = detect_cell_format(&raw);
+    let valid_utf8 = std::str::from_utf8(bytes).is_ok();
+    let mut detected_format = detect_cell_format(bytes);
     if !valid_utf8 {
         detected_format = CellFormat::InvalidUtf8;
+    } else if force_json {
+        detected_format = CellFormat::Json;
     }
-    let pretty_json = if detected_format == CellFormat::Json {
-        let res = pretty_print_json_streaming(&raw, cancel);
+    let pretty_json = if detected_format == CellFormat::Json || (force_json && !valid_utf8) {
+        let res = pretty_print_json_streaming(bytes, cancel);
         if matches!(res, PrettyJsonResult::Cancelled) {
             return None;
         }
@@ -1223,7 +1342,8 @@ impl CellInspectorJob {
     /// Spawns a cancellable background thread to index `raw` and pretty-print JSON when detected.
     pub fn spawn(
         generation: u64,
-        raw: Arc<[u8]>,
+        raw: whitespace::Input,
+        force_json: bool,
         on_done: Option<Arc<dyn Fn() + Send + Sync>>,
     ) -> Self {
         let cancel = Arc::new(AtomicBool::new(false));
@@ -1234,7 +1354,9 @@ impl CellInspectorJob {
         let handle = thread::Builder::new()
             .name("quarry-cell-inspector".into())
             .spawn(move || {
-                let Some(snapshot) = build_inspector_snapshot(generation, raw, &cancel_bg) else {
+                let Some(snapshot) =
+                    build_inspector_snapshot(generation, raw, force_json, &cancel_bg)
+                else {
                     return;
                 };
                 if let Ok(mut guard) = result_bg.lock() {
@@ -1296,26 +1418,33 @@ pub struct HoverPeek {
     pub truncated: bool,
 }
 
+/// Fast O(1) zero-allocation check used during grid paint to decide whether a cell qualifies for
+/// Hover-to-Peek without allocating strings or running format detection until actually hovered.
+pub fn needs_hover_peek(raw: &[u8], col_width_px: f32, font_size_px: f32) -> bool {
+    if raw.is_empty() {
+        return false;
+    }
+    let avg_char_px = (font_size_px * 0.62).max(5.0);
+    let inner_width = (col_width_px - 16.0).max(24.0);
+    let fitting_chars = ((inner_width / avg_char_px).floor() as usize).max(8);
+    if raw.len() > fitting_chars {
+        return true;
+    }
+    let scan_len = raw.len().min(MAX_PEEK_BYTES);
+    raw[..scan_len].iter().any(|&b| b == b'\n' || b == b'\r')
+}
+
 /// Builds a bounded hover-to-peek preview from already-parsed viewport bytes `raw`.
 ///
 /// Performs zero file I/O and returns `None` for short single-line values that fit
 /// comfortably inside `col_width_px`.
 pub fn build_hover_peek(raw: &[u8], col_width_px: f32, font_size_px: f32) -> Option<HoverPeek> {
-    if raw.is_empty() {
+    if !needs_hover_peek(raw, col_width_px, font_size_px) {
         return None;
     }
-    let avg_char_px = (font_size_px * 0.62).max(5.0);
-    let inner_width = (col_width_px - 16.0).max(24.0);
-    let fitting_chars = ((inner_width / avg_char_px).floor() as usize).max(8);
 
     let prefix_len = bounded_slice_end(raw, MAX_PEEK_BYTES);
     let prefix = &raw[..prefix_len];
-    let has_line_break = prefix.iter().any(|&b| b == b'\n' || b == b'\r');
-
-    if !has_line_break && raw.len() <= fitting_chars {
-        return None;
-    }
-
     let format = detect_cell_format(raw);
     let text = String::from_utf8_lossy(prefix);
     let mut lines_out = Vec::new();
@@ -1369,35 +1498,33 @@ pub fn inspector_token_color(
     match (appearance, kind) {
         (_, TokenKind::Plain) => tokens.text,
         (_, TokenKind::Punctuation) => tokens.text_secondary,
-        // Light theme (>= 4.5:1 against #FFFFFF canvas)
         (ThemeAppearance::Light, TokenKind::JsonKey | TokenKind::MarkdownHeading) => {
-            Rgba::rgb(26, 79, 156) // #1A4F9C (~8.2:1 on white)
+            Rgba::rgb(26, 79, 156)
         }
         (ThemeAppearance::Light, TokenKind::JsonString | TokenKind::MarkdownCode) => {
-            Rgba::rgb(22, 107, 52) // #166B34 (~6.4:1 on white)
+            Rgba::rgb(22, 107, 52)
         }
         (ThemeAppearance::Light, TokenKind::JsonNumber | TokenKind::StackLocation) => {
-            Rgba::rgb(148, 72, 0) // #944800 (~6.1:1 on white)
+            Rgba::rgb(148, 72, 0)
         }
         (ThemeAppearance::Light, TokenKind::JsonBoolNull | TokenKind::StackSymbol) => {
-            Rgba::rgb(112, 46, 152) // #702E98 (~7.5:1 on white)
+            Rgba::rgb(112, 46, 152)
         }
         (ThemeAppearance::Light, TokenKind::StackHeader) => tokens.error_text,
         (ThemeAppearance::Light, TokenKind::MarkdownFence | TokenKind::MarkdownMarker) => {
             tokens.text_secondary
         }
-        // Dark theme (>= 4.5:1 against #141413 canvas)
         (ThemeAppearance::Dark, TokenKind::JsonKey | TokenKind::MarkdownHeading) => {
-            Rgba::rgb(122, 184, 255) // #7AB8FF (~9.1:1 on dark)
+            Rgba::rgb(122, 184, 255)
         }
         (ThemeAppearance::Dark, TokenKind::JsonString | TokenKind::MarkdownCode) => {
-            Rgba::rgb(124, 214, 148) // #7CD694 (~10.4:1 on dark)
+            Rgba::rgb(124, 214, 148)
         }
         (ThemeAppearance::Dark, TokenKind::JsonNumber | TokenKind::StackLocation) => {
-            Rgba::rgb(245, 194, 114) // #F5C272 (~11.3:1 on dark)
+            Rgba::rgb(245, 194, 114)
         }
         (ThemeAppearance::Dark, TokenKind::JsonBoolNull | TokenKind::StackSymbol) => {
-            Rgba::rgb(206, 160, 255) // #CEA0FF (~8.8:1 on dark)
+            Rgba::rgb(206, 160, 255)
         }
         (ThemeAppearance::Dark, TokenKind::StackHeader) => tokens.error_text,
         (ThemeAppearance::Dark, TokenKind::MarkdownFence | TokenKind::MarkdownMarker) => {
@@ -1412,18 +1539,22 @@ mod tests {
     use crate::theme::{DARK, LIGHT, contrast_ratio};
     use std::time::Instant;
 
+    fn owned(bytes: Vec<u8>) -> whitespace::Input {
+        whitespace::Input::Owned(Arc::new(bytes))
+    }
+
     #[test]
     fn ten_mib_single_line_cell_stays_bounded_and_fast() {
-        let raw = Arc::<[u8]>::from(vec![b'a'; 10 * 1024 * 1024]);
+        let raw = owned(vec![b'a'; 10 * 1024 * 1024]);
         let began = Instant::now();
-        let job = CellInspectorJob::spawn(1, Arc::clone(&raw), None);
+        let job = CellInspectorJob::spawn(1, raw, false, None);
         let snap = job.wait().expect("inspector job must finish");
         assert_eq!(snap.raw_lines.len(), 1);
         assert_eq!(snap.detected_format, CellFormat::PlainText);
 
         let slice = snap
             .raw_lines
-            .line_slice(&snap.raw, 0, MAX_INSPECTOR_LINE_BYTES)
+            .line_slice(snap.raw.bytes(), 0, MAX_INSPECTOR_LINE_BYTES)
             .unwrap();
         assert_eq!(slice.text.len(), MAX_INSPECTOR_LINE_BYTES);
         assert_eq!(
@@ -1444,6 +1575,23 @@ mod tests {
     }
 
     #[test]
+    fn line_index_cap_preserves_exact_end_of_last_indexed_line() {
+        let bytes = b"line0\nline1\nline2\nline3\n";
+        let cancel = AtomicBool::new(false);
+        let idx = LineIndex::build_cancellable_with_limit(bytes, &cancel, 2).unwrap();
+        assert!(idx.truncated_lines());
+        assert_eq!(idx.len(), 2);
+        let l0 = idx.line_slice(bytes, 0, 1024).unwrap();
+        let l1 = idx.line_slice(bytes, 1, 1024).unwrap();
+        assert_eq!(l0.text, "line0");
+        assert_eq!(
+            l1.text, "line1",
+            "last indexed line must not absorb line2/line3"
+        );
+        assert_eq!(l1.total_line_bytes, 5);
+    }
+
+    #[test]
     fn json_pretty_print_preserves_duplicate_keys_and_exact_numeric_lexemes() {
         let input = br#"{"id":1.00,"id":999999999999999999999999999,"exp":1e500,"zero":-0.0,"nested":[{"k":"v\n"},{"k":"v2"}]}"#;
         let cancel = AtomicBool::new(false);
@@ -1452,20 +1600,16 @@ mod tests {
             panic!("expected valid pretty JSON");
         };
         assert!(lines.len() >= 10);
-        let id_count = text.matches("\"id\":").count();
-        assert_eq!(id_count, 2, "duplicate object keys must be preserved");
-        assert!(text.contains("1.00"), "exact decimal precision preserved");
-        assert!(
-            text.contains("999999999999999999999999999"),
-            "arbitrary-precision integer lexeme preserved"
-        );
-        assert!(text.contains("1e500"), "large exponent lexeme preserved");
-        assert!(text.contains("-0.0"), "signed zero lexeme preserved");
-        assert!(text.contains("\"v\\n\""), "escape sequence preserved");
+        assert_eq!(text.matches("\"id\":").count(), 2);
+        assert!(text.contains("1.00"));
+        assert!(text.contains("999999999999999999999999999"));
+        assert!(text.contains("1e500"));
+        assert!(text.contains("-0.0"));
+        assert!(text.contains("\"v\\n\""));
     }
 
     #[test]
-    fn invalid_json_reports_exact_line_column_and_byte_offset() {
+    fn invalid_json_non_ascii_cr_and_utf8_report_exact_line_column_and_byte_offset() {
         let input = b"{\n  \"ok\": true,\n  \"bad\": [1, 2, ]\n}";
         let cancel = AtomicBool::new(false);
         let PrettyJsonResult::Invalid(err) = pretty_print_json_streaming(input, &cancel) else {
@@ -1474,17 +1618,49 @@ mod tests {
         assert_eq!(err.line, 3);
         assert_eq!(err.column, 17);
         assert_eq!(input[err.byte_offset], b']');
-        assert!(err.display_summary().contains("line 3, column 17"));
+
+        // Malformed `{oops}` is detected as JSON and reports exact error at `o`.
+        assert_eq!(detect_cell_format(b"{oops}"), CellFormat::Json);
+        let PrettyJsonResult::Invalid(oops_err) = pretty_print_json_streaming(b"{oops}", &cancel)
+        else {
+            panic!("expected invalid JSON error for {{oops}}");
+        };
+        assert_eq!(oops_err.line, 1);
+        assert_eq!(oops_err.column, 2);
+        assert_eq!(oops_err.byte_offset, 1);
+
+        // Lone CR line endings and multi-byte UTF-8 characters advance line/column accurately.
+        let cr_non_ascii = "{\"café\": 1,\r  \"x\": ]}".as_bytes();
+        let PrettyJsonResult::Invalid(cr_err) = pretty_print_json_streaming(cr_non_ascii, &cancel)
+        else {
+            panic!("expected invalid JSON error on CR + UTF-8 input");
+        };
+        assert_eq!(cr_err.line, 2);
+        assert_eq!(cr_err.column, 8);
+        assert_eq!(cr_non_ascii[cr_err.byte_offset], b']');
+
+        // Invalid UTF-8 reports exact `valid_up_to()` byte/line/col rather than byte 0.
+        let bad_utf8 = b"{\n  \"k\": \"\xff\"}";
+        let PrettyJsonResult::Invalid(utf8_err) = pretty_print_json_streaming(bad_utf8, &cancel)
+        else {
+            panic!("expected UTF-8 error");
+        };
+        assert_eq!(utf8_err.byte_offset, 10);
+        assert_eq!(utf8_err.line, 2);
+        assert_eq!(utf8_err.column, 9);
     }
 
     #[test]
-    fn deeply_nested_and_oversized_json_fail_cleanly() {
+    fn deeply_nested_distinguished_from_syntax_error_and_oversized_fails_cleanly() {
         let mut deep = vec![b'['; MAX_JSON_NESTING_DEPTH + 10];
         deep.extend(vec![b']'; MAX_JSON_NESTING_DEPTH + 10]);
         let cancel = AtomicBool::new(false);
         assert!(matches!(
             pretty_print_json_streaming(&deep, &cancel),
-            PrettyJsonResult::Invalid(_)
+            PrettyJsonResult::DepthLimitExceeded {
+                max_depth: MAX_JSON_NESTING_DEPTH,
+                ..
+            }
         ));
 
         let huge = vec![b' '; MAX_PRETTY_JSON_INPUT_BYTES + 1];
@@ -1558,28 +1734,33 @@ mod tests {
     }
 
     #[test]
-    fn markdown_detection_and_code_fence_index_work() {
-        let md = b"# Title\n\nHere is `inline` code:\n```rust\nlet x = 1;\n```\n- item";
+    fn markdown_fences_respect_delimiter_character_and_run_length() {
+        // Four-backtick block containing both ``` and ~~~ lines must stay fenced until ````.
+        let md = b"# Title\n````md\n```rust\n~~~\nstill fenced\n````\noutside";
         assert_eq!(detect_cell_format(md), CellFormat::Markdown);
         let cancel = AtomicBool::new(false);
         let idx = LineIndex::build_cancellable(md, &cancel).unwrap();
-        assert!(!idx.in_code_fence_before(0));
-        assert!(!idx.in_code_fence_before(3));
-        assert!(idx.in_code_fence_before(4));
-        assert!(!idx.in_code_fence_before(6));
+        assert!(!idx.in_code_fence_before(0)); // # Title
+        assert!(!idx.in_code_fence_before(1)); // ````md (opener)
+        assert!(idx.in_code_fence_before(2)); // ```rust (inside 4-backtick block!)
+        assert!(idx.in_code_fence_before(3)); // ~~~ (inside backtick block!)
+        assert!(idx.in_code_fence_before(4)); // still fenced!
+        assert!(!idx.in_code_fence_before(5)); // ```` (closer)
+        assert!(!idx.in_code_fence_before(6)); // outside
 
         let heading = tokenize_line("# Title", CellFormat::Markdown, false, 1024);
         assert_eq!(heading.spans[0].kind, TokenKind::MarkdownHeading);
-        let code = tokenize_line("let x = 1;", CellFormat::Markdown, true, 1024);
-        assert_eq!(code.spans[0].kind, TokenKind::MarkdownCode);
-        assert!(code.next_in_code_fence);
+        let nested_ticks = tokenize_line("```rust", CellFormat::Markdown, true, 1024);
+        assert_eq!(nested_ticks.spans[0].kind, TokenKind::MarkdownCode);
     }
 
     #[test]
     fn hover_peek_skips_short_cells_and_bounds_long_and_multiline_cells() {
+        assert!(!needs_hover_peek(b"short", 160.0, 12.0));
         assert!(build_hover_peek(b"short", 160.0, 12.0).is_none());
 
         let multiline = b"line 1\nline 2";
+        assert!(needs_hover_peek(multiline, 240.0, 12.0));
         let peek = build_hover_peek(multiline, 240.0, 12.0).expect("multiline must peek");
         assert!(!peek.truncated);
         assert_eq!(peek.preview_text, "line 1\nline 2");
@@ -1592,7 +1773,16 @@ mod tests {
     }
 
     #[test]
-    fn inspector_syntax_colors_meet_wcag_aa_contrast_on_light_and_dark() {
+    fn inspector_syntax_and_line_number_colors_meet_wcag_aa_contrast_on_light_and_dark() {
+        assert!(
+            contrast_ratio(LIGHT.text_secondary, LIGHT.canvas) >= 4.5,
+            "light line-number color must meet WCAG AA"
+        );
+        assert!(
+            contrast_ratio(DARK.text_secondary, DARK.canvas) >= 4.5,
+            "dark line-number color must meet WCAG AA"
+        );
+
         let all_kinds = [
             TokenKind::Plain,
             TokenKind::JsonKey,

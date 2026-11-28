@@ -29,7 +29,7 @@ pub use cell_inspector::{
     MAX_PEEK_BYTES, MAX_PEEK_LINE_CHARS, MAX_PEEK_LINES, MAX_PRETTY_JSON_INPUT_BYTES,
     MAX_PRETTY_JSON_OUTPUT_BYTES, PrettyJsonResult, TokenKind, TokenSpan, TokenizedLine,
     build_hover_peek, build_inspector_snapshot, detect_cell_format, inspector_token_color,
-    pretty_print_json_streaming, tokenize_line,
+    needs_hover_peek, pretty_print_json_streaming, tokenize_line,
 };
 pub use command::{
     CloseCommandOutcome, CommandContext, CommandId, CommandResolution, CommandTarget, DocumentId,

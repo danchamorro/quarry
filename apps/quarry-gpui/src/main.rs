@@ -3568,7 +3568,7 @@ impl QuarryWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.editing || self.confirming {
+        if self.editing || self.confirming || self.command_palette.read(cx).is_open() {
             return;
         }
         if self.command_enabled(CommandId::ToggleCellInspector, cx) {
@@ -5414,11 +5414,13 @@ impl QuarryWindow {
             .id("document-toolbar")
             .role(Role::Toolbar)
             .aria_label("Document toolbar")
-            .h(px(42.))
+            .min_h(px(42.))
+            .py_1()
             .flex_shrink_0()
             .flex()
+            .flex_wrap()
             .items_center()
-            .gap_1()
+            .gap_0p5()
             .px_2()
             .border_b_1()
             .border_color(cx.theme().border)
@@ -5428,7 +5430,7 @@ impl QuarryWindow {
                     .label(filename)
                     .ghost()
                     .small()
-                    .max_w(px(220.))
+                    .max_w(px(160.))
                     .disabled(busy)
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.choose_open_with_encoding(None, window, cx)
@@ -5441,7 +5443,7 @@ impl QuarryWindow {
                 Input::new(&self.row_input)
                     .aria_label("Go to row")
                     .small()
-                    .w(px(64.))
+                    .w(px(56.))
                     .disabled(!loaded),
             )
             .child(

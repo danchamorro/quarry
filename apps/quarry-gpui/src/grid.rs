@@ -806,8 +806,10 @@ impl TableDelegate for Grid {
                     let pending = summary.is_none() && !raw.is_empty();
                     let ws_tip = (indicated || pending)
                         .then(|| controller.whitespace_explanation(win_id, summary));
-                    let hover_peek =
-                        quarry_workbench::build_hover_peek(raw, col_width_px, GRID_FONT_SIZE);
+                    // Fast zero-allocation eligibility check on paint; format detection and preview
+                    // materialization run lazily inside `.tooltip(...)` only if the user hovers.
+                    let can_hover_peek =
+                        quarry_workbench::needs_hover_peek(raw, col_width_px, GRID_FONT_SIZE);
                     Some((
                         allow_wrap_cell,
                         numeric_cell,
@@ -816,7 +818,7 @@ impl TableDelegate for Grid {
                         indicated,
                         pending,
                         ws_tip,
-                        hover_peek,
+                        can_hover_peek,
                     ))
                 })
             };
@@ -829,7 +831,7 @@ impl TableDelegate for Grid {
                 indicated,
                 pending,
                 ws_tip,
-                hover_peek,
+                can_hover_peek,
             )) = rendered_cell
             else {
                 return cell.child(div().flex_1().min_w_0());
@@ -876,30 +878,54 @@ impl TableDelegate for Grid {
                 );
             }
 
-            if hover_peek.is_some() || invalid_utf8 || indicated || pending {
-                let mut sections = Vec::new();
-                if let Some(peek) = hover_peek {
-                    let shortcut = if cfg!(target_os = "macos") {
-                        "⌘I"
-                    } else {
-                        "Ctrl+I"
-                    };
-                    sections.push(format!(
-                        "{} · {} bytes · Press {} to inspect\n{}",
-                        peek.format.label(),
-                        peek.total_bytes,
-                        shortcut,
-                        peek.preview_text
-                    ));
-                }
-                if invalid_utf8 {
-                    sections.push("This cell is not valid UTF-8 and cannot be edited.".to_owned());
-                }
-                if let Some(ws) = ws_tip {
-                    sections.push(ws);
-                }
-                let tip = sections.join("\n\n");
-                cell = cell.tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx));
+            if can_hover_peek || invalid_utf8 || indicated || pending {
+                let tip_controller = self.controller.clone();
+                let tip_win = self.window_id;
+                cell = cell.tooltip(move |window, cx| {
+                    let mut sections = Vec::new();
+                    if can_hover_peek {
+                        let controller = tip_controller.read(cx);
+                        if let Some(doc) = controller.active_document(tip_win)
+                            && let Some(raw) = doc.effective_cell(src_row, src_col)
+                            && let Some(peek) = quarry_workbench::build_hover_peek(
+                                raw,
+                                col_width_px,
+                                GRID_FONT_SIZE,
+                            )
+                        {
+                            let shortcut = if cfg!(target_os = "macos") {
+                                "⌘I"
+                            } else {
+                                "Ctrl+I"
+                            };
+                            let is_selected = doc.selection
+                                == Some(quarry_workbench::GridSelection::Cell {
+                                    row: src_row,
+                                    column: src_col,
+                                });
+                            let hint = if is_selected {
+                                format!("Press {shortcut} to inspect")
+                            } else {
+                                format!("Click & press {shortcut} (or right-click → Inspect Cell)")
+                            };
+                            sections.push(format!(
+                                "{} · {} bytes · {hint}\n{}",
+                                peek.format.label(),
+                                peek.total_bytes,
+                                peek.preview_text
+                            ));
+                        }
+                    }
+                    if invalid_utf8 {
+                        sections
+                            .push("This cell is not valid UTF-8 and cannot be edited.".to_owned());
+                    }
+                    if let Some(ws) = ws_tip.as_ref() {
+                        sections.push(ws.clone());
+                    }
+                    let tip = sections.join("\n\n");
+                    Tooltip::new(tip).build(window, cx)
+                });
             }
         } else {
             cell = cell.child(div().flex_1().min_w_0());
