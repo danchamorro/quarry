@@ -3,6 +3,7 @@ mod grid;
 mod menus;
 mod operations;
 mod panels;
+mod query_bar;
 mod section_modal;
 mod whitespace_ui;
 mod workbench;
@@ -54,10 +55,11 @@ use menus::{
     QUARRY_KEY_CONTEXT, QuitApp, RedoEdit, ReloadFromDisk, RenameHeader, ReplaceText, SaveAsFile,
     SaveAsUtf8, SaveFile, ShowAllWhitespace, SortRows, SplitColumn, TemporaryStorage, ThemeDark,
     ThemeLight, ThemeOmarchy, ThemeSystem, ToggleBookmark, ToggleBookmarks, ToggleColumns,
-    ToggleFilters, ToggleLiveWatch, ToggleWordWrap, UndoEdit, VerifySectionBoundary,
-    bind_shortcuts, encoding_label, install_menus,
+    ToggleFilters, ToggleLiveWatch, ToggleQueryBar, ToggleWordWrap, UndoEdit,
+    VerifySectionBoundary, bind_shortcuts, encoding_label, install_menus,
 };
 use panels::{PanelEvent, Panels, Tool};
+use query_bar::{QueryBar, QueryBarEvent};
 use workbench::{
     CloseReviewAction, DocumentSnapshot, LiveWatchUiSnapshot, MAX_EDIT_BYTES, WorkbenchController,
     WorkflowDialogKind,
@@ -72,6 +74,7 @@ pub struct QuarryWindow {
     table: Entity<TableState<Grid>>,
     panels: Entity<Panels>,
     find_bar: Entity<FindBar>,
+    query_bar: Entity<QueryBar>,
     row_input: Entity<InputState>,
     last_synced_doc: Option<(DocumentId, u64)>,
     last_headers: Vec<String>,
@@ -128,6 +131,7 @@ impl QuarryWindow {
         });
         let panels = cx.new(|cx| Panels::new(window, cx));
         let find_bar = cx.new(|cx| FindBar::new(controller.clone(), window_id, window, cx));
+        let query_bar = cx.new(|cx| QueryBar::new(controller.clone(), window_id, window, cx));
         let row_input = cx.new(|cx| InputState::new(window, cx).default_value("1"));
         let initial_appearance = window_appearance_to_theme(window.appearance());
         if let Some(resolved) =
@@ -154,6 +158,68 @@ impl QuarryWindow {
                 window,
                 |this, _, event: &FindBarEvent, window, cx| {
                     if matches!(event, FindBarEvent::Closed) {
+                        let table_focus = this
+                            .snapshot(cx)
+                            .is_some()
+                            .then(|| this.table.focus_handle(cx));
+                        let root_focus = this.focus_handle.clone();
+                        window.defer(cx, move |window, cx| {
+                            if let Some(tf) = table_focus {
+                                tf.focus(window, cx);
+                            } else {
+                                root_focus.focus(window, cx);
+                            }
+                        });
+                        cx.notify();
+                    }
+                },
+            ),
+            cx.subscribe_in(
+                &query_bar,
+                window,
+                |this, _, event: &QueryBarEvent, window, cx| match event {
+                    QueryBarEvent::Apply(query) => {
+                        this.table
+                            .update(cx, |table, cx| table.scroll_to_row(0, cx));
+                        this.row_input
+                            .update(cx, |state, cx| state.set_value("1", window, cx));
+                        let res = this.controller.update(cx, |controller, cx| {
+                            controller.start_filter_active(this.window_id, query.clone(), cx)
+                        });
+                        if let Err(error) = res {
+                            this.set_message(AppMessage::error(error), cx);
+                        }
+                    }
+                    QueryBarEvent::Clear => {
+                        this.table
+                            .update(cx, |table, cx| table.scroll_to_row(0, cx));
+                        this.row_input
+                            .update(cx, |state, cx| state.set_value("1", window, cx));
+                        let visible_rows = this.table.read(cx).delegate().visible_rows_count();
+                        let res = this.controller.update(cx, |controller, cx| {
+                            let cleared = controller.clear_filter_active(this.window_id, cx);
+                            if cleared.is_ok() {
+                                controller.request_viewport_rows(
+                                    this.window_id,
+                                    0,
+                                    visible_rows,
+                                    cx,
+                                );
+                            }
+                            cleared
+                        });
+                        if let Err(error) = res {
+                            this.set_message(AppMessage::error(error), cx);
+                        }
+                    }
+                    QueryBarEvent::OpenRules => {
+                        if this.command_enabled(CommandId::Filters, cx) {
+                            this.panels.update(cx, |panels, cx| {
+                                panels.open_tool(Tool::Filters, window, cx)
+                            });
+                        }
+                    }
+                    QueryBarEvent::Closed => {
                         let table_focus = this
                             .snapshot(cx)
                             .is_some()
@@ -368,6 +434,7 @@ impl QuarryWindow {
             table,
             panels,
             find_bar,
+            query_bar,
             row_input,
             last_synced_doc: None,
             last_headers: Vec::new(),
@@ -459,6 +526,8 @@ impl QuarryWindow {
             ));
             self.panels
                 .update(cx, |panels, cx| panels.sync_document(&info, window, cx));
+            self.query_bar
+                .update(cx, |bar, cx| bar.sync_document(&info, window, cx));
             if schema_changed {
                 self.last_synced_doc = Some(doc_key);
                 self.last_headers = info.headers.clone();
@@ -542,6 +611,8 @@ impl QuarryWindow {
                 self.last_row_gutter_anchor = None;
                 self.panels
                     .update(cx, |panels, cx| panels.clear_document(window, cx));
+                self.query_bar
+                    .update(cx, |bar, cx| bar.clear_document(window, cx));
                 self.table.update(cx, |table, cx| {
                     table.delegate_mut().reset_widths();
                     table.refresh(cx);
@@ -2313,6 +2384,17 @@ impl QuarryWindow {
         if self.command_enabled(CommandId::Filters, cx) {
             self.panels
                 .update(cx, |panels, cx| panels.open_tool(Tool::Filters, window, cx));
+        }
+    }
+
+    fn toggle_query_bar_action(
+        &mut self,
+        _: &ToggleQueryBar,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.command_enabled(CommandId::Filters, cx) {
+            self.query_bar.update(cx, |bar, cx| bar.toggle(window, cx));
         }
     }
 
@@ -4206,6 +4288,20 @@ impl QuarryWindow {
             )
             .child(columns)
             .child(filters)
+            .child(
+                Button::new("toolbar-query")
+                    .label(if self.query_bar.read(cx).is_open() {
+                        "Query: On"
+                    } else {
+                        "Query"
+                    })
+                    .ghost()
+                    .small()
+                    .disabled(!loaded)
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.toggle_query_bar_action(&ToggleQueryBar, window, cx);
+                    })),
+            )
             .child(bookmarks)
             .child(
                 Button::new("toolbar-find")
@@ -4911,6 +5007,7 @@ impl Render for QuarryWindow {
             .on_action(cx.listener(Self::theme_omarchy_action))
             .on_action(cx.listener(Self::toggle_columns_action))
             .on_action(cx.listener(Self::toggle_filters_action))
+            .on_action(cx.listener(Self::toggle_query_bar_action))
             .on_action(cx.listener(Self::toggle_bookmarks_action))
             .on_action(cx.listener(Self::combine_files_action))
             .on_action(cx.listener(Self::join_files_action))
@@ -4961,6 +5058,9 @@ impl Render for QuarryWindow {
 
         if loaded && self.find_bar.read(cx).is_open() {
             body = body.child(self.find_bar.clone());
+        }
+        if loaded && self.query_bar.read(cx).is_open() {
+            body = body.child(self.query_bar.clone());
         }
 
         if let Some(ref snap) = info {

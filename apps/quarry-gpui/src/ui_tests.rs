@@ -5426,3 +5426,179 @@ fn idle_coordinator_wakes_for_filtered_edit_parks_on_duplicate_preview_and_updat
         "completed DuplicatePreview waiting on user confirmation must park the real coordinator"
     );
 }
+
+#[gpui_kit::test]
+fn query_bar_applies_syncs_rules_isolates_tabs_and_preserves_active_filter_on_error(
+    cx: &mut TestAppContext,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let path_a = dir.path().join("orders.csv");
+    let path_b = dir.path().join("other.csv");
+    fs::write(
+        &path_a,
+        "state,order total,code,tag\n\
+         TX,25,ERR-007,d1\n\
+         FL,100,ERR-042,d2\n\
+         CA,50,ERR-009,d3\n\
+         TX,150,ERR-099,d4\n\
+         FL,10,OK-001,d5\n\
+         TX,25,ERR-008,d6\n",
+    )
+    .unwrap();
+    fs::write(&path_b, "region,score\nwest,10\neast,20\n").unwrap();
+
+    let (win, view, controller, win_id) = open_test_window(cx);
+    let (id_a, id_b) = cx.update(|cx| {
+        let a = controller
+            .update(cx, |c, cx| c.open_file(win_id, &path_a, cx))
+            .unwrap();
+        let b = controller
+            .update(cx, |c, cx| c.open_file(win_id, &path_b, cx))
+            .unwrap();
+        controller
+            .update(cx, |c, cx| c.activate_tab(win_id, a, cx))
+            .unwrap();
+        (a, b)
+    });
+    wait_until(cx, win, &view, &controller, |q, cx| {
+        q.snapshot(cx)
+            .is_some_and(|s| s.document_id == id_a && s.index_done && s.total_rows == 6)
+    });
+
+    // Open Query Bar, switch to Enter-to-apply, type a compound expression, and apply.
+    win.update(cx, |_, window, cx| {
+        view.update(cx, |q, cx| {
+            q.toggle_query_bar_action(&ToggleQueryBar, window, cx);
+            assert!(q.query_bar.read(cx).is_open());
+            assert!(
+                q.query_bar.read(cx).live_mode_for_test(),
+                "small files (<= 10 MiB) default to live mode enabled"
+            );
+            q.query_bar.update(cx, |bar, cx| {
+                bar.set_live_mode_for_test(false, window, cx);
+                bar.set_match_case_for_test(true, cx);
+                bar.set_expression_for_test(
+                    "state == \"TX\" OR state == \"FL\" AND [order total] >= 10 AND [order total] <= 100 AND code =~ /^ERR-\\d+$/ AND #4 != \"d6\"",
+                    window,
+                    cx,
+                );
+                assert!(bar.parse_error_for_test().is_none());
+                bar.apply_now(cx);
+            });
+        });
+    })
+    .unwrap();
+
+    wait_until(cx, win, &view, &controller, |q, cx| {
+        q.snapshot(cx)
+            .is_some_and(|s| s.filter_active && s.filter_done && s.available_rows == 2)
+    });
+
+    // Verify canonical expression synced back to Query Bar AND two-way sync populated Filters rules
+    // (including Between folding and Matches regex operator).
+    cx.update(|cx| {
+        let q = view.read(cx);
+        let text = q.query_bar.read(cx).text_for_test(cx);
+        assert_eq!(
+            text,
+            "state == \"TX\" OR state == \"FL\" AND [order total] BETWEEN 10 AND 100 AND code =~ \"^ERR-\\\\d+$\" AND tag != \"d6\""
+        );
+        let synced = q.panels.read(cx).synced_query_for_test(cx);
+        assert_eq!(synced.predicates.len(), 5);
+        assert_eq!(synced.predicates[2].operator, quarry_core::FilterOperator::Between);
+        assert_eq!(synced.predicates[3].operator, quarry_core::FilterOperator::Regex);
+        assert_eq!(synced.case_sensitivity, quarry_core::CaseSensitivity::Sensitive);
+    });
+
+    // Typing an unrepresentable expression (cross-column OR) shows inline diagnostic WITHOUT
+    // disturbing the 2 active filtered rows.
+    win.update(cx, |_, window, cx| {
+        view.update(cx, |q, cx| {
+            q.query_bar.update(cx, |bar, cx| {
+                bar.set_expression_for_test("state == \"TX\" OR [order total] > 10", window, cx);
+                let err = bar
+                    .parse_error_for_test()
+                    .expect("cross-column OR must report inline diagnostic");
+                assert!(err.message.contains("same column"));
+                bar.apply_now(cx);
+            });
+        });
+    })
+    .unwrap();
+    wait_until(cx, win, &view, &controller, |q, cx| {
+        q.snapshot(cx)
+            .is_some_and(|s| s.filter_active && s.filter_done && s.available_rows == 2)
+    });
+
+    // Switching to Tab B isolates Query Bar draft/errors; switching back restores Tab A's draft.
+    cx.update(|cx| {
+        controller
+            .update(cx, |c, cx| c.activate_tab(win_id, id_b, cx))
+            .unwrap();
+    });
+    wait_until(cx, win, &view, &controller, |q, cx| {
+        q.snapshot(cx)
+            .is_some_and(|s| s.document_id == id_b && s.index_done && s.total_rows == 2)
+    });
+    cx.update(|cx| {
+        let bar = view.read(cx).query_bar.read(cx);
+        assert_eq!(bar.text_for_test(cx), "");
+        assert!(bar.parse_error_for_test().is_none());
+    });
+
+    // Applying a filter on Tab B via controller syncs canonical expression into Query Bar.
+    cx.update(|cx| {
+        controller
+            .update(cx, |c, cx| {
+                c.start_filter_active(
+                    win_id,
+                    quarry_core::FilterQuery::single(
+                        0,
+                        quarry_core::FilterOperator::Equals,
+                        b"west".to_vec(),
+                    ),
+                    cx,
+                )
+                .unwrap();
+            })
+            .unwrap();
+    });
+    wait_until(cx, win, &view, &controller, |q, cx| {
+        q.snapshot(cx).is_some_and(|s| {
+            s.document_id == id_b && s.filter_active && s.filter_done && s.available_rows == 1
+        })
+    });
+    cx.update(|cx| {
+        assert_eq!(
+            view.read(cx).query_bar.read(cx).text_for_test(cx),
+            "region == \"west\""
+        );
+    });
+
+    // Switch back to Tab A: its in-progress invalid draft is preserved, and Clear restores all 6 rows.
+    cx.update(|cx| {
+        controller
+            .update(cx, |c, cx| c.activate_tab(win_id, id_a, cx))
+            .unwrap();
+    });
+    wait_until(cx, win, &view, &controller, |q, cx| {
+        q.snapshot(cx)
+            .is_some_and(|s| s.document_id == id_a && s.filter_active && s.available_rows == 2)
+    });
+    win.update(cx, |_, window, cx| {
+        view.update(cx, |q, cx| {
+            assert!(q.query_bar.read(cx).parse_error_for_test().is_some());
+            q.query_bar.update(cx, |bar, cx| bar.clear_now(window, cx));
+        });
+    })
+    .unwrap();
+    wait_until(cx, win, &view, &controller, |q, cx| {
+        q.snapshot(cx)
+            .is_some_and(|s| s.document_id == id_a && !s.filter_active && s.available_rows == 6)
+    });
+    cx.update(|cx| {
+        let q = view.read(cx);
+        assert_eq!(q.query_bar.read(cx).text_for_test(cx), "");
+        assert!(q.query_bar.read(cx).parse_error_for_test().is_none());
+    });
+}

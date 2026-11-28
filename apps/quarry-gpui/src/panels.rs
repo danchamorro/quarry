@@ -54,7 +54,7 @@ impl SelectItem for Choice {
 
 type ChoiceState = SelectState<SearchableVec<Choice>>;
 
-const OPERATORS: [(FilterOperator, &str); 8] = [
+const OPERATORS: [(FilterOperator, &str); 9] = [
     (FilterOperator::Contains, "Contains"),
     (FilterOperator::Equals, "Equals"),
     (FilterOperator::NotEquals, "Does not equal"),
@@ -63,6 +63,7 @@ const OPERATORS: [(FilterOperator, &str); 8] = [
     (FilterOperator::LessThan, "Less than"),
     (FilterOperator::LessThanOrEqual, "At most"),
     (FilterOperator::Between, "Between (inclusive)"),
+    (FilterOperator::Regex, "Matches regex"),
 ];
 const DELIMITERS: [&str; 5] = ["Auto", "Comma", "Tab", "Pipe", "Semicolon"];
 const HEADERS: [&str; 3] = ["Auto", "First row is header", "No header"];
@@ -115,6 +116,7 @@ pub struct Panels {
     source_changed: bool,
     filter_active: bool,
     filter_running: bool,
+    last_synced_filter: Option<(u64, u64)>,
     can_export_filtered: bool,
     export_running: bool,
     filter_status: Option<String>,
@@ -223,6 +225,7 @@ impl Panels {
             source_changed: false,
             filter_active: false,
             filter_running: false,
+            last_synced_filter: None,
             can_export_filtered: false,
             export_running: false,
             filter_status: None,
@@ -258,6 +261,7 @@ impl Panels {
             self.shown.clear();
             self.matches.clear();
             self.rules.clear();
+            self.last_synced_filter = None;
             self.dirty = false;
             self.busy = false;
             self.live_watching = false;
@@ -389,7 +393,64 @@ impl Panels {
             self.shown = is_shown;
             self.refresh_matches(cx);
         }
+        let filter_sync_key = (info.instance_id, info.filter_query_generation);
+        if self.last_synced_filter != Some(filter_sync_key) {
+            self.last_synced_filter = Some(filter_sync_key);
+            if self.active != Some(Tool::Filters) {
+                self.sync_rules_from_query(info.filter_query.as_ref(), window, cx);
+            }
+        }
         cx.notify();
+    }
+
+    fn sync_rules_from_query(
+        &mut self,
+        query: Option<&FilterQuery>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(query) = query else {
+            self.rules.clear();
+            self.match_case = false;
+            self.add_rule(window, cx);
+            return;
+        };
+        // Only mirror into UTF-8 rule inputs when every predicate payload is valid UTF-8
+        // (non-UTF-8 byte predicates stay lossless in the Query Bar via `\xHH`).
+        if query.predicates.iter().any(|p| {
+            std::str::from_utf8(&p.value).is_err()
+                || p.upper_bound
+                    .as_deref()
+                    .is_some_and(|u| std::str::from_utf8(u).is_err())
+        }) {
+            return;
+        }
+        self.rules.clear();
+        self.match_case = query.case_sensitivity == CaseSensitivity::Sensitive;
+        for predicate in &query.predicates {
+            let op_idx = OPERATORS
+                .iter()
+                .position(|(op, _)| *op == predicate.operator)
+                .unwrap_or(0);
+            let value_str = std::str::from_utf8(&predicate.value)
+                .unwrap_or("")
+                .to_owned();
+            let upper_str = predicate
+                .upper_bound
+                .as_deref()
+                .and_then(|u| std::str::from_utf8(u).ok())
+                .unwrap_or("")
+                .to_owned();
+            self.add_rule_with_values(predicate.column, op_idx, value_str, upper_str, window, cx);
+        }
+        if self.rules.is_empty() {
+            self.add_rule(window, cx);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn synced_query_for_test(&self, cx: &App) -> FilterQuery {
+        self.query(cx)
     }
 
     pub fn close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -439,6 +500,18 @@ impl Panels {
     }
 
     fn add_rule(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.add_rule_with_values(0, 0, String::new(), String::new(), window, cx);
+    }
+
+    fn add_rule_with_values(
+        &mut self,
+        selected_column: usize,
+        selected_operator: usize,
+        initial_value: String,
+        initial_upper: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let column = select_state(
             self.headers
                 .iter()
@@ -448,14 +521,36 @@ impl Panels {
             window,
             cx,
         );
+        if selected_column > 0 {
+            column.update(cx, |state, cx| {
+                state.set_selected_value(&selected_column, window, cx)
+            });
+        }
         let operator = select_state(
             OPERATORS.map(|(_, label)| label.to_owned()),
             false,
             window,
             cx,
         );
-        let value = cx.new(|cx| TextareaState::new(window, cx).rows(1).placeholder("Value"));
-        let upper = cx.new(|cx| InputState::new(window, cx).placeholder("Upper bound"));
+        if selected_operator > 0 {
+            operator.update(cx, |state, cx| {
+                state.set_selected_value(&selected_operator, window, cx)
+            });
+        }
+        let value = cx.new(|cx| {
+            let mut state = TextareaState::new(window, cx).rows(1).placeholder("Value");
+            if !initial_value.is_empty() {
+                state.set_value(initial_value, window, cx);
+            }
+            state
+        });
+        let upper = cx.new(|cx| {
+            let mut state = InputState::new(window, cx).placeholder("Upper bound");
+            if !initial_upper.is_empty() {
+                state.set_value(initial_upper, window, cx);
+            }
+            state
+        });
         let subscriptions = vec![
             cx.subscribe_in(
                 &column,
@@ -970,7 +1065,10 @@ impl Panels {
                     .overflow_y_scroll()
                     .children(self.rules.iter().enumerate().map(|(position, rule)| {
                         let id = rule.id;
-                        let between = *rule.operator.read(cx).selected_value().unwrap_or(&0) == 7;
+                        let between = OPERATORS
+                            [*rule.operator.read(cx).selected_value().unwrap_or(&0)]
+                            .0
+                            == FilterOperator::Between;
                         div()
                             .flex()
                             .w_full()
@@ -1388,8 +1486,9 @@ mod tests {
             title: "Duplicate".into(),
         };
         assert_ne!(first.value(), last.value());
-        assert_eq!(OPERATORS.len(), 8);
+        assert_eq!(OPERATORS.len(), 9);
         assert_eq!(OPERATORS[7].0, FilterOperator::Between);
+        assert_eq!(OPERATORS[8].0, FilterOperator::Regex);
         assert_eq!(format_options((2, 1)).delimiter, Some(b'\t'));
         assert_eq!(format_options((0, 2)).header_mode, HeaderMode::NoHeader);
     }

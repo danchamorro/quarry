@@ -112,6 +112,11 @@ pub struct DocumentSnapshot {
     pub filter_active: bool,
     pub filter_done: bool,
     pub filter_running: bool,
+    pub filter_query: Option<FilterQuery>,
+    pub filter_expression: Option<Result<String, String>>,
+    pub filter_query_generation: u64,
+    pub edit_revision: u64,
+    pub default_live_filter_enabled: bool,
     pub filter_status: Option<String>,
     pub can_export_filtered: bool,
     pub export_running: bool,
@@ -1540,6 +1545,13 @@ impl WorkbenchController {
             filter_active,
             filter_done,
             filter_running: doc.is_filter_scanning(),
+            filter_query: doc.filter_query.clone(),
+            filter_expression: doc
+                .active_filter_expression()
+                .map(|res| res.map_err(|err| err.message)),
+            filter_query_generation: doc.filter_query_generation,
+            edit_revision: doc.edit_revision,
+            default_live_filter_enabled: doc.default_live_filter_enabled(),
             filter_status: doc.filter_status.clone(),
             can_export_filtered: doc.is_filtered_export_ready(),
             export_running: doc.export_job.is_some(),
@@ -2059,6 +2071,16 @@ impl WorkbenchController {
         self.pending_reveal_cells.remove(&id);
         cx.notify();
         Ok(())
+    }
+
+    pub fn parse_filter_expression_active(
+        &self,
+        window: WindowId,
+        expr: &str,
+        case_sensitivity: CaseSensitivity,
+    ) -> Option<Result<FilterQuery, quarry_core::FilterExprError>> {
+        let doc = self.active_document(window)?;
+        Some(doc.parse_filter_expression(expr, case_sensitivity))
     }
 
     pub fn start_filter_active(

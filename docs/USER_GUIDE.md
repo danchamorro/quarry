@@ -1231,16 +1231,16 @@ expressions are available in the CLI via `quarry search --regex --query PATTERN`
   and at most 16 regex predicates per compound filter query. Empty, malformed,
   or oversized patterns fail immediately with a clear error.
 
-### Filter expressions (`--where`)
+### Filter expressions (Query Bar & CLI `--where`)
 
-In the CLI, `quarry filter` and `quarry export` accept `--where EXPR` (mutually
-exclusive with `--column`/`--operator`/`--value`/`--and`) to express any
-representable filter query in one readable string:
+In the desktop app, open the inline **Query Bar** with the toolbar **Query** button, **View → Query Bar**, or `Command+Shift+F` (macOS) / `Ctrl+Shift+F` (Linux). In the CLI, `quarry filter` and `quarry export` accept `--where EXPR` (mutually exclusive with `--column`/`--operator`/`--value`/`--and`) to express any representable filter query in one readable string:
 
 ```sh
 quarry export orders.csv --output filtered.csv \
   --where 'state == "TX" OR state == "FL" AND [order total] BETWEEN 10 AND 100 AND code =~ /^ERR-\d+$/'
 ```
+
+- **Desktop Query Bar & two-way rule sync:** Expressions applied in the Query Bar stay in sync with the **Filters** popover rule builder (which also supports **Matches regex**) and with right-click **Filter to This Value** / **Filter Out This Value**. Press `Enter` (or click **Apply**) to run a filter, or toggle **Live** for debounced as-you-type filtering (enabled by default for files up to 10 MiB and defaulting to Enter-to-apply above 10 MiB). Invalid or unrepresentable syntax shows an inline diagnostic with the byte position without disturbing the active filter, and submitting a new query supersedes any in-flight scan cleanly without rendering stale rows. Press `Escape` to close the Query Bar and return focus to the grid.
 
 - **Exact grammar:** Expressions represent a conjunction (`AND`) of per-column
   groups, where `OR` combines alternative inclusion rules on the **same column**
@@ -1287,6 +1287,7 @@ setting.
 | Undo / Redo | `Command+Z` / `Command+Shift+Z` | `Ctrl+Z` / `Ctrl+Shift+Z` |
 | Copy selected cell or row | `Command+C` | `Ctrl+C` |
 | Find / Find Next / Find Previous | `Command+F` / `Command+G` / `Command+Shift+G` | `Ctrl+F` / `Ctrl+G` / `Ctrl+Shift+G` |
+| Toggle Query Bar | `Command+Shift+F` | `Ctrl+Shift+F` |
 | Replace… | `Command+Option+F` | `Ctrl+H` |
 | Toggle row bookmark | `Command+B` or right-click `#` gutter | `Ctrl+B` or right-click `#` gutter |
 | Next / Previous row bookmark | `Command+]` / `Command+[` | `Ctrl+]` / `Ctrl+[` |

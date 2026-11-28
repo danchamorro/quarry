@@ -1,6 +1,7 @@
 //! Frontend-neutral `Document` model, background job coordination, and working-copy lifecycle.
 
 use crate::bookmarks::{BookmarkSplitTarget, BookmarkTransform, RowBookmark, RowBookmarks};
+use crate::command::DocumentId;
 use crate::compressed;
 use crate::history::{
     EditHistory, EditTarget, SharedCellEdits, StructuralOverlay, ValueEdit, WorkingCopySnapshot,
@@ -21,16 +22,17 @@ use quarry_core::{
     BoundaryTrust, ByteWindow, CaseSensitivity, CleanupJob, CleanupOutcome, ColumnCleanup,
     ColumnTransformation, CompletedIndex, DateFormatSuggestion, DateFormatSuggestionConfig,
     DuplicateJob, DuplicateOutcome, DuplicateSpec, DuplicateSummary, DuplicateTarget, Encoding,
-    FilterExportJob, FilterExportOutcome, FilterExportProgress, FilterIndex, FilterJob,
-    FilterMatch, FilterOperator, FilterProgress, FilterQuery, FilterReadJob, FilterReadOutcome,
-    HeaderMode, IndexCacheConfig, IndexConfig, IndexJob, IndexProgress, JoinConfig,
-    JoinWorkingSource, LiteralReplacement, LiveWatchFilterJob, LiveWatchJob,
-    MAX_TRANSFORMATION_COLUMNS, OpenOptions, QuarryError, ReplaceAllJob, ReplaceAllOutcome, Row,
-    RowInsertion, SaveAsJob, SaveAsOutcome, SaveAsProgress, SearchJob, SearchMatch, SearchOutcome,
-    SearchPosition, SectionBounds, SectionOpenOptions, Session, SortDirection, SortJob, SortMode,
-    SortOutcome, SortPlan, SplitAnalysisJob, SplitAnalysisOutcome, StructuralIndex,
-    VerifyBoundaryJob, VerifyBoundaryOutcome, VerifyBoundaryProgress, WatchAlert, WatchConfig,
-    WatchSnapshot, WatchStatus,
+    FilterColumnSchema, FilterExportJob, FilterExportOutcome, FilterExportProgress,
+    FilterExprError, FilterIndex, FilterJob, FilterMatch, FilterOperator, FilterProgress,
+    FilterQuery, FilterReadJob, FilterReadOutcome, HeaderMode, IndexCacheConfig, IndexConfig,
+    IndexJob, IndexProgress, JoinConfig, JoinWorkingSource, LiteralReplacement, LiveWatchFilterJob,
+    LiveWatchJob, MAX_TRANSFORMATION_COLUMNS, OpenOptions, QuarryError, ReplaceAllJob,
+    ReplaceAllOutcome, Row, RowInsertion, SaveAsJob, SaveAsOutcome, SaveAsProgress, SearchJob,
+    SearchMatch, SearchOutcome, SearchPosition, SectionBounds, SectionOpenOptions, Session,
+    SortDirection, SortJob, SortMode, SortOutcome, SortPlan, SplitAnalysisJob,
+    SplitAnalysisOutcome, StructuralIndex, VerifyBoundaryJob, VerifyBoundaryOutcome,
+    VerifyBoundaryProgress, WatchAlert, WatchConfig, WatchSnapshot, WatchStatus, parse_filter_expr,
+    print_filter_expr,
 };
 
 /// Actionable reason surfaced when editing or modifying a document while Live Watch is active.
@@ -39,6 +41,19 @@ pub const LIVE_WATCH_READ_ONLY_REASON: &str =
 
 /// Repaint/UI ingestion sync throttle (~10 Hz) while Live Watch streams appended rows.
 pub const WATCH_REPAINT_THROTTLE: Duration = Duration::from_millis(100);
+
+/// Active file-size ceiling (10 MiB) at or below which live as-you-type Query Bar filtering may
+/// default on; larger files default to Enter-to-apply unless the user explicitly opts into Live.
+pub const DEFAULT_LIVE_FILTER_MAX_BYTES: u64 = 10 * 1024 * 1024;
+
+/// Monotonic tag attached to every filter scan and filtered-page read so superseded queries,
+/// post-edit revisions, or results from another document can never overwrite visible rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FilterResultTag {
+    pub document_id: DocumentId,
+    pub edit_revision: u64,
+    pub query_generation: u64,
+}
 #[cfg(any(test, feature = "test-hooks"))]
 use quarry_core::{SearchProgress, SortSpec};
 use std::collections::{BTreeMap, BTreeSet};
@@ -257,6 +272,7 @@ static NEXT_DOCUMENT_INSTANCE_ID: std::sync::atomic::AtomicU64 =
 
 pub struct Document {
     pub instance_id: u64,
+    pub document_id: Option<DocumentId>,
     pub join_reservations: Arc<std::sync::atomic::AtomicUsize>,
     pub pending_diagnostic: Option<Box<quarry_core::Diagnostic>>,
     pub pending_diagnostic_message: Option<String>,
@@ -291,8 +307,11 @@ pub struct Document {
     pub search_status: Option<String>,
     pub search_paused_row_limit: Option<u64>,
     pub filter_job: Option<FilterJob>,
+    pub filter_job_tag: Option<FilterResultTag>,
     pub filter_index: Option<FilterIndex>,
+    pub filter_index_tag: Option<FilterResultTag>,
     pub filter_query: Option<FilterQuery>,
+    pub filter_query_generation: u64,
     pub filter_refresh_pending: bool,
     pub filter_progress: Option<FilterProgress>,
     pub filter_status: Option<String>,
@@ -318,6 +337,7 @@ pub struct Document {
     pub section_quote_free_confirmed: bool,
     pub live_watch: Option<LiveWatchJob>,
     pub live_watch_filter_attach: Option<LiveWatchFilterJob>,
+    pub live_watch_filter_attach_tag: Option<FilterResultTag>,
     pub live_watch_snapshot: Option<WatchSnapshot>,
     live_watch_header_row: Option<Row>,
     pub live_watch_alert: Option<WatchAlert>,
@@ -330,6 +350,7 @@ pub struct Document {
     pub filter_viewport_start: u64,
     pub filter_buffer_start: u64,
     pub filtered_rows: Vec<Arc<FilterMatch>>,
+    pub filtered_rows_tag: Option<FilterResultTag>,
     pub filter_read: Option<ActiveFilterRead>,
     pub pending_filter_read: Option<FilterReadWindow>,
     pub reveal_cell: Option<(u64, usize)>,
@@ -384,6 +405,7 @@ pub struct FilterReadWindow {
 }
 
 pub struct ActiveFilterRead {
+    pub tag: FilterResultTag,
     pub window: FilterReadWindow,
     pub job: FilterReadJob,
     pub started: Instant,
@@ -577,6 +599,7 @@ impl Document {
             decompression_slots: compressed::DecompressionSlots::default(),
             instance_id: NEXT_DOCUMENT_INSTANCE_ID
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            document_id: None,
             join_reservations: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             pending_materialization: None,
             original_session: None,
@@ -599,8 +622,11 @@ impl Document {
             search_status: None,
             search_paused_row_limit: None,
             filter_job: None,
+            filter_job_tag: None,
             filter_index: None,
+            filter_index_tag: None,
             filter_query: None,
+            filter_query_generation: 0,
             filter_refresh_pending: false,
             filter_progress: None,
             filter_status: None,
@@ -626,6 +652,7 @@ impl Document {
             section_quote_free_confirmed: false,
             live_watch: None,
             live_watch_filter_attach: None,
+            live_watch_filter_attach_tag: None,
             live_watch_snapshot: None,
             live_watch_header_row: None,
             live_watch_alert: None,
@@ -638,6 +665,7 @@ impl Document {
             filter_viewport_start: 0,
             filter_buffer_start: 0,
             filtered_rows: Vec::new(),
+            filtered_rows_tag: None,
             filter_read: None,
             pending_filter_read: None,
             reveal_cell: None,
@@ -2738,10 +2766,15 @@ impl Document {
             if live_filter_query_changed {
                 self.stop_filter_read();
                 self.filtered_rows.clear();
+                self.filtered_rows_tag = None;
                 self.whitespace.invalidate_rows();
             }
             let matches = filter_idx.matches_found();
+            let query_matches_active = self.filter_query.as_ref() == Some(filter_idx.query());
             self.filter_index = Some(filter_idx);
+            if query_matches_active {
+                self.filter_index_tag = Some(self.current_filter_tag());
+            }
             if let Some(progress) = self.filter_progress.as_mut() {
                 progress.matches_found = matches;
                 progress.rows_scanned = snap.committed_rows;
@@ -3171,12 +3204,67 @@ impl Document {
         self.search_job.as_ref().map(SearchJob::progress)
     }
 
+    /// Returns the monotonic `(document_id, edit_revision, query_generation)` tag for the
+    /// document's active filter state.
+    pub fn current_filter_tag(&self) -> FilterResultTag {
+        FilterResultTag {
+            document_id: self
+                .document_id
+                .unwrap_or_else(|| DocumentId::new(self.instance_id)),
+            edit_revision: self.edit_revision,
+            query_generation: self.filter_query_generation,
+        }
+    }
+
+    /// Returns whether live as-you-type Query Bar filtering should default on for this document
+    /// (true at or below [`DEFAULT_LIVE_FILTER_MAX_BYTES`], false for larger files).
+    pub fn default_live_filter_enabled(&self) -> bool {
+        self.session.active_byte_len() <= DEFAULT_LIVE_FILTER_MAX_BYTES
+    }
+
+    /// Returns raw header bytes for expression column resolution, honoring section headers,
+    /// committed Live Watch headers, and unsaved header renames (empty when headerless).
+    pub fn filter_column_headers(&self) -> Vec<Vec<u8>> {
+        if !self.session.dialect.has_header {
+            return Vec::new();
+        }
+        let mut fields = if let Some(row) = self.live_watch_header_row.as_ref() {
+            row.fields.clone()
+        } else {
+            self.session.filter_column_schema().headers.to_vec()
+        };
+        for (column, name) in self.header_renames.iter() {
+            if let Some(field) = fields.get_mut(*column) {
+                *field = name.as_bytes().to_vec();
+            }
+        }
+        fields
+    }
+
+    /// Parses an exact `FilterQuery` expression against this document's active column schema.
+    pub fn parse_filter_expression(
+        &self,
+        expr: &str,
+        case_sensitivity: CaseSensitivity,
+    ) -> Result<FilterQuery, FilterExprError> {
+        let headers = self.filter_column_headers();
+        let column_count = (self.total_columns > 0).then_some(self.total_columns);
+        let schema = FilterColumnSchema::with_headers(&headers, column_count);
+        parse_filter_expr(expr, &schema, case_sensitivity)
+    }
+
+    /// Prints the document's active `FilterQuery` in canonical expression form, if any.
+    pub fn active_filter_expression(&self) -> Option<Result<String, FilterExprError>> {
+        let query = self.filter_query.as_ref()?;
+        let headers = self.filter_column_headers();
+        let column_count = (self.total_columns > 0).then_some(self.total_columns);
+        let schema = FilterColumnSchema::with_headers(&headers, column_count);
+        Some(print_filter_expr(query, &schema))
+    }
+
     pub fn start_filter(&mut self, query: FilterQuery) -> Result<(), String> {
         if self.export_job.is_some() {
             return Err("Cancel the active export before changing filters.".into());
-        }
-        if self.is_filter_scanning() {
-            return Err("A filter is already running.".into());
         }
         if self.search_job.is_some() {
             return Err("Cancel the active search before filtering.".into());
@@ -3205,14 +3293,30 @@ impl Document {
             .map_err(|error| self.diagnostic_error(error))?;
 
         self.commit_edits();
+        // Supersede any in-flight scan/read only after validation succeeds so invalid queries
+        // never disturb the currently active filter.
+        self.stop_filter_read();
+        if let Some(old_job) = self.filter_job.take() {
+            old_job.cancel();
+            drop(old_job);
+        }
+        self.filter_job_tag = None;
+        if let Some(old_attach) = self.live_watch_filter_attach.take() {
+            old_attach.cancel();
+            drop(old_attach);
+        }
+        self.live_watch_filter_attach_tag = None;
+        self.filter_query_generation = self.filter_query_generation.wrapping_add(1);
+        let tag = self.current_filter_tag();
+
         if let Some(watch) = &self.live_watch {
             let attach_job = watch
                 .start_attach_filter_query(query.clone())
                 .map_err(|error| self.diagnostic_error(error))?;
-            self.stop_filter_read();
-            self.filter_job = None;
             self.live_watch_filter_attach = Some(attach_job);
+            self.live_watch_filter_attach_tag = Some(tag);
             self.filter_index = None;
+            self.filter_index_tag = None;
             self.filter_query = Some(query);
             self.filter_refresh_pending = false;
             self.filter_paused_row_limit = None;
@@ -3233,6 +3337,7 @@ impl Document {
             self.filter_buffer_start = 0;
             self.whitespace.invalidate_rows();
             self.filtered_rows.clear();
+            self.filtered_rows_tag = None;
             self.selection = None;
             self.clear_row_selection();
             self.reveal_cell = None;
@@ -3263,10 +3368,11 @@ impl Document {
                 }
                 self.diagnostic_error(error)
             })?;
-        self.stop_filter_read();
         self.filter_progress = Some(job.progress());
         self.filter_index = Some(job.snapshot());
+        self.filter_index_tag = Some(tag);
         self.filter_job = Some(job);
+        self.filter_job_tag = Some(tag);
         self.filter_query = Some(query);
         self.filter_refresh_pending = false;
         self.filter_paused_row_limit = paused_row_limit;
@@ -3282,6 +3388,7 @@ impl Document {
         self.filter_buffer_start = 0;
         self.whitespace.invalidate_rows();
         self.filtered_rows.clear();
+        self.filtered_rows_tag = None;
         self.selection = None;
         self.clear_row_selection();
         self.reveal_cell = None;
@@ -3298,9 +3405,13 @@ impl Document {
         if let Some(job) = self.filter_job.take() {
             job.cancel();
         }
+        self.filter_job_tag = None;
+        self.filter_query_generation = self.filter_query_generation.wrapping_add(1);
         self.filter_index = None;
+        self.filter_index_tag = None;
         self.filter_progress = None;
         self.filtered_rows.clear();
+        self.filtered_rows_tag = None;
         self.whitespace.invalidate_rows();
         self.selection = None;
         self.clear_row_selection();
@@ -3334,6 +3445,85 @@ impl Document {
         self.poll_filter_read()
     }
 
+    /// Installs a completed filter scan index only if its `(document_id, edit_revision,
+    /// query_generation)` tag still matches the document's active filter state.
+    pub fn accept_filter_scan_completion(
+        &mut self,
+        tag: FilterResultTag,
+        index: FilterIndex,
+        progress: FilterProgress,
+    ) -> Result<bool, String> {
+        if tag != self.current_filter_tag() || !self.filter_active() {
+            return Ok(false);
+        }
+        let matches = index.matches_found();
+        self.filter_index = Some(index);
+        self.filter_index_tag = Some(tag);
+        self.filter_progress = Some(progress);
+        self.filter_status = Some(if let Some(limit) = self.filter_paused_row_limit {
+            if progress.cancelled {
+                let scanned = progress.rows_scanned.saturating_sub(self.data_start);
+                format!(
+                    "Filter cancelled after {matches} matches (filtered up to row {scanned}, indexing paused)."
+                )
+            } else if matches == 0 {
+                format!(
+                    "Filter complete. No matching rows (filtered up to row {limit}, indexing paused)."
+                )
+            } else {
+                format!(
+                    "Filter complete. {matches} matches (filtered up to row {limit}, indexing paused)."
+                )
+            }
+        } else if progress.cancelled {
+            format!("Filter cancelled after {matches} matches.")
+        } else if matches == 0 {
+            "Filter complete. No matching rows.".into()
+        } else {
+            format!("Filter complete. {matches} matches.")
+        });
+        if matches > 0 {
+            self.navigate_filter(self.filter_viewport_start)?;
+        }
+        Ok(true)
+    }
+
+    /// Installs a completed filtered-page read only if its `(document_id, edit_revision,
+    /// query_generation)` tag still matches the document's active filter state and index.
+    pub fn accept_filter_page_result(
+        &mut self,
+        tag: FilterResultTag,
+        window: FilterReadWindow,
+        rows: Vec<FilterMatch>,
+        started: Instant,
+        tail_follow: bool,
+        cancel_requested: bool,
+    ) -> bool {
+        if tag != self.current_filter_tag()
+            || self.filter_index_tag != Some(tag)
+            || !self.filter_active()
+        {
+            return false;
+        }
+        let desired = self.filter_read_window(self.filter_viewport_start);
+        let install_coalesced_live =
+            tail_follow && !cancel_requested && self.filter_active() && self.is_live_watching();
+        if desired != Some(window) && !install_coalesced_live {
+            return false;
+        }
+        let loaded_columns = rows.iter().map(|row| row.fields.len()).max().unwrap_or(0);
+        if loaded_columns > self.total_columns {
+            self.ensure_column_count(loaded_columns);
+            self.refresh_column_headers();
+        }
+        self.last_viewport_read = Some(started.elapsed());
+        self.filter_buffer_start = window.start_match;
+        self.whitespace.invalidate_rows();
+        self.filtered_rows = rows.into_iter().map(Arc::new).collect();
+        self.filtered_rows_tag = Some(tag);
+        true
+    }
+
     pub fn poll_filter_scan(&mut self) -> Result<(), String> {
         if let Some(attach) = self.live_watch_filter_attach.as_ref() {
             if !attach.is_done() {
@@ -3343,8 +3533,12 @@ impl Document {
                 .live_watch_filter_attach
                 .take()
                 .expect("live watch filter attach job is present");
+            let attach_tag = self.live_watch_filter_attach_tag.take();
             match attach.wait() {
                 Ok(Some(attached_index)) => {
+                    if attach_tag != Some(self.current_filter_tag()) || !self.filter_active() {
+                        return Ok(());
+                    }
                     // Collect the watcher's current synchronized filter index so rows appended
                     // after filter installation (already synced by `poll_live_watch`) are never
                     // overwritten by the older snapshot returned by the attachment worker.
@@ -3355,6 +3549,7 @@ impl Document {
                         .unwrap_or(attached_index);
                     let matches = filter_index.matches_found();
                     self.filter_index = Some(filter_index);
+                    self.filter_index_tag = attach_tag;
                     self.filter_progress = Some(FilterProgress {
                         bytes_scanned: self.progress.bytes_scanned,
                         rows_scanned: self.progress.rows_scanned,
@@ -3375,9 +3570,13 @@ impl Document {
                     self.filter_buffer_start = 0;
                     self.whitespace.invalidate_rows();
                     self.filtered_rows.clear();
+                    self.filtered_rows_tag = None;
                     self.schedule_filter_buffer(self.filter_viewport_start)?;
                 }
                 Ok(None) => {
+                    if attach_tag != Some(self.current_filter_tag()) {
+                        return Ok(());
+                    }
                     self.stop_filter_read();
                     if let Some(existing) = self
                         .live_watch
@@ -3385,8 +3584,11 @@ impl Document {
                         .and_then(LiveWatchJob::filter_index_snapshot)
                     {
                         let matches = existing.matches_found();
+                        self.filter_query_generation = self.filter_query_generation.wrapping_add(1);
+                        let restored_tag = self.current_filter_tag();
                         self.filter_query = Some(existing.query().clone());
                         self.filter_index = Some(existing);
+                        self.filter_index_tag = Some(restored_tag);
                         self.filter_progress = Some(FilterProgress {
                             bytes_scanned: self.progress.bytes_scanned,
                             rows_scanned: self.progress.rows_scanned,
@@ -3408,15 +3610,21 @@ impl Document {
                         self.filter_buffer_start = 0;
                         self.whitespace.invalidate_rows();
                         self.filtered_rows.clear();
+                        self.filtered_rows_tag = None;
                         self.schedule_filter_buffer(self.filter_viewport_start)?;
                     } else {
                         self.filter_query = None;
                         self.filter_index = None;
+                        self.filter_index_tag = None;
+                        self.filtered_rows_tag = None;
                         self.filter_progress = None;
                         self.filter_status = Some("Filter cancelled.".into());
                     }
                 }
                 Err(error) => {
+                    if attach_tag != Some(self.current_filter_tag()) {
+                        return Ok(());
+                    }
                     self.stop_filter_read();
                     if matches!(error, QuarryError::SourceChanged) {
                         self.invalidate_changed_source();
@@ -3430,8 +3638,11 @@ impl Document {
                         .and_then(LiveWatchJob::filter_index_snapshot)
                     {
                         let matches = existing.matches_found();
+                        self.filter_query_generation = self.filter_query_generation.wrapping_add(1);
+                        let restored_tag = self.current_filter_tag();
                         self.filter_query = Some(existing.query().clone());
                         self.filter_index = Some(existing);
+                        self.filter_index_tag = Some(restored_tag);
                         self.filter_progress = Some(FilterProgress {
                             bytes_scanned: self.progress.bytes_scanned,
                             rows_scanned: self.progress.rows_scanned,
@@ -3445,11 +3656,14 @@ impl Document {
                             self.filter_buffer_start = 0;
                             self.whitespace.invalidate_rows();
                             self.filtered_rows.clear();
+                            self.filtered_rows_tag = None;
                             let _ = self.schedule_filter_buffer(self.filter_viewport_start);
                         }
                     } else {
                         self.filter_query = None;
                         self.filter_index = None;
+                        self.filter_index_tag = None;
+                        self.filtered_rows_tag = None;
                         self.filter_progress = None;
                     }
                     self.filter_status = Some("Filter failed.".into());
@@ -3461,6 +3675,15 @@ impl Document {
         let Some(job) = self.filter_job.as_ref() else {
             return Ok(());
         };
+        let current_tag = self.current_filter_tag();
+        if self.filter_job_tag != Some(current_tag) {
+            if let Some(stale) = self.filter_job.take() {
+                stale.cancel();
+                drop(stale);
+            }
+            self.filter_job_tag = None;
+            return Ok(());
+        }
         let progress = job.progress();
         self.filter_progress = Some(progress);
 
@@ -3475,10 +3698,12 @@ impl Document {
                     <= max_viewport_start(progress.matches_found, self.visible_rows)
             {
                 self.refresh_filter_snapshot_for(required);
+                self.filter_index_tag = Some(current_tag);
                 self.navigate_filter(self.filter_viewport_start)?;
             }
         } else {
             self.filtered_rows.clear();
+            self.filtered_rows_tag = None;
             self.filter_buffer_start = 0;
             if progress.done {
                 self.filter_viewport_start = 0;
@@ -3489,44 +3714,23 @@ impl Document {
         }
 
         let job = self.filter_job.take().expect("filter job is present");
+        let job_tag = self.filter_job_tag.take().unwrap_or(current_tag);
         match job.wait() {
             Ok(index) => {
-                let matches = index.matches_found();
-                self.filter_index = Some(index);
-                self.filter_status = Some(if let Some(limit) = self.filter_paused_row_limit {
-                    if progress.cancelled {
-                        let scanned = progress.rows_scanned.saturating_sub(self.data_start);
-                        format!(
-                            "Filter cancelled after {matches} matches (filtered up to row {scanned}, indexing paused)."
-                        )
-                    } else if matches == 0 {
-                        format!(
-                            "Filter complete. No matching rows (filtered up to row {limit}, indexing paused)."
-                        )
-                    } else {
-                        format!(
-                            "Filter complete. {matches} matches (filtered up to row {limit}, indexing paused)."
-                        )
-                    }
-                } else if progress.cancelled {
-                    format!("Filter cancelled after {matches} matches.")
-                } else if matches == 0 {
-                    "Filter complete. No matching rows.".into()
-                } else {
-                    format!("Filter complete. {matches} matches.")
-                });
-                if matches > 0 {
-                    self.navigate_filter(self.filter_viewport_start)?;
-                }
+                let _ = self.accept_filter_scan_completion(job_tag, index, progress)?;
                 Ok(())
             }
             Err(error) => {
+                if job_tag != self.current_filter_tag() {
+                    return Ok(());
+                }
                 if matches!(error, QuarryError::SourceChanged) {
                     self.invalidate_changed_source();
                     return Err(SOURCE_CHANGED_NOTICE.into());
                 }
                 self.stop_filter_read();
                 self.filter_index = None;
+                self.filter_index_tag = None;
                 self.filter_query = None;
                 self.filter_refresh_pending = false;
                 self.filter_progress = None;
@@ -3534,6 +3738,7 @@ impl Document {
                 self.filter_paused_row_limit = None;
                 self.whitespace.invalidate_rows();
                 self.filtered_rows.clear();
+                self.filtered_rows_tag = None;
                 self.filter_viewport_start = 0;
                 self.filter_buffer_start = 0;
                 Err(self.diagnostic_error(error))
@@ -3555,26 +3760,22 @@ impl Document {
             .take()
             .expect("completed filter read should be active");
         let desired = self.filter_read_window(self.filter_viewport_start);
-        let install_coalesced_live = active.tail_follow
-            && !active.cancel_requested
-            && self.filter_active()
-            && self.is_live_watching();
         match active.job.wait() {
-            Ok(FilterReadOutcome::Complete(rows))
-                if desired == Some(active.window) || install_coalesced_live =>
-            {
-                let loaded_columns = rows.iter().map(|row| row.fields.len()).max().unwrap_or(0);
-                if loaded_columns > self.total_columns {
-                    self.ensure_column_count(loaded_columns);
-                    self.refresh_column_headers();
-                }
-                self.last_viewport_read = Some(active.started.elapsed());
-                self.filter_buffer_start = active.window.start_match;
-                self.whitespace.invalidate_rows();
-                self.filtered_rows = rows.into_iter().map(Arc::new).collect();
+            Ok(FilterReadOutcome::Complete(rows)) => {
+                let _ = self.accept_filter_page_result(
+                    active.tag,
+                    active.window,
+                    rows,
+                    active.started,
+                    active.tail_follow,
+                    active.cancel_requested,
+                );
             }
-            Ok(FilterReadOutcome::Complete(_) | FilterReadOutcome::Cancelled) => {}
+            Ok(FilterReadOutcome::Cancelled) => {}
             Err(error) => {
+                if active.tag != self.current_filter_tag() {
+                    return Ok(());
+                }
                 if matches!(error, QuarryError::SourceChanged) {
                     self.invalidate_changed_source();
                     return Err(SOURCE_CHANGED_NOTICE.into());
@@ -3595,7 +3796,7 @@ impl Document {
             }
         }
 
-        if self.filter_waiting_for_page() {
+        if self.filter_waiting_for_page() || !self.filter_active() {
             return Ok(());
         }
         self.schedule_filter_buffer_inner(
@@ -4606,7 +4807,11 @@ impl Document {
         self.source_changed = true;
         self.progress.columns_found = 0;
         self.index = None;
+        self.filter_job_tag = None;
+        self.live_watch_filter_attach_tag = None;
+        self.filter_query_generation = self.filter_query_generation.wrapping_add(1);
         self.filter_index = None;
+        self.filter_index_tag = None;
         self.filter_query = None;
         self.filter_refresh_pending = false;
         self.filter_progress = None;
@@ -4616,6 +4821,7 @@ impl Document {
         self.buffered_rows.clear();
         self.whitespace.invalidate_rows();
         self.filtered_rows.clear();
+        self.filtered_rows_tag = None;
         self.selection = None;
         self.clear_row_selection();
         self.reveal_cell = None;
@@ -4669,7 +4875,11 @@ impl Document {
             job.cancel();
             drop(job);
         }
+        self.filter_job_tag = None;
+        self.live_watch_filter_attach_tag = None;
+        self.filter_query_generation = self.filter_query_generation.wrapping_add(1);
         self.filter_index = None;
+        self.filter_index_tag = None;
         self.filter_query = None;
         self.filter_refresh_pending = false;
         self.filter_progress = None;
@@ -4682,6 +4892,7 @@ impl Document {
         self.filter_buffer_start = 0;
         self.whitespace.invalidate_rows();
         self.filtered_rows.clear();
+        self.filtered_rows_tag = None;
         self.selection = None;
         self.clear_row_selection();
         self.reveal_cell = None;
@@ -5874,7 +6085,9 @@ impl Document {
                     }
                 })?
         };
+        let tag = self.current_filter_tag();
         self.filter_read = Some(ActiveFilterRead {
+            tag,
             window,
             job,
             started: Instant::now(),
@@ -8209,5 +8422,145 @@ mod tests {
         assert!(err.text.contains("destination"));
         assert!(document.save_job.is_none());
         assert!(document.save_output_encoding.is_none());
+    }
+
+    #[test]
+    fn filter_generation_tag_discards_out_of_order_stale_query_edit_and_tab_results() {
+        let directory = tempfile::tempdir().unwrap();
+        let path_a = directory.path().join("tab-a.csv");
+        let path_b = directory.path().join("tab-b.csv");
+        fs::write(&path_a, b"state,amount\nTX,10\nFL,20\nTX,30\nCA,40\n").unwrap();
+        fs::write(&path_b, b"state,amount\nNY,50\nTX,60\n").unwrap();
+
+        let mut doc_a = Document::open(
+            &path_a,
+            OpenOptions {
+                header_mode: HeaderMode::FirstRow,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        doc_a.document_id = Some(DocumentId::new(1));
+        finish_index(&mut doc_a);
+
+        let mut doc_b = Document::open(
+            &path_b,
+            OpenOptions {
+                header_mode: HeaderMode::FirstRow,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        doc_b.document_id = Some(DocumentId::new(2));
+        finish_index(&mut doc_b);
+
+        // Expression parsing & canonical printing honor renamed headers and round-trip.
+        doc_a.rename_header(1, "order total".into()).unwrap();
+        let q1 = doc_a
+            .parse_filter_expression(
+                "state == \"TX\" AND [order total] >= 10",
+                CaseSensitivity::Sensitive,
+            )
+            .unwrap();
+        doc_a.start_filter(q1.clone()).unwrap();
+        let tag_q1 = doc_a.current_filter_tag();
+        assert_eq!(tag_q1.document_id, DocumentId::new(1));
+        assert_eq!(
+            doc_a.active_filter_expression().unwrap().unwrap(),
+            "state == \"TX\" AND [order total] >= 10"
+        );
+        finish_filter(&mut doc_a);
+        let q1_index = doc_a.filter_index.clone().unwrap();
+        let q1_rows: Vec<FilterMatch> = doc_a.filtered_rows.iter().map(|r| (**r).clone()).collect();
+        assert_eq!(q1_rows.len(), 2);
+
+        // Invalid replacement expression must NOT disturb the active filter.
+        assert!(
+            doc_a
+                .parse_filter_expression(
+                    "state == \"FL\" OR [order total] > 5",
+                    CaseSensitivity::Sensitive,
+                )
+                .is_err()
+        );
+        assert_eq!(doc_a.filter_query.as_ref(), Some(&q1));
+        assert_eq!(doc_a.current_filter_tag(), tag_q1);
+
+        // Supersede with query 2 (`state == "FL"`) while forcing chunk 2 to arrive BEFORE chunk 1.
+        let q2 = doc_a
+            .parse_filter_expression("state == \"FL\"", CaseSensitivity::Sensitive)
+            .unwrap();
+        doc_a.start_filter(q2.clone()).unwrap();
+        let tag_q2 = doc_a.current_filter_tag();
+        assert_ne!(tag_q2.query_generation, tag_q1.query_generation);
+        finish_filter(&mut doc_a);
+        assert_eq!(doc_a.filtered_rows.len(), 1);
+        assert_eq!(doc_a.filtered_rows[0].fields[0], b"FL");
+        assert_eq!(doc_a.filtered_rows_tag, Some(tag_q2));
+
+        // Late scan completion AND late page chunk from query 1 (older query_generation) are discarded.
+        let stale_progress = FilterProgress {
+            bytes_scanned: 100,
+            rows_scanned: 5,
+            matches_found: q1_index.matches_found(),
+            file_size: 100,
+            elapsed: Duration::ZERO,
+            done: true,
+            cancelled: false,
+        };
+        assert!(
+            !doc_a
+                .accept_filter_scan_completion(tag_q1, q1_index.clone(), stale_progress)
+                .unwrap()
+        );
+        let window = doc_a.filter_read_window(0).unwrap();
+        assert!(!doc_a.accept_filter_page_result(
+            tag_q1,
+            window,
+            q1_rows.clone(),
+            Instant::now(),
+            false,
+            false,
+        ));
+        assert_eq!(doc_a.filtered_rows.len(), 1);
+        assert_eq!(doc_a.filtered_rows[0].fields[0], b"FL");
+
+        // Late page chunk tagged with Tab A's DocumentId is rejected by Tab B.
+        doc_b.start_filter(q2.clone()).unwrap();
+        finish_filter(&mut doc_b);
+        let window_b = FilterReadWindow {
+            start_match: 0,
+            count: 10,
+        };
+        assert!(!doc_b.accept_filter_page_result(
+            tag_q2,
+            window_b,
+            q1_rows.clone(),
+            Instant::now(),
+            false,
+            false,
+        ));
+        assert!(doc_b.filtered_rows.is_empty());
+
+        // Cell edit bumps edit_revision: any late page chunk tagged with the pre-edit tag is rejected.
+        let pre_edit_tag = doc_a.current_filter_tag();
+        doc_a.begin_cell_edit(2, 0, b"FL".to_vec()).unwrap();
+        doc_a.cell_edit.as_mut().unwrap().draft = "NY".into();
+        doc_a.commit_edits();
+        assert_ne!(
+            doc_a.current_filter_tag().edit_revision,
+            pre_edit_tag.edit_revision
+        );
+        assert!(!doc_a.accept_filter_page_result(
+            pre_edit_tag,
+            window,
+            q1_rows,
+            Instant::now(),
+            false,
+            false,
+        ));
+
+        doc_a.shutdown();
+        doc_b.shutdown();
     }
 }
