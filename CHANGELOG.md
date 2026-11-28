@@ -20,6 +20,7 @@ GitHub pull requests.
 
 ### Changed
 
+- Sped up GitHub Actions CI by adding Rust dependency caching across all jobs, removing the duplicate release compile of the desktop app in the macOS packaging check, aligning test and lint feature flags, and adding a fail-closed fast path for documentation-only pull requests while keeping full LTO release builds for tagged releases. (#236)
 - Retired the unused GitHub Project board links across `README.md`, `docs/ROADMAP.md`, `docs/README.md`, `docs/ROADMAP_HISTORY.md`, and the issue template, pointing contributors directly to `docs/ROADMAP.md` and GitHub Issues. (#235)
 - Replaced the outdated `v0.1`–`v0.5` log in `docs/PRD.md` with a current product requirements document and corrected stale temporary-storage, indexing, sorting, and tab-dormancy details in `docs/ARCHITECTURE.md`, `docs/USER_GUIDE.md`, and `README.md`. (#235)
 - Refreshed audited third-party license notice inventories across macOS Apple Silicon and Linux `x86_64` / `arm64` after adding `regex` to `quarry-core` (with no new third-party crates added to `Cargo.lock`). (#232)
