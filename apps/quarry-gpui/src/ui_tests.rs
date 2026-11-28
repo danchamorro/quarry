@@ -5745,17 +5745,33 @@ fn query_bar_applies_syncs_rules_isolates_tabs_and_preserves_active_filter_on_er
                 .print_omitted_reason_for_test()
                 .is_some()
     });
-    cx.update_window(win.into(), |_, _, cx| {
+    cx.update_window(win.into(), |_, window, cx| {
         view.update(cx, |q, cx| {
             assert_eq!(q.query_bar.read(cx).text_for_test(cx), "");
-            q.query_bar.update(cx, |bar, cx| bar.apply_now(cx));
+            q.query_bar.update(cx, |bar, cx| {
+                bar.apply_now(cx);
+                // Toggling Live on while the active filter expression is omitted must preserve
+                // the omission notice and must NOT schedule an empty-input Clear.
+                bar.set_live_mode_for_test(true, window, cx);
+            });
         });
     })
     .unwrap();
+    cx.background_executor
+        .advance_clock(Duration::from_millis(250));
+    cx.run_until_parked();
     cx.update(|cx| {
         assert!(
             view.read(cx).snapshot(cx).is_some_and(|s| s.filter_active),
-            "pressing Enter on omitted expression must not clear active filter"
+            "pressing Enter or enabling Live on an omitted expression must not clear active filter"
+        );
+        assert!(
+            view.read(cx)
+                .query_bar
+                .read(cx)
+                .print_omitted_reason_for_test()
+                .is_some(),
+            "enabling Live must preserve the omission notice"
         );
     });
 

@@ -8675,18 +8675,18 @@ mod tests {
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
-        }
-        let q2 = doc
-            .parse_filter_expression("state == \"FL\"", CaseSensitivity::Sensitive)
-            .unwrap();
-        let start_res = doc.start_filter(q2);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
+            // Privileged users (e.g. root in CI containers) bypass mode 000 read checks;
+            // restore permissions and skip cleanly when the OS cannot enforce PermissionDenied.
+            if std::fs::File::open(&path).is_ok() {
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+                doc.shutdown();
+                return;
+            }
+            let q2 = doc
+                .parse_filter_expression("state == \"FL\"", CaseSensitivity::Sensitive)
+                .unwrap();
+            let start_res = doc.start_filter(q2);
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-        }
-        #[cfg(unix)]
-        {
             assert!(start_res.is_err());
             assert!(!doc.source_changed);
             assert_eq!(doc.filter_query.as_ref(), Some(&q1));
@@ -8704,8 +8704,6 @@ mod tests {
                 false,
             ));
         }
-        #[cfg(not(unix))]
-        let _ = start_res;
 
         doc.shutdown();
     }

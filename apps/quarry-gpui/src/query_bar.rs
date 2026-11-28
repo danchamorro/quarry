@@ -464,6 +464,39 @@ impl QueryBar {
         self.on_input_changed(window, cx);
     }
 
+    fn set_live_mode(&mut self, live: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.live_mode = live;
+        self.live_override = Some(live);
+        self.debounce_task = None;
+        if live {
+            let text_empty = self.input.read(cx).value().trim().is_empty();
+            if text_empty && self.print_omitted_reason.is_some() {
+                cx.notify();
+                return;
+            }
+            match self.revalidate_current(cx) {
+                Some(Ok(query)) => {
+                    self.draft_generation = self.draft_generation.wrapping_add(1);
+                    self.schedule_live_apply(Some(query), window, cx);
+                }
+                Some(Err(_)) => {}
+                None if self.draft_dirty => {
+                    let has_active_filter = self
+                        .controller
+                        .read(cx)
+                        .active_snapshot(self.window_id)
+                        .is_some_and(|s| s.filter_active);
+                    if has_active_filter {
+                        self.draft_generation = self.draft_generation.wrapping_add(1);
+                        self.schedule_live_apply(None, window, cx);
+                    }
+                }
+                None => {}
+            }
+        }
+        cx.notify();
+    }
+
     #[cfg(test)]
     pub(crate) fn set_live_mode_for_test(
         &mut self,
@@ -471,14 +504,7 @@ impl QueryBar {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.live_mode = live;
-        self.live_override = Some(live);
-        if live {
-            self.on_input_changed(window, cx);
-        } else {
-            self.debounce_task = None;
-            cx.notify();
-        }
+        self.set_live_mode(live, window, cx);
     }
 
     #[cfg(test)]
@@ -628,14 +654,7 @@ impl Render for QueryBar {
                             .small()
                             .checked(self.live_mode)
                             .on_change(cx.listener(|this, checked, window, cx| {
-                                this.live_mode = *checked;
-                                this.live_override = Some(*checked);
-                                if *checked {
-                                    this.on_input_changed(window, cx);
-                                } else {
-                                    this.debounce_task = None;
-                                    cx.notify();
-                                }
+                                this.set_live_mode(*checked, window, cx);
                             })),
                     )
                     .child(
