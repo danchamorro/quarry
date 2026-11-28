@@ -5,100 +5,235 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
+env:
+  # Use parallel, non-LTO release compilation in CI so `main` populates a single
+  # rust-cache that every new PR reuses on its first run (for Clippy, tests, and
+  # release builds alike). Tagged releases (`release.yml`) and local installs
+  # still use `Cargo.toml`'s `lto = "thin"` and `codegen-units = 1`.
+  CARGO_PROFILE_RELEASE_LTO: "off"
+  CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+
 jobs:
+  detect-changes:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+    steps:
+      - name: Classify changed paths
+        id: filter
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" != "pull_request" ]]; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            echo "Push event — running full CI."
+            exit 0
+          fi
+
+          if ! entries="$(gh api --paginate "repos/${REPO}/pulls/${PR_NUMBER}/files" --jq '.[] | [.filename, (.previous_filename // "")] | @tsv')"; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            echo "Could not list PR files — defaulting to full CI."
+            exit 0
+          fi
+
+          if [[ -z "$entries" ]]; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            echo "Empty PR file list — defaulting to full CI."
+            exit 0
+          fi
+
+          docs_regex='^(docs/|README\.md$|CHANGELOG\.md$|\.github/ISSUE_TEMPLATE/)'
+          code_changed=false
+          file_count=0
+          while IFS=$'\t' read -r path prev_path; do
+            [[ -n "$path" ]] || continue
+            file_count=$((file_count + 1))
+            if [[ ! "$path" =~ $docs_regex ]]; then
+              code_changed=true
+              echo "Non-doc change detected: $path"
+              break
+            fi
+            if [[ -n "$prev_path" && ! "$prev_path" =~ $docs_regex ]]; then
+              code_changed=true
+              echo "Non-doc rename source detected: $prev_path -> $path"
+              break
+            fi
+          done <<< "$entries"
+
+          # GitHub's PR files endpoint caps at 3000 entries; fail safe to full CI.
+          if (( file_count >= 3000 )); then
+            code_changed=true
+            echo "PR touched >= 3000 files — defaulting to full CI."
+          fi
+
+          echo "code=${code_changed}" >> "$GITHUB_OUTPUT"
+          if [[ "$code_changed" == "false" ]]; then
+            echo "Docs-only PR — skipping Rust build and test matrix."
+          fi
+
   test:
+    needs: [detect-changes]
+    # Run even if `detect-changes` fails (so a skipped `test` job can never
+    # satisfy branch protection), while still honoring `cancel-in-progress`
+    # when a newer commit supersedes this PR run.
+    if: ${{ !cancelled() }}
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Verify change detection succeeded
+        if: needs.detect-changes.result != 'success' || (needs.detect-changes.outputs.code != 'true' && needs.detect-changes.outputs.code != 'false')
+        env:
+          DETECT_RESULT: ${{ needs.detect-changes.result }}
+          DETECT_CODE: ${{ needs.detect-changes.outputs.code }}
+        run: |
+          echo "error: detect-changes did not succeed cleanly (result=${DETECT_RESULT}, code=${DETECT_CODE})." >&2
+          exit 1
+
+      - name: Skip Rust checks on docs-only PR
+        if: needs.detect-changes.result == 'success' && needs.detect-changes.outputs.code == 'false'
+        run: echo "Docs-only PR — required CI/test check satisfied without Rust builds."
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        if: needs.detect-changes.result == 'success' && needs.detect-changes.outputs.code == 'true'
         with:
           fetch-depth: 0
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@1.100.0
+      - uses: dtolnay/rust-toolchain@d5e4d57b030548f435d0befec15ff413a2c60eff # 1.100.0
+        if: needs.detect-changes.result == 'success' && needs.detect-changes.outputs.code == 'true'
         with:
           components: clippy,rustfmt
-      - name: Record host architecture
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        if: needs.detect-changes.result == 'success' && needs.detect-changes.outputs.code == 'true'
+        with:
+          cache-on-failure: true
+      - name: Record host architecture and target
+        id: host
+        if: needs.detect-changes.result == 'success' && needs.detect-changes.outputs.code == 'true'
         run: |
           uname -sm
           rustc -vV
-      - run: cargo fmt --all -- --check
-      - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-      - run: cargo test --workspace --locked
-      - run: cargo build --workspace --release --locked
-      - run: ./scripts/macos-app.sh self-test
-      - run: ./scripts/linux-app.sh self-test
-      - run: ./scripts/generate-notices.sh --release-check --all-targets
-      - run: ./scripts/macos-app.sh package
+          host_target="$(rustc -vV | sed -n 's/^host: //p')"
+          echo "target=${host_target}" >> "$GITHUB_OUTPUT"
+      - if: needs.detect-changes.result == 'success' && needs.detect-changes.outputs.code == 'true'
+        run: cargo fmt --all -- --check
+      - if: needs.detect-changes.result == 'success' && needs.detect-changes.outputs.code == 'true'
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - if: needs.detect-changes.result == 'success' && needs.detect-changes.outputs.code == 'true'
+        run: cargo test --workspace --all-features --locked
+      - name: Build non-GPUI workspace crates (release)
+        if: needs.detect-changes.result == 'success' && needs.detect-changes.outputs.code == 'true'
+        run: cargo build --release --locked --target "${{ steps.host.outputs.target }}" -p quarry-core -p quarry-delimited -p quarry-workbench -p quarry-cli -p quarry-appkit
+      - if: needs.detect-changes.result == 'success' && needs.detect-changes.outputs.code == 'true'
+        run: ./scripts/macos-app.sh self-test
+      - if: needs.detect-changes.result == 'success' && needs.detect-changes.outputs.code == 'true'
+        run: ./scripts/linux-app.sh self-test
+      - if: needs.detect-changes.result == 'success' && needs.detect-changes.outputs.code == 'true'
+        run: ./scripts/generate-notices.sh --release-check --all-targets
+      - name: Build and verify macOS app bundle (GPUI release)
+        if: needs.detect-changes.result == 'success' && needs.detect-changes.outputs.code == 'true'
+        run: |
+          ./scripts/macos-app.sh package
+          rm -rf target/package
 
   linux-core-cli:
+    needs: [detect-changes]
+    if: needs.detect-changes.result == 'success' && needs.detect-changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@1.100.0
+      - uses: dtolnay/rust-toolchain@d5e4d57b030548f435d0befec15ff413a2c60eff # 1.100.0
         with:
           components: clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          cache-on-failure: true
       - name: Record host architecture
         run: |
           uname -sm
           rustc -vV
       - run: cargo clippy -p quarry-core -p quarry-delimited -p quarry-cli -p quarry-workbench --all-targets --all-features --locked -- -D warnings
-      - run: cargo test -p quarry-core -p quarry-delimited -p quarry-cli -p quarry-workbench --locked
+      - run: cargo test -p quarry-core -p quarry-delimited -p quarry-cli -p quarry-workbench --all-features --locked
       - run: cargo build -p quarry-core -p quarry-delimited -p quarry-cli -p quarry-workbench --release --locked
 
   linux-arm64-core-cli:
+    needs: [detect-changes]
+    if: needs.detect-changes.result == 'success' && needs.detect-changes.outputs.code == 'true'
     runs-on: ubuntu-24.04-arm
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@1.100.0
+      - uses: dtolnay/rust-toolchain@d5e4d57b030548f435d0befec15ff413a2c60eff # 1.100.0
         with:
           components: clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          cache-on-failure: true
       - name: Record host architecture
         run: |
           uname -sm
           rustc -vV
       - run: cargo clippy -p quarry-core -p quarry-delimited -p quarry-cli -p quarry-workbench --all-targets --all-features --locked -- -D warnings
-      - run: cargo test -p quarry-core -p quarry-delimited -p quarry-cli -p quarry-workbench --locked
+      - run: cargo test -p quarry-core -p quarry-delimited -p quarry-cli -p quarry-workbench --all-features --locked
       - run: cargo build -p quarry-core -p quarry-delimited -p quarry-cli -p quarry-workbench --release --locked
 
   macos-intel-core-cli:
+    needs: [detect-changes]
+    if: needs.detect-changes.result == 'success' && needs.detect-changes.outputs.code == 'true'
     runs-on: macos-15-intel
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@1.100.0
+      - uses: dtolnay/rust-toolchain@d5e4d57b030548f435d0befec15ff413a2c60eff # 1.100.0
         with:
           components: clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          cache-on-failure: true
       - name: Record host architecture
         run: |
           uname -sm
           rustc -vV
       - run: cargo clippy -p quarry-core -p quarry-delimited -p quarry-cli -p quarry-workbench --all-targets --all-features --locked -- -D warnings
-      - run: cargo test -p quarry-core -p quarry-delimited -p quarry-cli -p quarry-workbench --locked
+      - run: cargo test -p quarry-core -p quarry-delimited -p quarry-cli -p quarry-workbench --all-features --locked
       - run: cargo build -p quarry-core -p quarry-delimited -p quarry-cli -p quarry-workbench --release --locked
 
   windows-core:
+    needs: [detect-changes]
+    if: needs.detect-changes.result == 'success' && needs.detect-changes.outputs.code == 'true'
     runs-on: windows-latest
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@1.100.0
+      - uses: dtolnay/rust-toolchain@d5e4d57b030548f435d0befec15ff413a2c60eff # 1.100.0
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          cache-on-failure: true
       - name: Record host architecture
         shell: pwsh
         run: |
