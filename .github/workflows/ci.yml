@@ -13,10 +13,12 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
-  # Keep full ThinLTO + single codegen unit on `main` pushes; use faster
-  # parallel release compilation on pull requests to avoid 15-20 min runs.
-  CARGO_PROFILE_RELEASE_LTO: ${{ github.event_name == 'pull_request' && 'off' || 'thin' }}
-  CARGO_PROFILE_RELEASE_CODEGEN_UNITS: ${{ github.event_name == 'pull_request' && '16' || '1' }}
+  # Use parallel, non-LTO release compilation in CI so `main` populates a single
+  # rust-cache that every new PR reuses on its first run (for Clippy, tests, and
+  # release builds alike). Tagged releases (`release.yml`) and local installs
+  # still use `Cargo.toml`'s `lto = "thin"` and `codegen-units = 1`.
+  CARGO_PROFILE_RELEASE_LTO: "off"
+  CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
 
 jobs:
   detect-changes:
@@ -42,29 +44,35 @@ jobs:
             exit 0
           fi
 
-          if ! files="$(gh api --paginate "repos/${REPO}/pulls/${PR_NUMBER}/files" --jq '.[].filename')"; then
+          if ! entries="$(gh api --paginate "repos/${REPO}/pulls/${PR_NUMBER}/files" --jq '.[] | [.filename, (.previous_filename // "")] | @tsv')"; then
             echo "code=true" >> "$GITHUB_OUTPUT"
             echo "Could not list PR files — defaulting to full CI."
             exit 0
           fi
 
-          if [[ -z "$files" ]]; then
+          if [[ -z "$entries" ]]; then
             echo "code=true" >> "$GITHUB_OUTPUT"
             echo "Empty PR file list — defaulting to full CI."
             exit 0
           fi
 
+          docs_regex='^(docs/|README\.md$|CHANGELOG\.md$|\.github/ISSUE_TEMPLATE/)'
           code_changed=false
           file_count=0
-          while IFS= read -r path; do
+          while IFS=$'\t' read -r path prev_path; do
             [[ -n "$path" ]] || continue
             file_count=$((file_count + 1))
-            if [[ ! "$path" =~ ^(docs/|README\.md$|CHANGELOG\.md$|\.github/ISSUE_TEMPLATE/) ]]; then
+            if [[ ! "$path" =~ $docs_regex ]]; then
               code_changed=true
               echo "Non-doc change detected: $path"
               break
             fi
-          done <<< "$files"
+            if [[ -n "$prev_path" && ! "$prev_path" =~ $docs_regex ]]; then
+              code_changed=true
+              echo "Non-doc rename source detected: $prev_path -> $path"
+              break
+            fi
+          done <<< "$entries"
 
           # GitHub's PR files endpoint caps at 3000 entries; fail safe to full CI.
           if (( file_count >= 3000 )); then
@@ -79,58 +87,69 @@ jobs:
 
   test:
     needs: [detect-changes]
+    # Never allow a skipped `test` job to satisfy branch protection if
+    # `detect-changes` fails or is cancelled.
+    if: always()
     runs-on: macos-latest
     steps:
+      - name: Verify change detection succeeded
+        if: needs.detect-changes.result != 'success' || (needs.detect-changes.outputs.code != 'true' && needs.detect-changes.outputs.code != 'false')
+        env:
+          DETECT_RESULT: ${{ needs.detect-changes.result }}
+          DETECT_CODE: ${{ needs.detect-changes.outputs.code }}
+        run: |
+          echo "error: detect-changes did not succeed cleanly (result=${DETECT_RESULT}, code=${DETECT_CODE})." >&2
+          exit 1
+
       - name: Skip Rust checks on docs-only PR
-        if: needs.detect-changes.outputs.code != 'true'
+        if: needs.detect-changes.result == 'success' && needs.detect-changes.outputs.code == 'false'
         run: echo "Docs-only PR — required CI/test check satisfied without Rust builds."
 
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        if: needs.detect-changes.outputs.code == 'true'
+        if: needs.detect-changes.result == 'success' && needs.detect-changes.outputs.code == 'true'
         with:
           fetch-depth: 0
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@d5e4d57b030548f435d0befec15ff413a2c60eff # 1.100.0
-        if: needs.detect-changes.outputs.code == 'true'
+        if: needs.detect-changes.result == 'success' && needs.detect-changes.outputs.code == 'true'
         with:
           components: clippy,rustfmt
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
-        if: needs.detect-changes.outputs.code == 'true'
+        if: needs.detect-changes.result == 'success' && needs.detect-changes.outputs.code == 'true'
         with:
-          key: ${{ github.event_name == 'pull_request' && 'pr-fast' || 'main-lto' }}
           cache-on-failure: true
       - name: Record host architecture and target
         id: host
-        if: needs.detect-changes.outputs.code == 'true'
+        if: needs.detect-changes.result == 'success' && needs.detect-changes.outputs.code == 'true'
         run: |
           uname -sm
           rustc -vV
           host_target="$(rustc -vV | sed -n 's/^host: //p')"
           echo "target=${host_target}" >> "$GITHUB_OUTPUT"
-      - if: needs.detect-changes.outputs.code == 'true'
+      - if: needs.detect-changes.result == 'success' && needs.detect-changes.outputs.code == 'true'
         run: cargo fmt --all -- --check
-      - if: needs.detect-changes.outputs.code == 'true'
+      - if: needs.detect-changes.result == 'success' && needs.detect-changes.outputs.code == 'true'
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-      - if: needs.detect-changes.outputs.code == 'true'
+      - if: needs.detect-changes.result == 'success' && needs.detect-changes.outputs.code == 'true'
         run: cargo test --workspace --all-features --locked
       - name: Build non-GPUI workspace crates (release)
-        if: needs.detect-changes.outputs.code == 'true'
+        if: needs.detect-changes.result == 'success' && needs.detect-changes.outputs.code == 'true'
         run: cargo build --release --locked --target "${{ steps.host.outputs.target }}" -p quarry-core -p quarry-delimited -p quarry-workbench -p quarry-cli -p quarry-appkit
-      - if: needs.detect-changes.outputs.code == 'true'
+      - if: needs.detect-changes.result == 'success' && needs.detect-changes.outputs.code == 'true'
         run: ./scripts/macos-app.sh self-test
-      - if: needs.detect-changes.outputs.code == 'true'
+      - if: needs.detect-changes.result == 'success' && needs.detect-changes.outputs.code == 'true'
         run: ./scripts/linux-app.sh self-test
-      - if: needs.detect-changes.outputs.code == 'true'
+      - if: needs.detect-changes.result == 'success' && needs.detect-changes.outputs.code == 'true'
         run: ./scripts/generate-notices.sh --release-check --all-targets
       - name: Build and verify macOS app bundle (GPUI release)
-        if: needs.detect-changes.outputs.code == 'true'
+        if: needs.detect-changes.result == 'success' && needs.detect-changes.outputs.code == 'true'
         run: |
           ./scripts/macos-app.sh package
           rm -rf target/package
 
   linux-core-cli:
     needs: [detect-changes]
-    if: needs.detect-changes.outputs.code == 'true'
+    if: needs.detect-changes.result == 'success' && needs.detect-changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -143,7 +162,6 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
-          key: ${{ github.event_name == 'pull_request' && 'pr-fast' || 'main-lto' }}
           cache-on-failure: true
       - name: Record host architecture
         run: |
@@ -155,7 +173,7 @@ jobs:
 
   linux-arm64-core-cli:
     needs: [detect-changes]
-    if: needs.detect-changes.outputs.code == 'true'
+    if: needs.detect-changes.result == 'success' && needs.detect-changes.outputs.code == 'true'
     runs-on: ubuntu-24.04-arm
     permissions:
       contents: read
@@ -168,7 +186,6 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
-          key: ${{ github.event_name == 'pull_request' && 'pr-fast' || 'main-lto' }}
           cache-on-failure: true
       - name: Record host architecture
         run: |
@@ -180,7 +197,7 @@ jobs:
 
   macos-intel-core-cli:
     needs: [detect-changes]
-    if: needs.detect-changes.outputs.code == 'true'
+    if: needs.detect-changes.result == 'success' && needs.detect-changes.outputs.code == 'true'
     runs-on: macos-15-intel
     permissions:
       contents: read
@@ -193,7 +210,6 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
-          key: ${{ github.event_name == 'pull_request' && 'pr-fast' || 'main-lto' }}
           cache-on-failure: true
       - name: Record host architecture
         run: |
@@ -205,7 +221,7 @@ jobs:
 
   windows-core:
     needs: [detect-changes]
-    if: needs.detect-changes.outputs.code == 'true'
+    if: needs.detect-changes.result == 'success' && needs.detect-changes.outputs.code == 'true'
     runs-on: windows-latest
     permissions:
       contents: read
@@ -216,7 +232,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@d5e4d57b030548f435d0befec15ff413a2c60eff # 1.100.0
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
-          key: ${{ github.event_name == 'pull_request' && 'pr-fast' || 'main-lto' }}
           cache-on-failure: true
       - name: Record host architecture
         shell: pwsh
