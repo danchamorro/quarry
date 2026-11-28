@@ -109,6 +109,7 @@ impl CellInspector {
         self.open
     }
 
+    #[cfg(test)]
     pub fn focus_handle(&self) -> FocusHandle {
         self.focus_handle.clone()
     }
@@ -490,7 +491,7 @@ impl CellInspector {
         let resolved = self.controller.read(cx).resolved_theme();
         let tokens = resolved.palette;
         let appearance = resolved.appearance;
-        let Some((mut text_content, spans, total_truncated, total_line_bytes, overflows_drawer)) =
+        let Some((mut text_content, spans, total_truncated, _, overflows_drawer)) =
             self.slice_line_with_pan(line_idx)
         else {
             return div().h(px(INSPECTOR_LINE_HEIGHT_PX)).into_any_element();
@@ -510,15 +511,7 @@ impl CellInspector {
             })
             .collect();
 
-        let truncation_suffix = if total_truncated > 0 {
-            Some(format!(
-                " … (showing first {} of {} bytes on this line)",
-                MAX_INSPECTOR_LINE_BYTES, total_line_bytes
-            ))
-        } else {
-            None
-        };
-        if text_content.is_empty() && truncation_suffix.is_none() {
+        if text_content.is_empty() {
             text_content.push(' ');
         }
 
@@ -557,13 +550,13 @@ impl CellInspector {
                     .child(styled),
             );
 
-        if let Some(suffix) = truncation_suffix {
+        if total_truncated > 0 {
             row = row.child(
                 div()
                     .flex_shrink_0()
                     .text_size(px(11.))
                     .text_color(rgb(tokens.warning_text.to_rgb_hex()))
-                    .child(suffix),
+                    .child("…"),
             );
         } else if overflows_drawer {
             row = row.child(
@@ -976,16 +969,18 @@ impl Render for CellInspector {
             }
         }
 
-        let copy_label = if self.view_mode == InspectorViewMode::Pretty && has_pretty {
-            "Copy Pretty"
+        let copy_tooltip = if self.view_mode == InspectorViewMode::Pretty && has_pretty {
+            "Copy formatted JSON"
         } else {
-            "Copy Raw"
+            "Copy raw cell"
         };
         actions = actions
             .child(div().flex_1())
             .child(
                 Button::new("cell-inspector-copy")
-                    .label(copy_label)
+                    .label("Copy")
+                    .accessibility_label(copy_tooltip)
+                    .tooltip(copy_tooltip)
                     .ghost()
                     .xsmall()
                     .disabled(!can_copy)
@@ -1010,7 +1005,39 @@ impl Render for CellInspector {
             );
         drawer = drawer.child(actions);
 
-        // Diagnostic banners (invalid JSON error position, nesting/size caps, invalid UTF-8)
+        // Diagnostic banners (invalid JSON error position, nesting/size caps, line budget, invalid UTF-8)
+        let long_line_notice: Option<String> = self.snapshot.as_ref().and_then(|snap| {
+            let active_lines = if self.view_mode == InspectorViewMode::Pretty
+                && let Some(PrettyJsonResult::Ready { lines, .. }) = &snap.pretty_json
+            {
+                lines
+            } else {
+                &snap.raw_lines
+            };
+            (active_lines.max_line_bytes() > MAX_INSPECTOR_LINE_BYTES).then(|| {
+                format!(
+                    "Long line capped at {} per line (longest line: {}); use Copy for full text.",
+                    format_byte_count(MAX_INSPECTOR_LINE_BYTES),
+                    format_byte_count(active_lines.max_line_bytes()),
+                )
+            })
+        });
+
+        if let Some(notice) = long_line_notice {
+            drawer = drawer.child(
+                div()
+                    .id("cell-inspector-line-budget-notice")
+                    .role(Role::Status)
+                    .px_3()
+                    .py_1p5()
+                    .bg(rgb(tokens.warning_fill.to_rgb_hex()))
+                    .border_b_1()
+                    .border_color(rgb(tokens.separator.to_rgb_hex()))
+                    .text_size(px(11.))
+                    .text_color(rgb(tokens.warning_text.to_rgb_hex()))
+                    .child(notice),
+            );
+        }
         if let Some((is_error, notice)) = json_notice {
             let (bg, fg) = if is_error {
                 (tokens.error_fill, tokens.error_text)

@@ -121,6 +121,7 @@ pub struct LineIndex {
     /// Disjoint sorted line ranges `[first_body_line..closing_fence_line)` inside Markdown code fences.
     fenced_body_ranges: Vec<Range<usize>>,
     total_bytes: usize,
+    max_line_bytes: usize,
     truncated_lines: bool,
 }
 
@@ -144,6 +145,7 @@ impl LineIndex {
                 last_line_end: 0,
                 fenced_body_ranges: Vec::new(),
                 total_bytes: 0,
+                max_line_bytes: 0,
                 truncated_lines: false,
             });
         }
@@ -153,6 +155,7 @@ impl LineIndex {
         let mut active_fence: Option<(u8, usize, usize)> = None; // (char, run_len, body_start_line)
         let mut truncated_lines = false;
         let mut last_line_end = bytes.len();
+        let mut max_line_bytes = 0usize;
         let mut line_start = 0usize;
         let mut line_idx = 0usize;
 
@@ -162,6 +165,7 @@ impl LineIndex {
             }
             if b == b'\n' {
                 let line_bytes = strip_trailing_cr(&bytes[line_start..i]);
+                max_line_bytes = max_line_bytes.max(line_bytes.len());
                 update_fence_state(
                     line_bytes,
                     line_idx,
@@ -185,6 +189,7 @@ impl LineIndex {
         }
         if !truncated_lines && line_start < bytes.len() {
             let line_bytes = strip_trailing_cr(&bytes[line_start..]);
+            max_line_bytes = max_line_bytes.max(line_bytes.len());
             update_fence_state(
                 line_bytes,
                 line_idx,
@@ -203,6 +208,7 @@ impl LineIndex {
             last_line_end,
             fenced_body_ranges,
             total_bytes: bytes.len(),
+            max_line_bytes,
             truncated_lines,
         })
     }
@@ -217,6 +223,10 @@ impl LineIndex {
 
     pub fn total_bytes(&self) -> usize {
         self.total_bytes
+    }
+
+    pub fn max_line_bytes(&self) -> usize {
+        self.max_line_bytes
     }
 
     pub fn truncated_lines(&self) -> bool {
