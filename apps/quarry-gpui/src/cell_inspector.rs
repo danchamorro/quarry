@@ -217,13 +217,27 @@ impl CellInspector {
         snap.raw_lines.len()
     }
 
+    fn current_viewport_top_line(&self) -> usize {
+        let count = self.active_line_count();
+        if count == 0 {
+            return 0;
+        }
+        let state = self.scroll_handle.0.borrow();
+        if let Some(deferred) = state.deferred_scroll_to_item.as_ref() {
+            return deferred.item_index.min(count.saturating_sub(1));
+        }
+        let scroll_top_px = (-f32::from(state.base_handle.offset().y)).max(0.0);
+        ((scroll_top_px / INSPECTOR_LINE_HEIGHT_PX).round() as usize).min(count.saturating_sub(1))
+    }
+
     fn scroll_vertical(&mut self, next_top: usize, cx: &mut Context<Self>) {
         let count = self.active_line_count();
         if count == 0 {
             return;
         }
+        let current_top = self.current_viewport_top_line();
         let clamped = next_top.min(count.saturating_sub(1));
-        if clamped != self.top_line {
+        if clamped != current_top || clamped != self.top_line {
             self.top_line = clamped;
             self.scroll_handle
                 .scroll_to_item_strict(clamped, ScrollStrategy::Top);
@@ -595,6 +609,15 @@ impl CellInspector {
     }
 
     #[cfg(test)]
+    pub fn set_scroll_offset_y_for_test(&self, offset_y_px: f32) {
+        self.scroll_handle
+            .0
+            .borrow()
+            .base_handle
+            .set_offset(point(px(0.), px(-offset_y_px.max(0.0))));
+    }
+
+    #[cfg(test)]
     pub fn h_offset_chars_for_test(&self) -> usize {
         self.h_offset_chars
     }
@@ -742,7 +765,8 @@ impl Render for CellInspector {
                             let end = this.active_line_count().saturating_sub(1);
                             this.scroll_vertical(end, cx);
                         } else {
-                            this.scroll_vertical(this.top_line.saturating_add(1), cx);
+                            let cur = this.current_viewport_top_line();
+                            this.scroll_vertical(cur.saturating_add(1), cx);
                         }
                     }
                     "up" => {
@@ -750,22 +774,19 @@ impl Render for CellInspector {
                         if mods.platform || mods.control {
                             this.scroll_vertical(0, cx);
                         } else {
-                            this.scroll_vertical(this.top_line.saturating_sub(1), cx);
+                            let cur = this.current_viewport_top_line();
+                            this.scroll_vertical(cur.saturating_sub(1), cx);
                         }
                     }
                     "pagedown" => {
                         cx.stop_propagation();
-                        this.scroll_vertical(
-                            this.top_line.saturating_add(INSPECTOR_PAGE_LINES),
-                            cx,
-                        );
+                        let cur = this.current_viewport_top_line();
+                        this.scroll_vertical(cur.saturating_add(INSPECTOR_PAGE_LINES), cx);
                     }
                     "pageup" => {
                         cx.stop_propagation();
-                        this.scroll_vertical(
-                            this.top_line.saturating_sub(INSPECTOR_PAGE_LINES),
-                            cx,
-                        );
+                        let cur = this.current_viewport_top_line();
+                        this.scroll_vertical(cur.saturating_sub(INSPECTOR_PAGE_LINES), cx);
                     }
                     "right" => {
                         cx.stop_propagation();
@@ -789,7 +810,8 @@ impl Render for CellInspector {
                     }
                     "end" => {
                         cx.stop_propagation();
-                        if let Some((text, _, _, _, _)) = this.slice_line_with_pan(this.top_line) {
+                        let cur = this.current_viewport_top_line();
+                        if let Some((text, _, _, _, _)) = this.slice_line_with_pan(cur) {
                             let total_chars = self_line_chars(this.h_offset_chars, &text);
                             this.pan_horizontal(total_chars.saturating_sub(32), cx);
                         }

@@ -7324,8 +7324,35 @@ fn cell_inspector_drawer_json_pretty_invalid_stack_markdown_10mib_and_escape_foc
             "Down must strictly scroll the uniform list top item to line 1 (got offset_y={})",
             insp.scroll_offset_y_for_test()
         );
+        // Simulate wheel/trackpad scrolling to line 10 (200 px) while keyboard top_line is still 1.
+        insp.set_scroll_offset_y_for_test(200.0);
     });
-    // Page down 3 times (1 + 3 * 16 = line 49) below the first screen.
+    cx.dispatch_keystroke(
+        win.into(),
+        Keystroke {
+            modifiers: Modifiers::default(),
+            key: "down".into(),
+            key_char: None,
+        },
+    );
+    cx.update_window(win.into(), |_, window, cx| {
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.update(|cx| {
+        let insp = view.read(cx).cell_inspector.read(cx);
+        assert_eq!(
+            insp.top_line_for_test(),
+            11,
+            "Down after mouse-wheel scroll to line 10 must advance to line 11 rather than jumping back"
+        );
+        assert!(
+            insp.scroll_offset_y_for_test() >= 219.0,
+            "viewport offset must advance to line 11 (got offset_y={})",
+            insp.scroll_offset_y_for_test()
+        );
+    });
+    // Page down 3 times (11 + 3 * 16 = line 59) below the first screen.
     for _ in 0..3 {
         cx.dispatch_keystroke(
             win.into(),
