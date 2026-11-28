@@ -351,6 +351,11 @@ pub fn evaluate_command(command: CommandId, ctx: &CommandContext<'_>) -> Command
             && doc.structural_job.is_none()
             && doc.pending_materialization.is_none()
     });
+    let row_structural_ready = document.is_some_and(|doc| {
+        doc.row_structural_edit_disabled_reason().is_none()
+            && doc.structural_job.is_none()
+            && doc.pending_materialization.is_none()
+    });
     let available = match command {
         CommandId::About
         | CommandId::NewWindow
@@ -418,7 +423,7 @@ pub fn evaluate_command(command: CommandId, ctx: &CommandContext<'_>) -> Command
             structural_ready && document.is_some_and(|doc| doc.selected_columns.len() >= 2)
         }
         CommandId::DeleteSelectedRows => {
-            structural_ready && document.is_some_and(|doc| doc.selected_row_count() > 0)
+            row_structural_ready && document.is_some_and(|doc| doc.selected_row_count() > 0)
         }
         CommandId::InsertRows => insertion(true),
         CommandId::InsertColumns => insertion(false),
@@ -474,7 +479,15 @@ pub fn command_disabled_reason(
         CommandId::NextBookmark | CommandId::PreviousBookmark | CommandId::ClearBookmarks => {
             "No bookmarks in this tab"
         }
-        CommandId::DeleteSelectedRows => "Select one or more rows first",
+        CommandId::DeleteSelectedRows => {
+            if let Some(reason) = doc.row_structural_edit_disabled_reason() {
+                reason
+            } else if doc.selected_row_count() == 0 {
+                "Select one or more rows first"
+            } else {
+                "Unavailable right now"
+            }
+        }
         CommandId::CleanupColumns | CommandId::MoveColumns | CommandId::DeleteSelectedColumns => {
             "Select one or more columns first"
         }

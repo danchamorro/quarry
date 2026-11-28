@@ -3622,6 +3622,7 @@ impl WorkbenchController {
                     doc.column_selection_anchor = None;
                 }
             }
+            doc.cursor.sync_from_grid_selection(doc.selection);
             cx.notify();
         }
     }
@@ -3683,6 +3684,7 @@ impl WorkbenchController {
                     .select(source_row, SelectionModifiers::NONE);
             }
             doc.selection = Some(GridSelection::Row { row: source_row });
+            doc.cursor.sync_from_grid_selection(doc.selection);
             doc.selected_columns.clear();
             doc.column_selection_anchor = None;
             cx.notify();
@@ -3713,6 +3715,7 @@ impl WorkbenchController {
                 },
             );
             doc.selection = None;
+            doc.cursor.clear();
             doc.clear_row_selection();
             cx.notify();
         }
@@ -3736,6 +3739,7 @@ impl WorkbenchController {
                 doc.column_selection_anchor = Some(source_col);
             }
             doc.selection = None;
+            doc.cursor.clear();
             doc.clear_row_selection();
             cx.notify();
         }

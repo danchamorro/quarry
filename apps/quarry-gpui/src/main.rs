@@ -302,6 +302,10 @@ impl QuarryWindow {
                 window,
                 |this, table, event, window, cx| match event {
                     TableEvent::SelectRow(row) => {
+                        if this.suppress_table_selection_event {
+                            return;
+                        }
+                        this.pending_display_cursor = None;
                         if table.read(cx).delegate().take_gutter_mouse_selection(*row) {
                             return;
                         }
@@ -2093,20 +2097,29 @@ impl QuarryWindow {
         {
             return Some((row, col_idx));
         }
-        if let Some(coord) = self.controller.read(cx).active_cursor(self.window_id)
-            && let Some((table_row, table_col)) = self
+        if let Some(coord) = self.controller.read(cx).active_cursor(self.window_id) {
+            if let Some((table_row, table_col)) = self
                 .table
                 .read(cx)
                 .delegate()
                 .display_position_for_source(coord.row, coord.column, cx)
-            && let Some(dc) = table_col.checked_sub(1)
-        {
-            return Some((table_row, dc));
-        }
-        if let Some((row, col)) = self.table.read(cx).selected_cell()
-            && col > 0
-        {
-            return Some((row, col - 1));
+                && let Some(dc) = table_col.checked_sub(1)
+            {
+                return Some((table_row, dc));
+            }
+            if let Some(table_row) = self
+                .table
+                .read(cx)
+                .delegate()
+                .display_row_for_source(coord.row, cx)
+            {
+                return Some((table_row, 0));
+            }
+            if let Some((row, col)) = self.table.read(cx).selected_cell()
+                && col > 0
+            {
+                return Some((row, col - 1));
+            }
         }
         None
     }

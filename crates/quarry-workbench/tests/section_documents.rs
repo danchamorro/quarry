@@ -1644,3 +1644,129 @@ fn intact_section_working_copy_allows_save_section_as_new_recovery_after_parent_
     let _ = fs::remove_file(&path);
     let _ = fs::remove_file(&recovery_dest);
 }
+
+#[test]
+fn delete_selected_rows_command_respects_section_verification() {
+    let mut bytes = Vec::from(&b"id,val\n"[..]);
+    for i in 0..10 {
+        bytes.extend_from_slice(format!("{i},row_{i}\n").as_bytes());
+    }
+    let sec_start = bytes.len() as u64;
+    let body = b"100,sec_a\n101,sec_b\n";
+    bytes.extend_from_slice(body);
+    let sec_len = body.len() as u64;
+    bytes.extend_from_slice(b"200,tail\n");
+    let path = temp_csv("delete-rows-cmd", &bytes);
+
+    let mut scheduler = WorkbenchScheduler::new(WorkbenchSchedulerConfig::default());
+    scheduler.register_window(WindowId::PRIMARY);
+    let sec_id = match scheduler
+        .open_section(
+            WindowId::PRIMARY,
+            path.clone(),
+            ByteWindow::new(sec_start, sec_len).unwrap(),
+            SectionOpenOptions::default(),
+        )
+        .unwrap()
+    {
+        WakeOutcome::Ready { document_id, .. } => document_id,
+        other => panic!("unexpected open outcome: {other:?}"),
+    };
+    wait_for_index(&mut scheduler, sec_id);
+
+    // Select a row on the speculative section: DeleteSelectedRows stays disabled with verification reason.
+    scheduler
+        .tab_mut(sec_id)
+        .unwrap()
+        .document
+        .as_mut()
+        .unwrap()
+        .selected_rows
+        .select(0, quarry_workbench::SelectionModifiers::NONE);
+    {
+        let tab = scheduler.tab(sec_id).unwrap();
+        let ctx = CommandContext {
+            window: WindowId::PRIMARY,
+            active_tab: tab,
+            open_document_count: 1,
+            write_slot_available: true,
+            external_modal_blocked: false,
+            text_field_focused: false,
+            show_all_whitespace: false,
+        };
+        assert!(!evaluate_command(CommandId::DeleteSelectedRows, &ctx).enabled);
+        let reason = quarry_workbench::command_disabled_reason(CommandId::DeleteSelectedRows, &ctx)
+            .expect("unverified section must explain why row delete is disabled");
+        assert!(reason.contains("Verify section boundaries"));
+    }
+
+    // Verify section boundaries -> Verified section allows DeleteSelectedRows (but not column deletion).
+    scheduler.start_verify_section_boundary(sec_id).unwrap();
+    let comp = wait_for_verify(&mut scheduler, sec_id);
+    assert!(comp.result.is_ok());
+
+    {
+        let doc = scheduler
+            .tab_mut(sec_id)
+            .unwrap()
+            .document
+            .as_mut()
+            .unwrap();
+        assert_eq!(doc.section_trust(), Some(BoundaryTrust::Verified));
+        doc.selected_rows
+            .select(0, quarry_workbench::SelectionModifiers::NONE);
+        doc.selected_columns.insert(0);
+    }
+    {
+        let tab = scheduler.tab(sec_id).unwrap();
+        let ctx = CommandContext {
+            window: WindowId::PRIMARY,
+            active_tab: tab,
+            open_document_count: 1,
+            write_slot_available: true,
+            external_modal_blocked: false,
+            text_field_focused: false,
+            show_all_whitespace: false,
+        };
+        assert!(
+            evaluate_command(CommandId::DeleteSelectedRows, &ctx).enabled,
+            "verified section with selected rows must allow DeleteSelectedRows"
+        );
+        assert!(
+            quarry_workbench::command_disabled_reason(CommandId::DeleteSelectedRows, &ctx)
+                .is_none()
+        );
+        assert!(
+            !evaluate_command(CommandId::DeleteSelectedColumns, &ctx).enabled,
+            "column deletion remains disabled on section tabs"
+        );
+    }
+
+    // Clearing row selection disables DeleteSelectedRows with the selection prompt.
+    scheduler
+        .tab_mut(sec_id)
+        .unwrap()
+        .document
+        .as_mut()
+        .unwrap()
+        .clear_row_selection();
+    {
+        let tab = scheduler.tab(sec_id).unwrap();
+        let ctx = CommandContext {
+            window: WindowId::PRIMARY,
+            active_tab: tab,
+            open_document_count: 1,
+            write_slot_available: true,
+            external_modal_blocked: false,
+            text_field_focused: false,
+            show_all_whitespace: false,
+        };
+        assert!(!evaluate_command(CommandId::DeleteSelectedRows, &ctx).enabled);
+        assert_eq!(
+            quarry_workbench::command_disabled_reason(CommandId::DeleteSelectedRows, &ctx),
+            Some("Select one or more rows first")
+        );
+    }
+
+    let _ = fs::remove_file(&path);
+}

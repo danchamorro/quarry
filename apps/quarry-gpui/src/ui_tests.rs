@@ -6831,4 +6831,63 @@ fn astra_review_regressions_stale_copy_deep_jump_tab_cursor_and_palette_scroll(
         );
     })
     .unwrap();
+
+    // 7. Mouse row-gutter selection and deselection keep `doc.cursor` in sync so the next
+    //    arrow/Vim motion starts from the newly selected row (or resets when deselected).
+    cx.update_window(win.into(), |_, window, cx| {
+        view.update(cx, |q, cx| {
+            q.find_bar.update(cx, |bar, cx| bar.close_silent(cx));
+            q.apply_display_cursor(0, 1, false, window, cx);
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.update_window(win.into(), |_, window, cx| {
+        controller.update(cx, |c, cx| {
+            // Source row 6 corresponds to display row 5 (header is row 0).
+            c.select_row_active(win_id, 6, false, false, cx);
+        });
+        view.update(cx, |q, cx| {
+            q.table.update(cx, |table, cx| {
+                table.delegate().record_gutter_mouse_selection(5);
+                table.set_selected_cell(5, 0, cx);
+            });
+            q.move_cursor(quarry_workbench::CursorMotion::Down, window, cx);
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.update(|cx| {
+        assert_eq!(
+            view.read(cx).table.read(cx).selected_cell(),
+            Some((6, 2)),
+            "Down after mouse-clicking row 5 gutter must step to display row 6, not from old cell (0, 2)"
+        );
+    });
+
+    // Clicking the same row's gutter again deselects it and clears `doc.cursor` so the next
+    // arrow motion starts fresh from (0, 1) rather than resurrecting the stale selection.
+    cx.update_window(win.into(), |_, window, cx| {
+        controller.update(cx, |c, cx| {
+            c.select_row_active(win_id, 6, false, false, cx);
+            c.select_row_active(win_id, 6, false, false, cx);
+        });
+        view.update(cx, |q, cx| {
+            q.table.update(cx, |table, cx| {
+                table.delegate().record_gutter_mouse_selection(5);
+                table.set_selected_cell(5, 0, cx);
+            });
+            assert_eq!(controller.read(cx).active_cursor(win_id), None);
+            q.move_cursor(quarry_workbench::CursorMotion::Down, window, cx);
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.update(|cx| {
+        assert_eq!(
+            view.read(cx).table.read(cx).selected_cell(),
+            Some((0, 1)),
+            "Down after deselecting a gutter row must start fresh at (0, 1)"
+        );
+    });
 }
