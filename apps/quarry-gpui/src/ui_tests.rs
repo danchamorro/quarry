@@ -5730,7 +5730,7 @@ fn query_bar_applies_syncs_rules_isolates_tabs_and_preserves_active_filter_on_er
                 quarry_core::FilterQuery::single(
                     0,
                     quarry_core::FilterOperator::Equals,
-                    vec![b'x'; 5_000],
+                    vec![b'x'; quarry_core::MAX_FILTER_EXPR_BYTES + 1],
                 ),
                 cx,
             )
