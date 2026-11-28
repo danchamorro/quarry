@@ -5182,11 +5182,16 @@ impl Document {
             })
     }
 
-    /// Ensures physical `source_col` is visible in `self.columns`, auto-unhiding it if hidden,
-    /// and returns `(display_col_index, was_hidden)`.
+    /// Ensures physical `source_col` is visible in `self.columns`, extending the column view if
+    /// needed (for wide files discovered past the eager layout limit), auto-unhiding it if hidden,
+    /// and returning `(display_col_index, was_hidden)`.
     pub fn reveal_column(&mut self, source_col: usize) -> Option<(usize, bool)> {
-        if source_col >= self.columns.hidden.len() {
+        let width = self.known_width();
+        if source_col >= width {
             return None;
+        }
+        if self.columns.hidden.len() < width {
+            self.columns.extend_to(width);
         }
         let was_hidden = self.columns.hidden[source_col];
         if !self.columns.view(source_col) {

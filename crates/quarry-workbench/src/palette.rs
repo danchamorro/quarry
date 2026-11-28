@@ -649,13 +649,14 @@ pub fn rank_palette_commands(query: &str, commands: &[PaletteCommand]) -> Vec<Pa
 
 /// Resolves `#` column-jump and `Cmd/Ctrl+L` Go to Row / Column queries.
 ///
-/// - When `allow_row_jump` is `false` (palette `#` mode), numeric input `N` resolves strictly to
-///   1-based source column `#N`.
+/// - When `allow_row_jump` is `false` (palette `#` mode), purely numeric input `N` resolves
+///   strictly to 1-based source column `#N` (never falling through to fuzzy matching on `#0`,
+///   overflow, or out-of-range indices).
 /// - When `allow_row_jump` is `true` (`Cmd/Ctrl+L` mode):
 ///   - `#N` or `#name` resolves to columns.
 ///   - `row:N`, `r:N`, or `:N` resolves to 1-based visible row `N`.
-///   - Plain `N` offers visible row `N` first (when in bounds) and source column `#N` second
-///     (when in bounds).
+///   - Plain numeric `N` offers visible row `N` first (when in bounds) and source column `#N`
+///     second (when in bounds), without falling through to fuzzy matching when out of bounds.
 /// - Duplicate header names are explicitly distinguished by 1-based `#index` and occurrence count
 ///   (e.g., `duplicate name (2 of 2)`), and hidden columns carry a `hidden (will show)` badge.
 pub fn resolve_jump_targets(
@@ -665,57 +666,30 @@ pub fn resolve_jump_targets(
     available_rows: u64,
     allow_row_jump: bool,
 ) -> Vec<JumpMatch> {
-    let trimmed = raw_query.trim();
+    resolve_jump_targets_bounded(
+        raw_query,
+        headers,
+        hidden,
+        available_rows,
+        allow_row_jump,
+        usize::MAX,
+    )
+}
 
-    // Count duplicate header names case-insensitively across all source columns.
-    let mut name_totals: HashMap<String, usize> = HashMap::with_capacity(headers.len());
-    let normalized_names: Vec<String> = headers.iter().map(|h| h.trim().to_lowercase()).collect();
-    for norm in &normalized_names {
-        if !norm.is_empty() {
-            *name_totals.entry(norm.clone()).or_insert(0) += 1;
-        }
+/// Bounded variant of [`resolve_jump_targets`] that formats at most `max_results` displayed
+/// matches so wide schemas avoid formatting thousands of undisplayed labels.
+pub fn resolve_jump_targets_bounded(
+    raw_query: &str,
+    headers: &[String],
+    hidden: &[bool],
+    available_rows: u64,
+    allow_row_jump: bool,
+    max_results: usize,
+) -> Vec<JumpMatch> {
+    if max_results == 0 {
+        return Vec::new();
     }
-    let mut seen_counts: HashMap<String, usize> = HashMap::new();
-    let duplicate_ordinals: Vec<Option<(usize, usize)>> = normalized_names
-        .iter()
-        .map(|norm| {
-            let total = name_totals.get(norm).copied().unwrap_or(0);
-            if total > 1 {
-                let ord = seen_counts.entry(norm.clone()).or_insert(0);
-                *ord += 1;
-                Some((*ord, total))
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    let make_column_match = |source_col: usize, score: i32| -> JumpMatch {
-        let index_1based = source_col + 1;
-        let name = headers.get(source_col).map(String::as_str).unwrap_or("");
-        let is_hidden = hidden.get(source_col).copied().unwrap_or(false);
-        let dup = duplicate_ordinals.get(source_col).copied().flatten();
-        let title = if name.is_empty() {
-            format!("#{index_1based} (unnamed)")
-        } else {
-            format!("#{index_1based}: {name}")
-        };
-        let mut detail_parts = vec![format!("Column {index_1based} of {}", headers.len())];
-        if let Some((ord, total)) = dup {
-            detail_parts.push(format!("duplicate name ({ord} of {total})"));
-        }
-        if is_hidden {
-            detail_parts.push("hidden (will show)".into());
-        }
-        JumpMatch {
-            target: JumpTarget::Column { source_col },
-            title,
-            detail: detail_parts.join(" · "),
-            hidden: is_hidden,
-            duplicate_header: dup.is_some(),
-            score,
-        }
-    };
+    let trimmed = raw_query.trim();
 
     let make_row_match = |row_1based: u64, score: i32| -> JumpMatch {
         JumpMatch {
@@ -755,54 +729,151 @@ pub fn resolve_jump_targets(
         (!allow_row_jump, trimmed)
     };
 
-    if effective.is_empty() {
-        return (0..headers.len())
-            .map(|col| make_column_match(col, 0))
+    // Purely numeric input finishes numeric resolution directly so `#0`, overflow, or
+    // out-of-range numbers never fall through to fuzzy matches like `#10` or `FY99`.
+    if !effective.is_empty() && effective.chars().all(|c| c.is_ascii_digit()) {
+        let mut results = Vec::new();
+        if let Ok(num) = effective.parse::<u64>()
+            && num >= 1
+        {
+            if !explicit_column && allow_row_jump && num <= available_rows {
+                results.push(make_row_match(num, 2200));
+            }
+            if let Ok(col_1based) = usize::try_from(num)
+                && col_1based >= 1
+                && col_1based <= headers.len()
+                && results.len() < max_results
+            {
+                let source_col = col_1based - 1;
+                let col_score = if explicit_column { 2200 } else { 2000 };
+                let dup = duplicate_ordinal_for_column(headers, source_col);
+                results.push(format_column_match(
+                    headers, hidden, source_col, dup, col_score,
+                ));
+            }
+        }
+        return results;
+    }
+
+    // Score/select column candidates first, then format only the top `max_results` entries.
+    let selected_cols: Vec<(usize, i32)> = if effective.is_empty() {
+        (0..headers.len().min(max_results))
+            .map(|col| (col, 0))
+            .collect()
+    } else {
+        let mut scored: Vec<(usize, i32)> = headers
+            .iter()
+            .enumerate()
+            .filter_map(|(source_col, name)| {
+                let hash_token = format!("#{}", source_col + 1);
+                let name_score = fuzzy_score(effective, name);
+                let hash_score = fuzzy_score(effective, &hash_token).map(|s| s - 30);
+                let combined = format!("{hash_token} {name}");
+                let combined_score = fuzzy_score(effective, &combined).map(|s| s - 15);
+                let best = [name_score, hash_score, combined_score]
+                    .into_iter()
+                    .flatten()
+                    .max()?;
+                Some((source_col, best))
+            })
             .collect();
+        scored.sort_by(|(col_a, score_a), (col_b, score_b)| {
+            score_b.cmp(score_a).then_with(|| col_a.cmp(col_b))
+        });
+        scored.truncate(max_results);
+        scored
+    };
+
+    if selected_cols.is_empty() {
+        return Vec::new();
     }
 
-    let mut results: Vec<(usize, JumpMatch)> = Vec::new();
-    let mut matched_cols = vec![false; headers.len()];
-
-    // Numeric target parsing (1-based).
-    if let Ok(num) = effective.parse::<u64>()
-        && num >= 1
-    {
-        if !explicit_column && allow_row_jump && num <= available_rows {
-            results.push((0, make_row_match(num, 2200)));
+    // Count duplicate names only for normalized headers present in the displayed slice.
+    let mut target_names: HashMap<String, usize> = HashMap::with_capacity(selected_cols.len());
+    for &(source_col, _) in &selected_cols {
+        let norm = headers[source_col].trim().to_lowercase();
+        if !norm.is_empty() {
+            target_names.entry(norm).or_insert(0);
         }
-        if let Ok(col_1based) = usize::try_from(num)
-            && col_1based >= 1
-            && col_1based <= headers.len()
-        {
-            let source_col = col_1based - 1;
-            let col_score = if explicit_column { 2200 } else { 2000 };
-            results.push((source_col + 1, make_column_match(source_col, col_score)));
-            matched_cols[source_col] = true;
+    }
+    let mut ordinals: HashMap<usize, (usize, usize)> = HashMap::new();
+    if !target_names.is_empty() {
+        for name in headers {
+            let norm = name.trim().to_lowercase();
+            if let Some(total) = target_names.get_mut(&norm) {
+                *total += 1;
+            }
+        }
+        let mut seen: HashMap<String, usize> = HashMap::new();
+        for (idx, name) in headers.iter().enumerate() {
+            let norm = name.trim().to_lowercase();
+            if let Some(&total) = target_names.get(&norm)
+                && total > 1
+            {
+                let ord = seen.entry(norm).or_insert(0);
+                *ord += 1;
+                ordinals.insert(idx, (*ord, total));
+            }
         }
     }
 
-    // Name / `#index` fuzzy matches across all source columns.
-    for (source_col, name) in headers.iter().enumerate() {
-        if matched_cols[source_col] {
-            continue;
-        }
-        let hash_token = format!("#{}", source_col + 1);
-        let name_score = fuzzy_score(effective, name);
-        let hash_score = fuzzy_score(effective, &hash_token).map(|s| s - 30);
-        let combined = format!("{hash_token} {name}");
-        let combined_score = fuzzy_score(effective, &combined).map(|s| s - 15);
-        if let Some(best) = [name_score, hash_score, combined_score]
-            .into_iter()
-            .flatten()
-            .max()
-        {
-            results.push((source_col + 1, make_column_match(source_col, best)));
+    selected_cols
+        .into_iter()
+        .map(|(source_col, score)| {
+            let dup = ordinals.get(&source_col).copied();
+            format_column_match(headers, hidden, source_col, dup, score)
+        })
+        .collect()
+}
+
+fn duplicate_ordinal_for_column(headers: &[String], source_col: usize) -> Option<(usize, usize)> {
+    let target = headers.get(source_col)?.trim().to_lowercase();
+    if target.is_empty() {
+        return None;
+    }
+    let mut total = 0usize;
+    let mut ord = 0usize;
+    for (idx, name) in headers.iter().enumerate() {
+        if name.trim().to_lowercase() == target {
+            total += 1;
+            if idx <= source_col {
+                ord += 1;
+            }
         }
     }
+    (total > 1).then_some((ord, total))
+}
 
-    results.sort_by(|(ord_a, a), (ord_b, b)| b.score.cmp(&a.score).then_with(|| ord_a.cmp(ord_b)));
-    results.into_iter().map(|(_, m)| m).collect()
+fn format_column_match(
+    headers: &[String],
+    hidden: &[bool],
+    source_col: usize,
+    dup: Option<(usize, usize)>,
+    score: i32,
+) -> JumpMatch {
+    let index_1based = source_col + 1;
+    let name = headers.get(source_col).map(String::as_str).unwrap_or("");
+    let is_hidden = hidden.get(source_col).copied().unwrap_or(false);
+    let title = if name.is_empty() {
+        format!("#{index_1based} (unnamed)")
+    } else {
+        format!("#{index_1based}: {name}")
+    };
+    let mut detail_parts = vec![format!("Column {index_1based} of {}", headers.len())];
+    if let Some((ord, total)) = dup {
+        detail_parts.push(format!("duplicate name ({ord} of {total})"));
+    }
+    if is_hidden {
+        detail_parts.push("hidden (will show)".into());
+    }
+    JumpMatch {
+        target: JumpTarget::Column { source_col },
+        title,
+        detail: detail_parts.join(" · "),
+        hidden: is_hidden,
+        duplicate_header: dup.is_some(),
+        score,
+    }
 }
 
 /// Helpful empty-state message when a jump query matches no rows or columns.
@@ -925,5 +996,35 @@ mod tests {
                 display_row_1based: 42
             }
         );
+    }
+
+    #[test]
+    fn resolve_jump_targets_rejects_zero_out_of_range_and_overflow_without_fuzzy_fallthrough() {
+        let mut headers: Vec<String> = (1..=10).map(|i| format!("c{i}")).collect();
+        headers[4] = "FY99".into();
+        let hidden = vec![false; headers.len()];
+
+        // `#0` on a 10-column file must NOT fuzzy-match `#10`.
+        assert!(resolve_jump_targets("0", &headers, &hidden, 100, false).is_empty());
+        assert!(resolve_jump_targets("#0", &headers, &hidden, 100, true).is_empty());
+
+        // Out-of-range `#99` must NOT fuzzy-match header `FY99`.
+        assert!(resolve_jump_targets("99", &headers, &hidden, 50, false).is_empty());
+        assert!(resolve_jump_targets("99", &headers, &hidden, 50, true).is_empty());
+
+        // Overflowing numeric input returns empty cleanly.
+        assert!(
+            resolve_jump_targets("999999999999999999999999999", &headers, &hidden, 50, true)
+                .is_empty()
+        );
+
+        // Bounded variant caps empty-query formatting cleanly.
+        let wide_headers: Vec<String> = (1..=300).map(|i| format!("col_{i}")).collect();
+        let wide_hidden = vec![false; 300];
+        let bounded =
+            resolve_jump_targets_bounded("", &wide_headers, &wide_hidden, 1000, false, 80);
+        assert_eq!(bounded.len(), 80);
+        assert_eq!(bounded[0].target, JumpTarget::Column { source_col: 0 });
+        assert_eq!(bounded[79].target, JumpTarget::Column { source_col: 79 });
     }
 }

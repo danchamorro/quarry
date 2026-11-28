@@ -1,8 +1,9 @@
 //! Fuzzy Command Palette (`Cmd/Ctrl+K`) and Go to Row / Column (`Cmd/Ctrl+L` / `#`) overlay.
 //!
 //! Captures the invoking `(WindowId, Option<DocumentId>)` when opened, routes all command
-//! execution through `quarry_workbench::CommandId` + `evaluate_command`, and resolves 1-based
-//! source column indices, duplicate header names, hidden columns, and visible row jumps.
+//! execution through `quarry_workbench::CommandId` + `evaluate_command`, caches displayed rows
+//! across selection movement, scrolls the selected result into view, and exposes list/item
+//! accessibility metadata.
 
 use gpui_kit::component::{
     ActiveTheme, Sizable,
@@ -13,12 +14,12 @@ use gpui_kit::{prelude::*, *};
 use quarry_workbench::{
     CommandId, DocumentId, JumpMatch, JumpTarget, PaletteMatch, PaletteQuery, WindowId,
     jump_empty_message, palette_commands, parse_palette_input, rank_palette_commands,
-    resolve_jump_targets,
+    resolve_jump_targets_bounded,
 };
 
 use crate::workbench::WorkbenchController;
 
-/// Maximum number of matches rendered in the palette list to keep frames instantaneous.
+/// Maximum number of matches formatted and rendered in the palette list.
 const MAX_VISIBLE_RESULTS: usize = 80;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -48,6 +49,7 @@ pub enum CommandPaletteEvent {
     Closed,
 }
 
+#[derive(Clone)]
 enum PaletteRow {
     Command {
         matched: PaletteMatch,
@@ -64,7 +66,11 @@ pub struct CommandPalette {
     mode: PaletteOpenMode,
     captured_doc: Option<DocumentId>,
     input: Entity<InputState>,
+    results_scroll: ScrollHandle,
     selected_index: usize,
+    cached_is_jump: bool,
+    cached_rows: Vec<PaletteRow>,
+    cached_empty_msg: String,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -87,6 +93,8 @@ impl CommandPalette {
             |this, _, event: &InputEvent, _, cx| match event {
                 InputEvent::Change => {
                     this.selected_index = 0;
+                    this.rebuild_cache(cx);
+                    this.results_scroll.scroll_to_item(0);
                     cx.notify();
                 }
                 InputEvent::PressEnter { .. } => {
@@ -102,7 +110,11 @@ impl CommandPalette {
             mode: PaletteOpenMode::Commands,
             captured_doc: None,
             input,
+            results_scroll: ScrollHandle::new(),
             selected_index: 0,
+            cached_is_jump: false,
+            cached_rows: Vec::new(),
+            cached_empty_msg: String::new(),
             _subscriptions: subscriptions,
         }
     }
@@ -137,6 +149,8 @@ impl CommandPalette {
             state.set_value(initial_query.to_owned(), window, cx);
             state.focus(window, cx);
         });
+        self.rebuild_cache(cx);
+        self.results_scroll.scroll_to_item(0);
         cx.notify();
     }
 
@@ -144,6 +158,7 @@ impl CommandPalette {
         if self.open {
             self.open = false;
             self.selected_index = 0;
+            self.cached_rows.clear();
             cx.emit(CommandPaletteEvent::Closed);
             cx.notify();
         }
@@ -152,10 +167,11 @@ impl CommandPalette {
     fn close_without_focus_event(&mut self, cx: &mut Context<Self>) {
         self.open = false;
         self.selected_index = 0;
+        self.cached_rows.clear();
         cx.notify();
     }
 
-    fn build_rows(&self, cx: &App) -> (bool, Vec<PaletteRow>, String) {
+    fn rebuild_cache(&mut self, cx: &App) {
         let raw = self.input.read(cx).value().to_string();
         let jump_query = match self.mode {
             PaletteOpenMode::GoToRowOrColumn => Some((raw.as_str(), true)),
@@ -166,37 +182,39 @@ impl CommandPalette {
         };
 
         if let Some((query, allow_row_jump)) = jump_query {
+            self.cached_is_jump = true;
             let jump_info = self.captured_doc.and_then(|doc_id| {
                 self.controller
                     .read(cx)
                     .jump_info_for_document(self.window_id, doc_id)
             });
             let Some((headers, hidden, available_rows)) = jump_info else {
-                return (
-                    true,
-                    Vec::new(),
-                    "Open a file to jump to a row or column.".into(),
-                );
+                self.cached_rows.clear();
+                self.cached_empty_msg = "Open a file to jump to a row or column.".into();
+                return;
             };
-            let matches =
-                resolve_jump_targets(query, &headers, &hidden, available_rows, allow_row_jump);
-            let empty_msg =
+            let matches = resolve_jump_targets_bounded(
+                query,
+                &headers,
+                &hidden,
+                available_rows,
+                allow_row_jump,
+                MAX_VISIBLE_RESULTS,
+            );
+            self.cached_empty_msg =
                 jump_empty_message(query, headers.len(), available_rows, allow_row_jump);
-            let rows = matches
-                .into_iter()
-                .take(MAX_VISIBLE_RESULTS)
-                .map(PaletteRow::Jump)
-                .collect();
-            return (true, rows, empty_msg);
+            self.cached_rows = matches.into_iter().map(PaletteRow::Jump).collect();
+            return;
         }
 
+        self.cached_is_jump = false;
         let query = match parse_palette_input(&raw) {
             PaletteQuery::Command(q) => q,
             PaletteQuery::Jump(q) => q,
         };
         let ranked = rank_palette_commands(query, palette_commands());
         let controller = self.controller.read(cx);
-        let rows = ranked
+        self.cached_rows = ranked
             .into_iter()
             .take(MAX_VISIBLE_RESULTS)
             .map(|matched| {
@@ -212,26 +230,24 @@ impl CommandPalette {
                 }
             })
             .collect();
-        let empty_msg = format!("No commands match \"{}\".", query.trim());
-        (false, rows, empty_msg)
+        self.cached_empty_msg = format!("No commands match \"{}\".", query.trim());
     }
 
-    fn move_selection(&mut self, delta: isize, cx: &mut Context<Self>) {
-        let (_, rows, _) = self.build_rows(cx);
-        if rows.is_empty() {
+    pub fn move_selection(&mut self, delta: isize, cx: &mut Context<Self>) {
+        if self.cached_rows.is_empty() {
             self.selected_index = 0;
             return;
         }
-        let len = rows.len() as isize;
-        let current = (self.selected_index.min(rows.len() - 1)) as isize;
+        let len = self.cached_rows.len() as isize;
+        let current = (self.selected_index.min(self.cached_rows.len() - 1)) as isize;
         let next = (current + delta).rem_euclid(len) as usize;
         self.selected_index = next;
+        self.results_scroll.scroll_to_item(next);
         cx.notify();
     }
 
     fn activate_index(&mut self, index: usize, cx: &mut Context<Self>) {
-        let (_, rows, _) = self.build_rows(cx);
-        let Some(row) = rows.get(index) else {
+        let Some(row) = self.cached_rows.get(index).cloned() else {
             return;
         };
         match row {
@@ -293,20 +309,32 @@ impl CommandPalette {
         self.input.update(cx, |state, cx| {
             state.set_value(query.to_owned(), window, cx)
         });
+        self.rebuild_cache(cx);
+        self.results_scroll.scroll_to_item(0);
         cx.notify();
     }
 
     #[cfg(test)]
-    pub(crate) fn result_titles_for_test(&self, cx: &App) -> Vec<(String, bool)> {
-        let (_, rows, _) = self.build_rows(cx);
-        rows.into_iter()
+    pub(crate) fn result_titles_for_test(&self) -> Vec<(String, bool)> {
+        self.cached_rows
+            .iter()
             .map(|row| match row {
                 PaletteRow::Command {
                     matched, enabled, ..
-                } => (matched.command.label.to_owned(), enabled),
-                PaletteRow::Jump(jump) => (jump.title, true),
+                } => (matched.command.label.to_owned(), *enabled),
+                PaletteRow::Jump(jump) => (jump.title.clone(), true),
             })
             .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn selected_index_for_test(&self) -> usize {
+        self.selected_index
+    }
+
+    #[cfg(test)]
+    pub(crate) fn scroll_offset_y_for_test(&self) -> f32 {
+        f32::from(self.results_scroll.offset().y)
     }
 }
 
@@ -316,11 +344,11 @@ impl Render for CommandPalette {
             return div().into_any_element();
         }
         let is_macos = cfg!(target_os = "macos");
-        let (is_jump_mode, rows, empty_msg) = self.build_rows(cx);
-        let selected = if rows.is_empty() {
+        let is_jump_mode = self.cached_is_jump;
+        let selected = if self.cached_rows.is_empty() {
             0
         } else {
-            self.selected_index.min(rows.len() - 1)
+            self.selected_index.min(self.cached_rows.len() - 1)
         };
         let aria_title = if is_jump_mode {
             "Go to Row or Column"
@@ -335,24 +363,28 @@ impl Render for CommandPalette {
 
         let mut list = div()
             .id("command-palette-results")
+            .role(Role::List)
+            .aria_label(format!("{aria_title} results"))
+            .track_scroll(&self.results_scroll)
             .flex()
             .flex_col()
             .max_h(px(340.))
             .overflow_y_scroll()
             .py_1();
 
-        if rows.is_empty() {
+        if self.cached_rows.is_empty() {
             list = list.child(
                 div()
                     .id("command-palette-empty")
+                    .role(Role::Status)
                     .px_3()
                     .py_3()
                     .text_size(px(12.))
                     .text_color(cx.theme().muted_foreground)
-                    .child(empty_msg),
+                    .child(self.cached_empty_msg.clone()),
             );
         } else {
-            for (idx, row) in rows.into_iter().enumerate() {
+            for (idx, row) in self.cached_rows.iter().enumerate() {
                 let is_selected = idx == selected;
                 match row {
                     PaletteRow::Command {
@@ -373,9 +405,25 @@ impl Render for CommandPalette {
                         } else {
                             cx.theme().foreground
                         };
+                        let a11y_label = if let Some(reason) = disabled_reason {
+                            format!(
+                                "{}: {} (unavailable: {reason})",
+                                matched.command.category, matched.command.label
+                            )
+                        } else if let Some(sc) = shortcut {
+                            format!(
+                                "{}: {}, {sc}",
+                                matched.command.category, matched.command.label
+                            )
+                        } else {
+                            format!("{}: {}", matched.command.category, matched.command.label)
+                        };
                         list = list.child(
                             div()
                                 .id(("palette-cmd-row", idx))
+                                .role(Role::ListItem)
+                                .aria_label(a11y_label)
+                                .aria_selected(is_selected)
                                 .flex()
                                 .items_center()
                                 .justify_between()
@@ -386,7 +434,7 @@ impl Render for CommandPalette {
                                 .rounded(px(4.))
                                 .bg(bg)
                                 .text_color(fg)
-                                .when(enabled, |el| el.cursor_pointer())
+                                .when(*enabled, |el| el.cursor_pointer())
                                 .on_mouse_down(
                                     MouseButton::Left,
                                     cx.listener(move |this, _, _, cx| {
@@ -420,7 +468,7 @@ impl Render for CommandPalette {
                                         .items_center()
                                         .gap_2()
                                         .flex_shrink_0()
-                                        .when_some(disabled_reason, |el, reason| {
+                                        .when_some(*disabled_reason, |el, reason| {
                                             el.child(
                                                 div()
                                                     .text_size(px(11.))
@@ -428,7 +476,7 @@ impl Render for CommandPalette {
                                                     .child(reason),
                                             )
                                         })
-                                        .when_some(shortcut.filter(|_| enabled), |el, sc| {
+                                        .when_some(shortcut.filter(|_| *enabled), |el, sc| {
                                             el.child(
                                                 div()
                                                     .text_size(px(11.))
@@ -450,9 +498,13 @@ impl Render for CommandPalette {
                         } else {
                             cx.theme().foreground
                         };
+                        let a11y_label = format!("{}, {}", jump.title, jump.detail);
                         list = list.child(
                             div()
                                 .id(("palette-jump-row", idx))
+                                .role(Role::ListItem)
+                                .aria_label(a11y_label)
+                                .aria_selected(is_selected)
                                 .flex()
                                 .items_center()
                                 .justify_between()
@@ -476,14 +528,14 @@ impl Render for CommandPalette {
                                         .text_size(px(13.))
                                         .overflow_hidden()
                                         .text_ellipsis()
-                                        .child(jump.title),
+                                        .child(jump.title.clone()),
                                 )
                                 .child(
                                     div()
                                         .text_size(px(11.))
                                         .text_color(cx.theme().muted_foreground)
                                         .flex_shrink_0()
-                                        .child(jump.detail),
+                                        .child(jump.detail.clone()),
                                 ),
                         );
                     }

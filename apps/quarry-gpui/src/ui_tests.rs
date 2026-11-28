@@ -6318,7 +6318,7 @@ fn command_palette_captured_target_and_hash_column_jump_unhide_center(cx: &mut T
             q.open_command_palette_action(&super::menus::OpenCommandPalette, window, cx);
             q.command_palette.update(cx, |p, cx| {
                 p.set_query_for_test("#amount", window, cx);
-                let titles = p.result_titles_for_test(cx);
+                let titles = p.result_titles_for_test();
                 assert_eq!(titles.len(), 2);
                 assert!(titles[0].0.contains("#2: amount"));
                 assert!(titles[1].0.contains("#10: amount"));
@@ -6547,4 +6547,288 @@ fn explicit_tab_contract_outside_and_inside_edit_mode(cx: &mut TestAppContext) {
             .map(|b| String::from_utf8_lossy(b).into_owned());
         assert_eq!(edited.as_deref(), Some("82"));
     });
+}
+
+#[gpui_kit::test]
+fn astra_review_regressions_stale_copy_deep_jump_tab_cursor_and_palette_scroll(
+    cx: &mut TestAppContext,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let path_a = dir.path().join("tab_a.csv");
+    let path_b = dir.path().join("tab_b.csv");
+    let mut csv_a = String::from("id,tag,val\n");
+    for i in 1..=120 {
+        let tag = if i <= 90 { "KEEP" } else { "DROP" };
+        csv_a.push_str(&format!("{i},{tag},from_tab_a_{i}\n"));
+    }
+    std::fs::write(&path_a, csv_a).unwrap();
+    std::fs::write(
+        &path_b,
+        "id,val\n1,from_tab_b_1\n2,from_tab_b_2\n3,from_tab_b_3\n",
+    )
+    .unwrap();
+
+    // 1. Empty window palette (`captured_doc = None`) must NOT acquire a subsequently opened tab.
+    let controller = init_test_app(cx);
+    let (win, view) = open_test_window(cx, &controller);
+    let win_id = cx.update(|cx| view.read(cx).window_id);
+    cx.update_window(win.into(), |_, window, cx| {
+        cx.write_to_clipboard(ClipboardItem::new_string("sentinel".into()));
+        view.update(cx, |q, cx| {
+            q.open_command_palette_action(&super::menus::OpenCommandPalette, window, cx);
+            assert_eq!(q.command_palette.read(cx).captured_document(), None);
+            q.open_paths_direct(
+                vec![path_a.clone(), path_b.clone()],
+                OpenOptions::default(),
+                None,
+                window,
+                cx,
+            );
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+    wait_for_ui(cx, win, &controller, &view, |q, _, cx| {
+        q.snapshot(cx).is_some_and(|s| s.index_done)
+    });
+    let (id_a, id_b) = cx.update(|cx| {
+        let tabs = controller.read(cx).tabs_for_window(win_id);
+        (tabs[0].id, tabs[1].id)
+    });
+
+    // Execute Copy from the empty-window capture (`None`) while Tab B is now active: must be rejected.
+    cx.update_window(win.into(), |_, window, cx| {
+        controller.update(cx, |c, cx| {
+            c.activate_tab(win_id, id_b, cx).unwrap();
+        });
+        view.update(cx, |q, cx| {
+            q.sync_from_controller(window, cx);
+            q.apply_display_cursor(0, 1, false, window, cx);
+            q.execute_palette_command(win_id, None, quarry_workbench::CommandId::Copy, window, cx);
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update(|cx| {
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|c| c.text()),
+            Some("sentinel".into()),
+            "palette opened on empty window must not copy from a subsequently opened tab"
+        );
+    });
+
+    // 2. Stale Copy captured on Tab A must NOT copy Tab B's selection after tab switch.
+    cx.update_window(win.into(), |_, window, cx| {
+        view.update(cx, |q, cx| {
+            q.execute_palette_command(
+                win_id,
+                Some(id_a),
+                quarry_workbench::CommandId::Copy,
+                window,
+                cx,
+            );
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update(|cx| {
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|c| c.text()),
+            Some("sentinel".into()),
+            "stale Tab A palette Copy must not copy Tab B's cell"
+        );
+    });
+
+    // 3. Per-tab cursor isolation: set row 50 col 2 on Tab A, row 2 col 1 on Tab B, switch both ways.
+    cx.update_window(win.into(), |_, window, cx| {
+        controller.update(cx, |c, cx| {
+            c.activate_tab(win_id, id_a, cx).unwrap();
+        });
+        view.update(cx, |q, cx| {
+            q.sync_from_controller(window, cx);
+        });
+    })
+    .unwrap();
+    wait_for_ui(cx, win, &controller, &view, |q, _, cx| {
+        q.snapshot(cx)
+            .is_some_and(|s| s.document_id == id_a && s.index_done && s.available_rows == 120)
+    });
+    cx.update_window(win.into(), |_, window, cx| {
+        view.update(cx, |q, cx| {
+            q.apply_display_cursor(50, 2, false, window, cx);
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+    // Switch to Tab B (cursor was at row 0, col 1 -> table cell (0, 2)); verify Tab B does NOT inherit row 50.
+    cx.update_window(win.into(), |_, window, cx| {
+        controller.update(cx, |c, cx| {
+            c.activate_tab(win_id, id_b, cx).unwrap();
+        });
+        view.update(cx, |q, cx| q.sync_from_controller(window, cx));
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update(|cx| {
+        assert_eq!(
+            view.read(cx).table.read(cx).selected_cell(),
+            Some((0, 2)),
+            "switching to Tab B must restore Tab B's cursor instead of inheriting Tab A's row 50"
+        );
+    });
+    // Switch back to Tab A; verify Tab A's row 50 col 2 (table col 3) is restored.
+    cx.update_window(win.into(), |_, window, cx| {
+        controller.update(cx, |c, cx| {
+            c.activate_tab(win_id, id_a, cx).unwrap();
+        });
+        view.update(cx, |q, cx| q.sync_from_controller(window, cx));
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update(|cx| {
+        assert_eq!(
+            view.read(cx).table.read(cx).selected_cell(),
+            Some((50, 3)),
+            "switching back to Tab A must restore Tab A's cursor at row 50"
+        );
+    });
+
+    // 4. Deep jump beyond loaded 40-row buffer (unfiltered): jump to last row (row 120, source row 120)
+    //    and toggle bookmark; verify exact physical last row receives the bookmark.
+    cx.update_window(win.into(), |_, window, cx| {
+        view.update(cx, |q, cx| {
+            q.move_grid_cursor(quarry_workbench::CursorMotion::DocEnd, window, cx);
+        });
+    })
+    .unwrap();
+    wait_for_ui(cx, win, &controller, &view, |q, _, cx| {
+        q.table.read(cx).selected_cell() == Some((119, 3))
+            && controller.read(cx).active_cursor(win_id)
+                == Some(quarry_workbench::CellCoord::new(120, 2))
+    });
+    cx.update_window(win.into(), |_, window, cx| {
+        view.update(cx, |q, cx| {
+            q.toggle_bookmark_action(&super::menus::ToggleBookmark, window, cx);
+        });
+    })
+    .unwrap();
+    cx.update(|cx| {
+        let doc = controller.read(cx).active_document(win_id).unwrap();
+        assert!(
+            doc.bookmarks.contains_row(120),
+            "bookmark after unfiltered DocEnd must target physical row 120, not viewport row 1"
+        );
+    });
+
+    // 5. Deep jump beyond loaded filter buffer: filter 90 matching rows (`tag == "KEEP"`),
+    //    jump to DocEnd (display row 89 -> physical source row 90), wait for async filter read,
+    //    then toggle bookmark and verify physical row 90 is bookmarked!
+    let query = quarry_core::FilterQuery {
+        predicates: vec![quarry_core::FilterPredicate {
+            column: 1,
+            operator: quarry_core::FilterOperator::Equals,
+            upper_bound: None,
+            value: b"KEEP".to_vec(),
+        }],
+        case_sensitivity: quarry_core::CaseSensitivity::Sensitive,
+    };
+    cx.update_window(win.into(), |_, window, cx| {
+        controller.update(cx, |c, cx| {
+            c.start_filter_active(win_id, query, cx).unwrap();
+        });
+        view.update(cx, |q, cx| q.sync_from_controller(window, cx));
+    })
+    .unwrap();
+    wait_for_ui(cx, win, &controller, &view, |q, _, cx| {
+        q.snapshot(cx)
+            .is_some_and(|s| s.filter_active && s.filter_done && s.available_rows == 90)
+    });
+    cx.update_window(win.into(), |_, window, cx| {
+        view.update(cx, |q, cx| {
+            q.move_grid_cursor(quarry_workbench::CursorMotion::DocEnd, window, cx);
+        });
+    })
+    .unwrap();
+    wait_for_ui(cx, win, &controller, &view, |q, _, cx| {
+        q.table.read(cx).selected_cell().map(|(r, _)| r) == Some(89)
+            && q.pending_display_cursor.is_none()
+            && controller
+                .read(cx)
+                .active_cursor(win_id)
+                .is_some_and(|c| c.row == 90)
+    });
+    cx.update_window(win.into(), |_, window, cx| {
+        view.update(cx, |q, cx| {
+            q.toggle_bookmark_action(&super::menus::ToggleBookmark, window, cx);
+        });
+    })
+    .unwrap();
+    cx.update(|cx| {
+        let doc = controller.read(cx).active_document(win_id).unwrap();
+        assert!(
+            doc.bookmarks.contains_row(90),
+            "bookmark after filtered DocEnd beyond buffer must target physical row 90"
+        );
+    });
+    // Clear filter before testing Find Next focus preservation.
+    cx.update_window(win.into(), |_, window, cx| {
+        let _ = controller.update(cx, |c, cx| c.clear_filter_active(win_id, cx));
+        view.update(cx, |q, cx| q.sync_from_controller(window, cx));
+    })
+    .unwrap();
+    wait_for_ui(cx, win, &controller, &view, |q, _, cx| {
+        q.snapshot(cx).is_some_and(|s| !s.filter_active)
+    });
+
+    // 6. Command Palette wrap-around Up scrolls the selected last item into view, and
+    //    choosing Find Next from a fresh palette keeps focus in the Find input (not stolen by grid).
+    cx.update_window(win.into(), |_, window, cx| {
+        view.update(cx, |q, cx| {
+            q.open_command_palette_action(&super::menus::OpenCommandPalette, window, cx);
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.update_window(win.into(), |_, window, cx| {
+        view.update(cx, |q, cx| {
+            q.command_palette.update(cx, |p, cx| {
+                let total = p.result_titles_for_test().len();
+                assert!(total > 20);
+                p.move_selection(-1, cx);
+                assert_eq!(p.selected_index_for_test(), total - 1);
+            });
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.update_window(win.into(), |_, window, cx| {
+        window.render_frame(cx);
+        let offset_y = view
+            .read(cx)
+            .command_palette
+            .read(cx)
+            .scroll_offset_y_for_test();
+        assert!(
+            offset_y < 0.0,
+            "wrapping Up to last palette item must scroll the list (got offset_y={offset_y})"
+        );
+        view.update(cx, |q, cx| {
+            q.command_palette.update(cx, |p, cx| {
+                p.set_query_for_test("find next", window, cx);
+                p.activate_selected(cx);
+            });
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(win.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert!(view.read(cx).find_bar.read(cx).is_open());
+        assert!(
+            !view.read(cx).table.focus_handle(cx).is_focused(window),
+            "Find Next opened from fresh palette must keep focus in Find bar, not restore grid focus"
+        );
+    })
+    .unwrap();
 }

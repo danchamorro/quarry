@@ -19,13 +19,13 @@ use quarry_workbench::compressed::{
 };
 use quarry_workbench::{
     AppMessage, CellCoord, CombineWorkflow, CommandContext, CommandId, CommandResolution,
-    DEFAULT_NOFILE_TARGET, DelimiterMode, Document, DocumentId, EffectiveWordWrap, FailedOpen,
-    GridSelection, HudAnnouncement, HudAnnouncementTracker, HudIndexPhase, InspectWorkflow,
-    JOIN_INPUT_RESERVED, JoinWorkflow, MessageSeverity, OmarchyThemeWatcher, Palette,
-    ResidencyState, ResolvedTheme, ResourceHudSample, ResourceHudSampler, ResourceHudTargets,
-    SchedulerError, SelectionModifiers, StoragePreferences, StructuralDialog, StructuralJob,
-    ThemeAppearance, ThemePreference, ThemePreferences, VimMotionPreferences, WakeOutcome,
-    WindowId, WordWrapPreferences, WordWrapToggleOutcome, WorkbenchScheduler,
+    CommandTarget, DEFAULT_NOFILE_TARGET, DelimiterMode, Document, DocumentId, EffectiveWordWrap,
+    FailedOpen, GridSelection, HudAnnouncement, HudAnnouncementTracker, HudIndexPhase,
+    InspectWorkflow, JOIN_INPUT_RESERVED, JoinWorkflow, MessageSeverity, OmarchyThemeWatcher,
+    Palette, ResidencyState, ResolvedTheme, ResourceHudSample, ResourceHudSampler,
+    ResourceHudTargets, SchedulerError, SelectionModifiers, StoragePreferences, StructuralDialog,
+    StructuralJob, ThemeAppearance, ThemePreference, ThemePreferences, VimMotionPreferences,
+    WakeOutcome, WindowId, WordWrapPreferences, WordWrapToggleOutcome, WorkbenchScheduler,
     WorkbenchSchedulerConfig, WorkbenchTab, clear_index_cache_summary, command_disabled_reason,
     evaluate_command, inspect_temporary_storage, materialization_progress,
     omarchy_theme_fingerprint, resolve_theme, resolve_word_wrap, select_column, sort_progress,
@@ -1446,23 +1446,44 @@ impl WorkbenchController {
     }
 
     /// Evaluates a Command Palette item against the invoking `(window, captured_doc)` context.
+    ///
+    /// Invalidates all document-scoped commands whenever `captured_doc` no longer matches the
+    /// window's active document (including `None` -> `Some(new_doc)`), preventing stale palette
+    /// invocations from reading or mutating a different tab.
     pub fn evaluate_command_for_captured_document(
         &self,
         window: WindowId,
         captured_doc: Option<DocumentId>,
         command: CommandId,
     ) -> (bool, Option<&'static str>) {
+        let active_doc = self.scheduler.active_document(window);
         let fallback = WorkbenchTab::new(0);
+        if captured_doc != active_doc {
+            let ctx = CommandContext {
+                window,
+                active_tab: &fallback,
+                open_document_count: self.scheduler.tabs_in_window(window).len(),
+                write_slot_available: self.write_slot_available(),
+                external_modal_blocked: false,
+                text_field_focused: false,
+                show_all_whitespace: self.whitespace_prefs.show_all,
+            };
+            let res = evaluate_command(command, &ctx);
+            let is_app_or_window = matches!(
+                res.target,
+                Some(CommandTarget::Application | CommandTarget::Window(_))
+            );
+            if !is_app_or_window {
+                return (false, Some("The target tab is no longer active"));
+            }
+            let reason = (!res.enabled)
+                .then(|| command_disabled_reason(command, &ctx))
+                .flatten();
+            return (res.enabled, reason);
+        }
+
         let active_tab = captured_doc
             .and_then(|id| self.scheduler.tab(id))
-            .filter(|_| self.scheduler.active_document(window) == captured_doc)
-            .or_else(|| {
-                if captured_doc.is_none() {
-                    self.active_tab(window)
-                } else {
-                    None
-                }
-            })
             .unwrap_or(&fallback);
         let ctx = CommandContext {
             window,
@@ -1474,6 +1495,14 @@ impl WorkbenchController {
             show_all_whitespace: self.whitespace_prefs.show_all,
         };
         let res = evaluate_command(command, &ctx);
+        if active_tab.document.is_none()
+            && !matches!(
+                res.target,
+                Some(CommandTarget::Application | CommandTarget::Window(_))
+            )
+        {
+            return (false, Some("Open a file first"));
+        }
         let reason = (!res.enabled)
             .then(|| command_disabled_reason(command, &ctx))
             .flatten();

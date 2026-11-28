@@ -42,7 +42,7 @@ pub use navigation::{
 pub use palette::{
     JumpMatch, JumpTarget, MAX_PALETTE_QUERY_CHARS, PaletteCommand, PaletteMatch, PaletteQuery,
     fuzzy_score, jump_empty_message, palette_commands, parse_palette_input, rank_palette_commands,
-    resolve_jump_targets,
+    resolve_jump_targets, resolve_jump_targets_bounded,
 };
 pub use storage_prefs::{
     ADAPTIVE_MEMORY_BUDGET_BYTES, StoragePreferences, clear_index_cache_summary,
