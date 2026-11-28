@@ -72,10 +72,8 @@ impl QueryBar {
                         InputEvent::PressEnter { .. } => {
                             this.apply_now(cx);
                         }
-                        InputEvent::Change => {
-                            if !this.suppress_change {
-                                this.on_input_changed(window, cx);
-                            }
+                        InputEvent::Change if !this.suppress_change => {
+                            this.on_input_changed(window, cx);
                         }
                         _ => {}
                     }
