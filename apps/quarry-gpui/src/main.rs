@@ -2135,9 +2135,12 @@ impl QuarryWindow {
     ) {
         self.suppress_table_selection_depth += 1;
         f(self, cx);
-        cx.defer(|this, _| {
-            this.suppress_table_selection_depth =
-                this.suppress_table_selection_depth.saturating_sub(1);
+        let weak = cx.weak_entity();
+        cx.defer(move |cx| {
+            let _ = weak.update(cx, |this, _| {
+                this.suppress_table_selection_depth =
+                    this.suppress_table_selection_depth.saturating_sub(1);
+            });
         });
     }
 

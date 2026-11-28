@@ -1475,11 +1475,15 @@ impl WorkbenchController {
                     .flatten()
                     .any(|doc_id| {
                         self.scheduler.tab(doc_id).is_some_and(|tab| {
-                            let bytes = tab.document.as_ref().map(|d| d.session.active_byte_len());
-                            let next = self
-                                .word_wrap_prefs
-                                .toggle_for_tab(tab.word_wrap_override, bytes);
-                            next.next_tab_override != tab.word_wrap_override
+                            tab.word_wrap_override.is_some()
+                                || matches!(
+                                    resolve_word_wrap(
+                                        &self.word_wrap_prefs,
+                                        tab.word_wrap_override,
+                                        tab.document.as_ref().map(|d| d.session.active_byte_len()),
+                                    ),
+                                    EffectiveWordWrap::AutoDisabled { .. }
+                                )
                         })
                     });
             let is_app_or_window = !word_wrap_targets_tab
