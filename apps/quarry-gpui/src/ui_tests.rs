@@ -7055,8 +7055,15 @@ fn cell_inspector_drawer_json_pretty_invalid_stack_markdown_10mib_and_escape_foc
     std::fs::write(&csv_path, csv).unwrap();
 
     let controller = init_test_app(cx);
-    let (win, view) = open_test_window_with_path(cx, &controller, csv_path);
+    let (win, view) = open_test_window(cx, &controller);
     let win_id = cx.update(|cx| view.read(cx).window_id);
+    cx.update_window(win.into(), |_, window, cx| {
+        view.update(cx, |q, cx| {
+            q.open_paths_direct(vec![csv_path], OpenOptions::default(), None, window, cx);
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
     wait_for_ui(cx, win, &controller, &view, |q, _, cx| {
         q.snapshot(cx)
             .is_some_and(|s| s.index_done && s.available_rows == 5)
