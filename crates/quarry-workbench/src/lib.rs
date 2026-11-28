@@ -1,6 +1,7 @@
 //! Frontend-neutral document, selection, edit history, and workbench state for Quarry.
 
 pub mod bookmarks;
+pub mod cell_inspector;
 pub mod command;
 pub mod compressed;
 pub mod document;
@@ -20,6 +21,15 @@ pub mod workflows;
 pub use bookmarks::{
     BookmarkKey, BookmarkSplitTarget, BookmarkTransform, MAX_ROW_BOOKMARKS, RowBookmark,
     RowBookmarks,
+};
+pub use cell_inspector::{
+    BoundedLineSlice, CellFormat, CellInspectorJob, CellInspectorSnapshot, HoverPeek,
+    JsonPrettyError, LineIndex, MAX_FORMAT_DETECT_BYTES, MAX_INSPECTOR_LINE_BYTES,
+    MAX_INSPECTOR_LINE_OFFSETS, MAX_INSPECTOR_TOKENS_PER_LINE, MAX_JSON_NESTING_DEPTH,
+    MAX_PEEK_BYTES, MAX_PEEK_LINE_CHARS, MAX_PEEK_LINES, MAX_PRETTY_JSON_INPUT_BYTES,
+    MAX_PRETTY_JSON_OUTPUT_BYTES, PrettyJsonResult, TokenKind, TokenSpan, TokenizedLine,
+    build_hover_peek, build_inspector_snapshot, detect_cell_format, inspector_token_color,
+    needs_hover_peek, pretty_print_json_streaming, tokenize_line,
 };
 pub use command::{
     CloseCommandOutcome, CommandContext, CommandId, CommandResolution, CommandTarget, DocumentId,

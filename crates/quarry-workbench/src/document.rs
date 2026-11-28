@@ -5320,7 +5320,7 @@ impl Document {
         self.cell_edit_disabled_reason(source).is_none()
     }
 
-    pub fn cell_edit_disabled_reason(&self, source: Option<&[u8]>) -> Option<&'static str> {
+    pub fn document_cell_edit_disabled_reason(&self) -> Option<&'static str> {
         if let Some(reason) = self.compressed_read_only_reason() {
             return Some(reason);
         }
@@ -5340,7 +5340,17 @@ impl Document {
             || self.structural_job.is_some()
         {
             Some("Wait for the active file operation before editing data cells.")
-        } else if source.is_none() {
+        } else {
+            None
+        }
+    }
+
+    pub fn cell_edit_disabled_reason(&self, source: Option<&[u8]>) -> Option<&'static str> {
+        if let Some(reason) = self.document_cell_edit_disabled_reason() {
+            return Some(reason);
+        }
+
+        if source.is_none() {
             Some("This row has no cell in this file column.")
         } else if source.is_some_and(|source| std::str::from_utf8(source).is_err()) {
             Some("This cell is not valid UTF-8 and cannot be edited.")
@@ -6343,6 +6353,28 @@ impl Document {
         }
     }
 
+    /// Returns a zero-copy shared handle (`Arc<Row>`, `Arc<FilterMatch>`, or `Arc<Vec<u8>>`) for
+    /// `(row, column)` when loaded, avoiding full-cell copies on the UI thread for huge cells.
+    pub fn cell_inspector_input(&self, row: u64, column: usize) -> Option<whitespace::Input> {
+        if let Some(value) = self.cell_edits.get(&(row, column)) {
+            return Some(whitespace::Input::Owned(value.clone()));
+        }
+        if self.filter_active() {
+            let found = self.filtered_rows.iter().find(|value| value.row == row)?;
+            if column >= found.fields.len() {
+                return None;
+            }
+            Some(whitespace::Input::Filtered(found.clone(), column))
+        } else {
+            let index = usize::try_from(row.checked_sub(self.buffer_start)?).ok()?;
+            let loaded = self.buffered_rows.get(index)?;
+            if column >= loaded.fields.len() {
+                return None;
+            }
+            Some(whitespace::Input::Row(loaded.clone(), column))
+        }
+    }
+
     pub fn whitespace_header_input(&self, column: usize) -> whitespace::Input {
         self.header_renames.get(&column).map_or_else(
             || whitespace::Input::Header(self.session.clone(), column),
@@ -6484,13 +6516,17 @@ impl Document {
             return;
         };
         let row_visible = if self.filter_active() {
-            self.visible_filter_rows()
-                .iter()
-                .any(|row| row.row == selection.row())
+            self.filter_waiting_for_page()
+                || self
+                    .visible_filter_rows()
+                    .iter()
+                    .any(|row| row.row == selection.row())
         } else {
-            let row_end = self
-                .viewport_start
-                .saturating_add(self.visible_rows().len() as u64);
+            let row_end = self.viewport_start.saturating_add(
+                self.available_rows()
+                    .saturating_sub(self.viewport_start)
+                    .min(self.visible_rows.max(1) as u64),
+            );
             (self.viewport_start..row_end).contains(&selection.row())
         };
         let column_visible = match selection {

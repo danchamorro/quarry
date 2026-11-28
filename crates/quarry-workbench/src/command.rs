@@ -91,6 +91,7 @@ pub enum CommandId {
     FindPrevious,
     Replace,
     ToggleQueryBar,
+    ToggleCellInspector,
     OpenCommandPalette,
     GoToRowOrColumn,
     ToggleVimMotions,
@@ -266,6 +267,7 @@ pub fn evaluate_command(command: CommandId, ctx: &CommandContext<'_>) -> Command
         | CommandId::FindPrevious
         | CommandId::Replace
         | CommandId::ToggleQueryBar
+        | CommandId::ToggleCellInspector
         | CommandId::GoToRowOrColumn
         | CommandId::ToggleBookmark
         | CommandId::NextBookmark
@@ -385,6 +387,7 @@ pub fn evaluate_command(command: CommandId, ctx: &CommandContext<'_>) -> Command
         | CommandId::Columns
         | CommandId::Filters
         | CommandId::ToggleQueryBar
+        | CommandId::ToggleCellInspector
         | CommandId::GoToRowOrColumn => open,
         CommandId::ReloadFromDisk => files.reload,
         CommandId::Save => files.save,

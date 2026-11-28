@@ -195,6 +195,22 @@ const PALETTE_COMMANDS: &[PaletteCommand] = &[
         keywords: &["bookmarks", "list"],
     },
     PaletteCommand {
+        id: CommandId::ToggleCellInspector,
+        label: "Toggle Cell Inspector",
+        category: "View",
+        shortcut_macos: Some("⌘I"),
+        shortcut_other: Some("Ctrl+I"),
+        keywords: &[
+            "inspect",
+            "inspector",
+            "peek",
+            "json",
+            "stack",
+            "markdown",
+            "drawer",
+        ],
+    },
+    PaletteCommand {
         id: CommandId::EditCell,
         label: "Edit Selected Cell…",
         category: "Edit",
