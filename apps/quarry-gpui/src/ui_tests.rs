@@ -5451,11 +5451,33 @@ fn query_bar_applies_syncs_rules_isolates_tabs_and_preserves_active_filter_on_er
     let (win, view) = open_test_window(cx, &controller);
     let win_id = cx.update(|cx| view.read(cx).window_id);
     let (id_a, id_b) = cx.update(|cx| {
-        let a = controller
-            .update(cx, |c, cx| c.open_file(win_id, &path_a, cx))
+        let (_, a) = controller
+            .update(cx, |c, cx| {
+                c.open_paths(
+                    win_id,
+                    vec![path_a.clone()],
+                    OpenOptions {
+                        header_mode: HeaderMode::FirstRow,
+                        ..OpenOptions::default()
+                    },
+                    None,
+                    cx,
+                )
+            })
             .unwrap();
-        let b = controller
-            .update(cx, |c, cx| c.open_file(win_id, &path_b, cx))
+        let (_, b) = controller
+            .update(cx, |c, cx| {
+                c.open_paths(
+                    win_id,
+                    vec![path_b.clone()],
+                    OpenOptions {
+                        header_mode: HeaderMode::FirstRow,
+                        ..OpenOptions::default()
+                    },
+                    None,
+                    cx,
+                )
+            })
             .unwrap();
         controller
             .update(cx, |c, cx| c.activate_tab(win_id, a, cx))
@@ -5559,20 +5581,18 @@ fn query_bar_applies_syncs_rules_isolates_tabs_and_preserves_active_filter_on_er
 
     // Applying a filter on Tab B via controller syncs canonical expression into Query Bar.
     cx.update(|cx| {
-        controller
-            .update(cx, |c, cx| {
-                c.start_filter_active(
-                    win_id,
-                    quarry_core::FilterQuery::single(
-                        0,
-                        quarry_core::FilterOperator::Equals,
-                        b"west".to_vec(),
-                    ),
-                    cx,
-                )
-                .unwrap();
-            })
+        controller.update(cx, |c, cx| {
+            c.start_filter_active(
+                win_id,
+                quarry_core::FilterQuery::single(
+                    0,
+                    quarry_core::FilterOperator::Equals,
+                    b"west".to_vec(),
+                ),
+                cx,
+            )
             .unwrap();
+        });
     });
     wait_for_ui(cx, win, &controller, &view, |q, _, cx| {
         q.snapshot(cx).is_some_and(|s| {
