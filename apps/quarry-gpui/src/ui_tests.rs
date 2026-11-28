@@ -5793,16 +5793,16 @@ fn query_bar_applies_syncs_rules_isolates_tabs_and_preserves_active_filter_on_er
         })
     });
 
-    // Close Tab B and verify its draft entry is pruned from QueryBar.
+    // Close Tab B and verify its draft entry is pruned from QueryBar (leaving only Tab A).
     cx.update(|cx| {
         assert_eq!(
             view.read(cx).query_bar.read(cx).tab_draft_count_for_test(),
-            1
+            2
         );
         let _ = controller.update(cx, |c, cx| c.request_close_tab(win_id, id_b, false, cx));
     });
     wait_for_ui(cx, win, &controller, &view, |q, _, cx| {
-        q.query_bar.read(cx).tab_draft_count_for_test() == 0
+        q.query_bar.read(cx).tab_draft_count_for_test() == 1
     });
 
     // Closing Query Bar via toggle/Escape hides it cleanly.
