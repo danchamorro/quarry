@@ -8692,17 +8692,20 @@ mod tests {
         finish_filter(&mut doc);
         assert_eq!(doc.filtered_rows.len(), 2);
 
-        // Revoke read permissions so starting a replacement filter fails at file open with
-        // `PermissionDenied` (not `SourceChanged`), then verify the retained filter's index tag
-        // stays reconciled with `current_filter_tag()` instead of stranding future page reads.
+        // Revoke traverse/read permissions on the parent directory (NOT the file itself, so the
+        // file's inode/ctime stay untouched for Linux `SourceGuard` checks!) so starting a
+        // replacement filter fails at file open with `PermissionDenied` (not `SourceChanged`),
+        // then verify the retained filter's index tag stays reconciled with `current_filter_tag()`
+        // and recovery reschedules & loads the visible filtered page once readable again.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
-            // Privileged users (e.g. root in CI containers) bypass mode 000 read checks;
+            let parent = dir.path();
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o000)).unwrap();
+            // Privileged users (e.g. root in CI containers) bypass mode 000 directory checks;
             // restore permissions and skip cleanly when the OS cannot enforce PermissionDenied.
             if std::fs::File::open(&path).is_ok() {
-                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+                std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o755)).unwrap();
                 doc.shutdown();
                 return;
             }
@@ -8714,7 +8717,7 @@ mod tests {
             doc.filtered_rows.clear();
             doc.filtered_rows_tag = None;
             let start_res = doc.start_filter(q2);
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o755)).unwrap();
             assert!(start_res.is_err());
             assert!(!doc.source_changed);
             assert_eq!(doc.filter_query.as_ref(), Some(&q1));
