@@ -5652,7 +5652,7 @@ fn query_bar_applies_syncs_rules_isolates_tabs_and_preserves_active_filter_on_er
     cx.update(|cx| {
         controller.update(cx, |c, cx| {
             let doc = c.active_document_mut(win_id).unwrap();
-            doc.begin_header_edit(0, "state".into());
+            doc.begin_header_edit(0);
             doc.header_edit.as_mut().unwrap().draft = "province".into();
             doc.commit_edits();
             cx.notify();
@@ -5743,9 +5743,7 @@ fn query_bar_applies_syncs_rules_isolates_tabs_and_preserves_active_filter_on_er
             view.read(cx).query_bar.read(cx).tab_draft_count_for_test(),
             1
         );
-        controller
-            .update(cx, |c, cx| c.close_tab(win_id, id_b, cx))
-            .unwrap();
+        let _ = controller.update(cx, |c, cx| c.request_close_tab(win_id, id_b, false, cx));
     });
     wait_for_ui(cx, win, &controller, &view, |q, _, cx| {
         q.query_bar.read(cx).tab_draft_count_for_test() == 0
