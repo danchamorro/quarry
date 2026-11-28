@@ -6852,7 +6852,7 @@ fn astra_review_regressions_stale_copy_deep_jump_tab_cursor_and_palette_scroll(
                 table.delegate().record_gutter_mouse_selection(5);
                 table.set_selected_cell(5, 0, cx);
             });
-            q.move_cursor(quarry_workbench::CursorMotion::Down, window, cx);
+            q.move_grid_cursor(quarry_workbench::CursorMotion::Down, window, cx);
         });
         window.render_frame(cx);
     })
@@ -6878,7 +6878,7 @@ fn astra_review_regressions_stale_copy_deep_jump_tab_cursor_and_palette_scroll(
                 table.set_selected_cell(5, 0, cx);
             });
             assert_eq!(controller.read(cx).active_cursor(win_id), None);
-            q.move_cursor(quarry_workbench::CursorMotion::Down, window, cx);
+            q.move_grid_cursor(quarry_workbench::CursorMotion::Down, window, cx);
         });
         window.render_frame(cx);
     })
