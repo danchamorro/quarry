@@ -185,7 +185,8 @@ impl CellInspector {
         self.view_mode = mode;
         self.top_line = 0;
         self.h_offset_chars = 0;
-        self.scroll_handle.scroll_to_item(0, ScrollStrategy::Top);
+        self.scroll_handle
+            .scroll_to_item_strict(0, ScrollStrategy::Top);
         cx.notify();
     }
 
@@ -225,7 +226,7 @@ impl CellInspector {
         if clamped != self.top_line {
             self.top_line = clamped;
             self.scroll_handle
-                .scroll_to_item(clamped, ScrollStrategy::Top);
+                .scroll_to_item_strict(clamped, ScrollStrategy::Top);
             cx.notify();
         }
     }
@@ -296,9 +297,10 @@ impl CellInspector {
                 let display_row_number = doc
                     .global_data_row_number(row)
                     .unwrap_or_else(|| row.saturating_sub(doc.data_start).saturating_add(1));
-                let can_edit = doc
-                    .cell_edit_disabled_reason(doc.effective_cell(row, column))
-                    .is_none();
+                // Evaluate O(1) document-level edit guards here; cell presence and
+                // UTF-8 validity come from the background snapshot so UI notifications
+                // never scan multi-megabyte cell bytes on the main thread.
+                let can_edit = doc.document_cell_edit_disabled_reason().is_none();
                 Some(Some(InspectedTarget {
                     doc_id,
                     instance_id: doc.instance_id,
@@ -385,7 +387,8 @@ impl CellInspector {
 
         self.cancel_in_flight();
         self.snapshot = None;
-        self.scroll_handle.scroll_to_item(0, ScrollStrategy::Top);
+        self.scroll_handle
+            .scroll_to_item_strict(0, ScrollStrategy::Top);
 
         let Some(raw) = input_opt else {
             if row_loaded {
@@ -584,6 +587,11 @@ impl CellInspector {
     #[cfg(test)]
     pub fn top_line_for_test(&self) -> usize {
         self.top_line
+    }
+
+    #[cfg(test)]
+    pub fn scroll_top_index_for_test(&self) -> usize {
+        self.scroll_handle.logical_scroll_top_index()
     }
 
     #[cfg(test)]

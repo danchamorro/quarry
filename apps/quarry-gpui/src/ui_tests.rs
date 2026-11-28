@@ -7303,7 +7303,29 @@ fn cell_inspector_drawer_json_pretty_invalid_stack_markdown_10mib_and_escape_foc
             },
         );
     }
-    // Page down 3 times (3 * 16 = line 48) below the first screen.
+    // Single Down keystroke must strictly advance the viewport top line even while line 1 is visible.
+    cx.dispatch_keystroke(
+        win.into(),
+        Keystroke {
+            modifiers: Modifiers::default(),
+            key: "down".into(),
+            key_char: None,
+        },
+    );
+    cx.update_window(win.into(), |_, window, cx| {
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.update(|cx| {
+        let insp = view.read(cx).cell_inspector.read(cx);
+        assert_eq!(insp.top_line_for_test(), 1);
+        assert_eq!(
+            insp.scroll_top_index_for_test(),
+            1,
+            "Down must strictly scroll the uniform list top item to line 1"
+        );
+    });
+    // Page down 3 times (1 + 3 * 16 = line 49) below the first screen.
     for _ in 0..3 {
         cx.dispatch_keystroke(
             win.into(),
@@ -7315,6 +7337,10 @@ fn cell_inspector_drawer_json_pretty_invalid_stack_markdown_10mib_and_escape_foc
         );
     }
     cx.run_until_parked();
+    cx.update_window(win.into(), |_, window, cx| {
+        window.render_frame(cx);
+    })
+    .unwrap();
     cx.update(|cx| {
         let insp = view.read(cx).cell_inspector.read(cx);
         assert!(insp.h_offset_chars_for_test() >= 180);
@@ -7327,6 +7353,11 @@ fn cell_inspector_drawer_json_pretty_invalid_stack_markdown_10mib_and_escape_foc
             insp.top_line_for_test() >= 48,
             "PageDown must scroll below the first screen (got top_line={})",
             insp.top_line_for_test()
+        );
+        assert!(
+            insp.scroll_top_index_for_test() > 1,
+            "PageDown must strictly advance the rendered scroll viewport (got top_idx={})",
+            insp.scroll_top_index_for_test()
         );
     });
 

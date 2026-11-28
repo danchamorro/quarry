@@ -5320,7 +5320,7 @@ impl Document {
         self.cell_edit_disabled_reason(source).is_none()
     }
 
-    pub fn cell_edit_disabled_reason(&self, source: Option<&[u8]>) -> Option<&'static str> {
+    pub fn document_cell_edit_disabled_reason(&self) -> Option<&'static str> {
         if let Some(reason) = self.compressed_read_only_reason() {
             return Some(reason);
         }
@@ -5340,7 +5340,17 @@ impl Document {
             || self.structural_job.is_some()
         {
             Some("Wait for the active file operation before editing data cells.")
-        } else if source.is_none() {
+        } else {
+            None
+        }
+    }
+
+    pub fn cell_edit_disabled_reason(&self, source: Option<&[u8]>) -> Option<&'static str> {
+        if let Some(reason) = self.document_cell_edit_disabled_reason() {
+            return Some(reason);
+        }
+
+        if source.is_none() {
             Some("This row has no cell in this file column.")
         } else if source.is_some_and(|source| std::str::from_utf8(source).is_err()) {
             Some("This cell is not valid UTF-8 and cannot be edited.")
