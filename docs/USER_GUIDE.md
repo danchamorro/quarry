@@ -765,6 +765,29 @@ composition, or with system/VoiceOver modifier chords (`Ctrl+Option`):
   (for example `#2: amount` and `#10: amount`). Jumping to a hidden column
   automatically unhides it and centers it horizontally in the grid.
 
+#### Inspect cells and Hover-to-Peek (`Command+I` / `Ctrl+I`)
+
+- **Hover-to-Peek:** Hover over any truncated or multi-line cell to view a fast,
+  bounded preview tooltip (up to 1 KiB and 8 lines) read strictly from
+  already-parsed viewport rows with zero extra file I/O. Short single-line cells
+  stay uncluttered.
+- **Cell Inspector drawer:** Press **`Command+I`** on macOS (**`Ctrl+I`** on
+  Linux), click **Inspect** in the toolbar, choose **View → Cell Inspector**,
+  right-click a cell and choose **Inspect Cell**, or run **Toggle Cell
+  Inspector** from the Command Palette.
+- **Format detection & highlighting:** Automatically highlights **JSON**,
+  **Java/Python/Rust stack traces**, and **Markdown** (headings, fenced code
+  blocks, inline code, lists, and blockquotes) using bounded per-line byte and
+  token budgets so multi-megabyte single-line cells stay responsive.
+- **JSON Raw / Pretty view:** Valid JSON cells (up to 4 MiB) are pretty-printed
+  in the background while preserving duplicate keys and exact numeric lexemes
+  (`1.00`, arbitrary-precision integers, large exponents). Invalid JSON keeps
+  the raw text visible and displays the exact line, column, and byte offset of
+  the syntax error.
+- **Actions & focus:** Use **Copy Raw** / **Copy Pretty** to copy the displayed
+  view (up to 64 MiB), **Edit…** to open the inline cell editor, and press
+  **`Escape`** inside the drawer to close it and return focus to the data grid.
+
 ### Filter rows
 
 #### Build one or more rules

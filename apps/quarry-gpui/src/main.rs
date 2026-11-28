@@ -1,3 +1,4 @@
+mod cell_inspector;
 mod command_palette;
 mod find_bar;
 mod grid;
@@ -52,6 +53,7 @@ use quarry_workbench::{
     conflicts_with_voiceover_or_shortcut, format_bytes, step_adjacent_cell, step_display_cursor,
 };
 
+use cell_inspector::{CellInspector, CellInspectorEvent};
 use command_palette::{CommandPalette, CommandPaletteEvent, PaletteOpenMode};
 use find_bar::{FindBar, FindBarEvent};
 use grid::{Grid, GridAction, GridActionCallback};
@@ -65,9 +67,9 @@ use menus::{
     PreviousBookmark, PreviousTab, QUARRY_KEY_CONTEXT, QuitApp, RedoEdit, ReloadFromDisk,
     RenameHeader, ReplaceText, SaveAsFile, SaveAsUtf8, SaveFile, ShowAllWhitespace, SortRows,
     SplitColumn, TemporaryStorage, ThemeDark, ThemeLight, ThemeOmarchy, ThemeSystem,
-    ToggleBookmark, ToggleBookmarks, ToggleColumns, ToggleFilters, ToggleLiveWatch, ToggleQueryBar,
-    ToggleVimMotions, ToggleWordWrap, UndoEdit, VerifySectionBoundary, bind_shortcuts,
-    encoding_label, install_menus,
+    ToggleBookmark, ToggleBookmarks, ToggleCellInspector, ToggleColumns, ToggleFilters,
+    ToggleLiveWatch, ToggleQueryBar, ToggleVimMotions, ToggleWordWrap, UndoEdit,
+    VerifySectionBoundary, bind_shortcuts, encoding_label, install_menus,
 };
 use panels::{PanelEvent, Panels, Tool};
 use query_bar::{QueryBar, QueryBarEvent};
@@ -86,6 +88,7 @@ pub struct QuarryWindow {
     panels: Entity<Panels>,
     find_bar: Entity<FindBar>,
     query_bar: Entity<QueryBar>,
+    cell_inspector: Entity<CellInspector>,
     command_palette: Entity<CommandPalette>,
     row_input: Entity<InputState>,
     vim_state: VimKeyState,
@@ -167,6 +170,7 @@ impl QuarryWindow {
         let panels = cx.new(|cx| Panels::new(window, cx));
         let find_bar = cx.new(|cx| FindBar::new(controller.clone(), window_id, window, cx));
         let query_bar = cx.new(|cx| QueryBar::new(controller.clone(), window_id, window, cx));
+        let cell_inspector = cx.new(|cx| CellInspector::new(controller.clone(), window_id, cx));
         let command_palette =
             cx.new(|cx| CommandPalette::new(controller.clone(), window_id, window, cx));
         let row_input = cx.new(|cx| InputState::new(window, cx).default_value("1"));
@@ -201,6 +205,36 @@ impl QuarryWindow {
                     FindBarEvent::Closed => {
                         this.restore_grid_focus(window, cx);
                         cx.notify();
+                    }
+                },
+            ),
+            cx.subscribe_in(
+                &cell_inspector,
+                window,
+                |this, _, event: &CellInspectorEvent, window, cx| match event {
+                    CellInspectorEvent::Closed => {
+                        this.restore_grid_focus(window, cx);
+                        cx.notify();
+                    }
+                    CellInspectorEvent::EditCell {
+                        source_row,
+                        source_col,
+                    } => {
+                        if let Some((table_row, table_col)) = this
+                            .table
+                            .read(cx)
+                            .delegate()
+                            .display_position_for_source(*source_row, *source_col, cx)
+                        {
+                            this.edit_cell(table_row, table_col, window, cx);
+                        }
+                    }
+                    CellInspectorEvent::CopyText { text, label } => {
+                        cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
+                        this.set_message(AppMessage::status(*label), cx);
+                    }
+                    CellInspectorEvent::CopyError(err) => {
+                        this.set_message(AppMessage::warning(err.clone()), cx);
                     }
                 },
             ),
@@ -557,6 +591,7 @@ impl QuarryWindow {
             panels,
             find_bar,
             query_bar,
+            cell_inspector,
             command_palette,
             row_input,
             vim_state: VimKeyState::default(),
@@ -872,6 +907,8 @@ impl QuarryWindow {
                     .update(cx, |panels, cx| panels.clear_document(window, cx));
                 self.query_bar
                     .update(cx, |bar, cx| bar.clear_document(window, cx));
+                self.cell_inspector
+                    .update(cx, |inspector, cx| inspector.clear_document(cx));
                 self.with_suppressed_table_selection(cx, |this, cx| {
                     this.table.update(cx, |table, cx| {
                         table.delegate_mut().reset_widths();
@@ -2708,6 +2745,11 @@ impl QuarryWindow {
                 restore_focus = !will_open;
                 self.toggle_query_bar_action(&ToggleQueryBar, window, cx);
             }
+            CommandId::ToggleCellInspector => {
+                let will_open = !self.cell_inspector.read(cx).is_open();
+                restore_focus = !will_open;
+                self.toggle_cell_inspector_action(&ToggleCellInspector, window, cx);
+            }
             CommandId::Filters => {
                 restore_focus = false;
                 self.toggle_filters_action(&ToggleFilters, window, cx);
@@ -3326,12 +3368,23 @@ impl QuarryWindow {
         let has_value = raw_shared.is_some();
 
         let menu = PopupMenu::build(window, cx, |menu, _, _| {
+            let w_inspect = weak.clone();
             let w_eq = weak.clone();
             let w_neq = weak.clone();
             let w_copy = weak.clone();
             let w_edit = weak.clone();
 
             menu.item(
+                PopupMenuItem::new("Inspect Cell").on_click(move |_, window, cx| {
+                    let _ = w_inspect.update(cx, |this, cx| {
+                        this.close_grid_context_menu(cx);
+                        this.cell_inspector
+                            .update(cx, |inspector, cx| inspector.open_and_focus(window, cx));
+                    });
+                }),
+            )
+            .separator()
+            .item(
                 PopupMenuItem::new("Filter to This Value")
                     .disabled(!can_filter)
                     .on_click(move |_, window, cx| {
@@ -3506,6 +3559,21 @@ impl QuarryWindow {
     ) {
         if self.command_enabled(CommandId::Filters, cx) {
             self.query_bar.update(cx, |bar, cx| bar.toggle(window, cx));
+        }
+    }
+
+    fn toggle_cell_inspector_action(
+        &mut self,
+        _: &ToggleCellInspector,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.editing || self.confirming {
+            return;
+        }
+        if self.command_enabled(CommandId::ToggleCellInspector, cx) {
+            self.cell_inspector
+                .update(cx, |inspector, cx| inspector.toggle(window, cx));
         }
     }
 
@@ -5420,6 +5488,21 @@ impl QuarryWindow {
                         this.toggle_query_bar_action(&ToggleQueryBar, window, cx);
                     })),
             )
+            .child(
+                Button::new("toolbar-inspector")
+                    .label(if self.cell_inspector.read(cx).is_open() {
+                        "Inspect: On"
+                    } else {
+                        "Inspect"
+                    })
+                    .accessibility_label("Toggle Cell Inspector")
+                    .ghost()
+                    .small()
+                    .disabled(!loaded)
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.toggle_cell_inspector_action(&ToggleCellInspector, window, cx);
+                    })),
+            )
             .child(bookmarks)
             .child(
                 Button::new("toolbar-find")
@@ -6161,6 +6244,7 @@ impl Render for QuarryWindow {
             .on_action(cx.listener(Self::toggle_columns_action))
             .on_action(cx.listener(Self::toggle_filters_action))
             .on_action(cx.listener(Self::toggle_query_bar_action))
+            .on_action(cx.listener(Self::toggle_cell_inspector_action))
             .on_action(cx.listener(Self::toggle_bookmarks_action))
             .on_action(cx.listener(Self::combine_files_action))
             .on_action(cx.listener(Self::join_files_action))
@@ -6274,50 +6358,64 @@ impl Render for QuarryWindow {
                     .bordered(false)
                     .small()
             };
-            body = body.child(
-                div()
-                    .id("quarry-grid-container")
-                    .relative()
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_hidden()
-                    .capture_action(cx.listener(|this, _: &TableCancel, window, cx| {
-                        if this.table.focus_handle(cx).is_focused(window)
-                            && this.cancel_vim_pending(cx)
-                        {
-                            cx.stop_propagation();
-                        }
-                    }))
-                    .capture_action(cx.listener(|this, _: &SelectUp, window, cx| {
-                        this.handle_grid_table_motion(CursorMotion::Up, window, cx);
-                    }))
-                    .capture_action(cx.listener(|this, _: &SelectDown, window, cx| {
-                        this.handle_grid_table_motion(CursorMotion::Down, window, cx);
-                    }))
-                    .capture_action(cx.listener(|this, _: &SelectPrevColumn, window, cx| {
-                        this.handle_grid_table_motion(CursorMotion::Left, window, cx);
-                    }))
-                    .capture_action(cx.listener(|this, _: &SelectNextColumn, window, cx| {
-                        this.handle_grid_table_motion(CursorMotion::Right, window, cx);
-                    }))
-                    .capture_action(cx.listener(|this, _: &SelectFirst, window, cx| {
-                        this.handle_grid_table_motion(CursorMotion::RowStart, window, cx);
-                    }))
-                    .capture_action(cx.listener(|this, _: &SelectLast, window, cx| {
-                        this.handle_grid_table_motion(CursorMotion::RowEnd, window, cx);
-                    }))
-                    .capture_action(cx.listener(|this, _: &SelectPageUp, window, cx| {
-                        let step = this.table.read(cx).delegate().visible_rows().len().max(1);
-                        this.handle_grid_table_motion(CursorMotion::PageUp(step), window, cx);
-                    }))
-                    .capture_action(cx.listener(|this, _: &SelectPageDown, window, cx| {
-                        let step = this.table.read(cx).delegate().visible_rows().len().max(1);
-                        this.handle_grid_table_motion(CursorMotion::PageDown(step), window, cx);
-                    }))
-                    .capture_key_down(cx.listener(Self::handle_grid_key_down))
-                    .child(shift_horizontal_scroll)
-                    .child(data_table),
-            );
+            let grid_pane = div()
+                .id("quarry-grid-container")
+                .relative()
+                .flex_1()
+                .min_w_0()
+                .min_h_0()
+                .overflow_hidden()
+                .capture_action(cx.listener(|this, _: &TableCancel, window, cx| {
+                    if this.table.focus_handle(cx).is_focused(window) && this.cancel_vim_pending(cx)
+                    {
+                        cx.stop_propagation();
+                    }
+                }))
+                .capture_action(cx.listener(|this, _: &SelectUp, window, cx| {
+                    this.handle_grid_table_motion(CursorMotion::Up, window, cx);
+                }))
+                .capture_action(cx.listener(|this, _: &SelectDown, window, cx| {
+                    this.handle_grid_table_motion(CursorMotion::Down, window, cx);
+                }))
+                .capture_action(cx.listener(|this, _: &SelectPrevColumn, window, cx| {
+                    this.handle_grid_table_motion(CursorMotion::Left, window, cx);
+                }))
+                .capture_action(cx.listener(|this, _: &SelectNextColumn, window, cx| {
+                    this.handle_grid_table_motion(CursorMotion::Right, window, cx);
+                }))
+                .capture_action(cx.listener(|this, _: &SelectFirst, window, cx| {
+                    this.handle_grid_table_motion(CursorMotion::RowStart, window, cx);
+                }))
+                .capture_action(cx.listener(|this, _: &SelectLast, window, cx| {
+                    this.handle_grid_table_motion(CursorMotion::RowEnd, window, cx);
+                }))
+                .capture_action(cx.listener(|this, _: &SelectPageUp, window, cx| {
+                    let step = this.table.read(cx).delegate().visible_rows().len().max(1);
+                    this.handle_grid_table_motion(CursorMotion::PageUp(step), window, cx);
+                }))
+                .capture_action(cx.listener(|this, _: &SelectPageDown, window, cx| {
+                    let step = this.table.read(cx).delegate().visible_rows().len().max(1);
+                    this.handle_grid_table_motion(CursorMotion::PageDown(step), window, cx);
+                }))
+                .capture_key_down(cx.listener(Self::handle_grid_key_down))
+                .child(shift_horizontal_scroll)
+                .child(data_table);
+
+            let mut workspace = div()
+                .id("quarry-workspace-split")
+                .flex_1()
+                .min_h_0()
+                .w_full()
+                .flex()
+                .flex_row()
+                .overflow_hidden()
+                .child(grid_pane);
+
+            if self.cell_inspector.read(cx).is_open() {
+                workspace = workspace.child(self.cell_inspector.clone());
+            }
+
+            body = body.child(workspace);
         } else {
             body = body.child(self.render_welcome(cx));
         }

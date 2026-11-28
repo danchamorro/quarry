@@ -806,6 +806,8 @@ impl TableDelegate for Grid {
                     let pending = summary.is_none() && !raw.is_empty();
                     let ws_tip = (indicated || pending)
                         .then(|| controller.whitespace_explanation(win_id, summary));
+                    let hover_peek =
+                        quarry_workbench::build_hover_peek(raw, col_width_px, GRID_FONT_SIZE);
                     Some((
                         allow_wrap_cell,
                         numeric_cell,
@@ -814,6 +816,7 @@ impl TableDelegate for Grid {
                         indicated,
                         pending,
                         ws_tip,
+                        hover_peek,
                     ))
                 })
             };
@@ -826,6 +829,7 @@ impl TableDelegate for Grid {
                 indicated,
                 pending,
                 ws_tip,
+                hover_peek,
             )) = rendered_cell
             else {
                 return cell.child(div().flex_1().min_w_0());
@@ -872,15 +876,29 @@ impl TableDelegate for Grid {
                 );
             }
 
-            if invalid_utf8 || indicated || pending {
-                let tip = match (invalid_utf8, ws_tip) {
-                    (true, Some(ws)) => {
-                        format!("This cell is not valid UTF-8 and cannot be edited.\n{ws}")
-                    }
-                    (true, None) => "This cell is not valid UTF-8 and cannot be edited.".to_owned(),
-                    (false, Some(ws)) => ws,
-                    (false, None) => unreachable!(),
-                };
+            if hover_peek.is_some() || invalid_utf8 || indicated || pending {
+                let mut sections = Vec::new();
+                if let Some(peek) = hover_peek {
+                    let shortcut = if cfg!(target_os = "macos") {
+                        "⌘I"
+                    } else {
+                        "Ctrl+I"
+                    };
+                    sections.push(format!(
+                        "{} · {} bytes · Press {} to inspect\n{}",
+                        peek.format.label(),
+                        peek.total_bytes,
+                        shortcut,
+                        peek.preview_text
+                    ));
+                }
+                if invalid_utf8 {
+                    sections.push("This cell is not valid UTF-8 and cannot be edited.".to_owned());
+                }
+                if let Some(ws) = ws_tip {
+                    sections.push(ws);
+                }
+                let tip = sections.join("\n\n");
                 cell = cell.tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx));
             }
         } else {

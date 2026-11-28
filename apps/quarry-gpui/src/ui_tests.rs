@@ -7032,3 +7032,227 @@ fn astra_review_regressions_stale_copy_deep_jump_tab_cursor_and_palette_scroll(
         );
     });
 }
+
+#[gpui_kit::test]
+fn cell_inspector_drawer_json_pretty_invalid_stack_markdown_10mib_and_escape_focus(
+    cx: &mut TestAppContext,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let csv_path = dir.path().join("inspect_cells.csv");
+    let valid_json = r#"{"id":1.00,"id":999999999999999999999999999,"ok":true}"#;
+    let invalid_json = "{\"a\": 1, \"b\": [1, ]}";
+    let stack = "Traceback (most recent call last):\n  File \"worker.py\", line 42, in run\nValueError: boom";
+    let markdown = "# Heading\n```rust\nlet v = 1;\n```\n- item";
+    let ten_mib = "x".repeat(10 * 1024 * 1024);
+
+    let quote = |s: &str| format!("\"{}\"", s.replace('"', "\"\""));
+    let mut csv = String::from("kind,payload\n");
+    csv.push_str(&format!("valid_json,{}\n", quote(valid_json)));
+    csv.push_str(&format!("invalid_json,{}\n", quote(invalid_json)));
+    csv.push_str(&format!("stack,{}\n", quote(stack)));
+    csv.push_str(&format!("markdown,{}\n", quote(markdown)));
+    csv.push_str(&format!("ten_mib,{ten_mib}\n"));
+    std::fs::write(&csv_path, csv).unwrap();
+
+    let controller = init_test_app(cx);
+    let (win, view) = open_test_window_with_path(cx, &controller, csv_path);
+    let win_id = cx.update(|cx| view.read(cx).window_id);
+    wait_for_ui(cx, win, &controller, &view, |q, _, cx| {
+        q.snapshot(cx)
+            .is_some_and(|s| s.index_done && s.available_rows == 5)
+    });
+
+    // 1. Select valid JSON cell (row 0, col 1 -> table col 2) and open Cell Inspector via Cmd/Ctrl+I action.
+    cx.update_window(win.into(), |_, window, cx| {
+        view.update(cx, |q, cx| {
+            q.apply_display_cursor(0, 1, false, window, cx);
+            q.toggle_cell_inspector_action(&super::menus::ToggleCellInspector, window, cx);
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+    wait_for_ui(cx, win, &controller, &view, |q, _, cx| {
+        let insp = q.cell_inspector.read(cx);
+        insp.is_open()
+            && !insp.is_loading_for_test()
+            && insp.detected_format_for_test() == Some(quarry_workbench::CellFormat::Json)
+    });
+
+    // Raw text is visible initially; switching to Pretty JSON preserves duplicate keys & exact numbers.
+    cx.update_window(win.into(), |_, window, cx| {
+        let insp = view.read(cx).cell_inspector.read(cx);
+        assert_eq!(
+            insp.view_mode_for_test(),
+            super::cell_inspector::InspectorViewMode::Raw
+        );
+        assert_eq!(insp.line_count_for_test(), 1);
+        view.update(cx, |q, cx| {
+            q.cell_inspector.update(cx, |i, cx| {
+                i.set_view_mode(super::cell_inspector::InspectorViewMode::Pretty, cx);
+                i.copy_current_view(cx);
+            });
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update(|cx| {
+        let insp = view.read(cx).cell_inspector.read(cx);
+        assert_eq!(
+            insp.view_mode_for_test(),
+            super::cell_inspector::InspectorViewMode::Pretty
+        );
+        assert!(insp.line_count_for_test() >= 5);
+        let clip = cx.read_from_clipboard().and_then(|c| c.text()).unwrap();
+        assert_eq!(
+            clip.matches("\"id\":").count(),
+            2,
+            "pretty JSON must preserve duplicate keys"
+        );
+        assert!(clip.contains("1.00"));
+        assert!(clip.contains("999999999999999999999999999"));
+    });
+
+    // 2. Invalid JSON keeps Raw text visible and reports exact error line/column.
+    cx.update_window(win.into(), |_, window, cx| {
+        view.update(cx, |q, cx| {
+            q.apply_display_cursor(1, 1, false, window, cx);
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+    wait_for_ui(cx, win, &controller, &view, |q, _, cx| {
+        let insp = q.cell_inspector.read(cx);
+        insp.inspected_coord_for_test() == Some((2, 1))
+            && !insp.is_loading_for_test()
+            && insp.pretty_json_error_for_test().is_some()
+    });
+    cx.update(|cx| {
+        let insp = view.read(cx).cell_inspector.read(cx);
+        assert_eq!(
+            insp.view_mode_for_test(),
+            super::cell_inspector::InspectorViewMode::Raw
+        );
+        let err = insp.pretty_json_error_for_test().unwrap();
+        assert!(err.contains("line 1"), "expected error position: {err}");
+        let (raw_line, _) = insp.line_preview_for_test(0).unwrap();
+        assert_eq!(raw_line, invalid_json);
+    });
+
+    // 3. Stack trace and Markdown detection.
+    cx.update_window(win.into(), |_, window, cx| {
+        view.update(cx, |q, cx| {
+            q.apply_display_cursor(2, 1, false, window, cx);
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+    wait_for_ui(cx, win, &controller, &view, |q, _, cx| {
+        let insp = q.cell_inspector.read(cx);
+        insp.inspected_coord_for_test() == Some((3, 1)) && !insp.is_loading_for_test()
+    });
+    cx.update(|cx| {
+        assert_eq!(
+            view.read(cx)
+                .cell_inspector
+                .read(cx)
+                .detected_format_for_test(),
+            Some(quarry_workbench::CellFormat::StackTrace)
+        );
+    });
+
+    cx.update_window(win.into(), |_, window, cx| {
+        view.update(cx, |q, cx| {
+            q.apply_display_cursor(3, 1, false, window, cx);
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+    wait_for_ui(cx, win, &controller, &view, |q, _, cx| {
+        let insp = q.cell_inspector.read(cx);
+        insp.inspected_coord_for_test() == Some((4, 1)) && !insp.is_loading_for_test()
+    });
+    cx.update(|cx| {
+        assert_eq!(
+            view.read(cx)
+                .cell_inspector
+                .read(cx)
+                .detected_format_for_test(),
+            Some(quarry_workbench::CellFormat::Markdown)
+        );
+    });
+
+    // 4. 10 MiB single-line cell stays bounded to MAX_INSPECTOR_LINE_BYTES and renders cleanly.
+    cx.update_window(win.into(), |_, window, cx| {
+        view.update(cx, |q, cx| {
+            q.apply_display_cursor(4, 1, false, window, cx);
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+    wait_for_ui(cx, win, &controller, &view, |q, _, cx| {
+        let insp = q.cell_inspector.read(cx);
+        insp.inspected_coord_for_test() == Some((5, 1))
+            && !insp.is_loading_for_test()
+            && insp.line_count_for_test() == 1
+    });
+    cx.update_window(win.into(), |_, window, cx| {
+        window.render_frame(cx);
+        let insp = view.read(cx).cell_inspector.read(cx);
+        let (preview, truncated) = insp.line_preview_for_test(0).unwrap();
+        assert_eq!(preview.len(), quarry_workbench::MAX_INSPECTOR_LINE_BYTES);
+        assert_eq!(
+            truncated,
+            10 * 1024 * 1024 - quarry_workbench::MAX_INSPECTOR_LINE_BYTES
+        );
+    })
+    .unwrap();
+
+    // 5. Pressing Escape inside the focused Cell Inspector closes it and restores grid focus.
+    cx.update_window(win.into(), |_, window, cx| {
+        view.read(cx)
+            .cell_inspector
+            .read(cx)
+            .focus_handle()
+            .focus(window, cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.dispatch_keystroke(
+        win.into(),
+        Keystroke {
+            modifiers: Modifiers::default(),
+            key: "escape".into(),
+            key_char: None,
+        },
+    );
+    cx.run_until_parked();
+    cx.update_window(win.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert!(!view.read(cx).cell_inspector.read(cx).is_open());
+        assert!(
+            view.read(cx).table.focus_handle(cx).is_focused(window),
+            "closing Cell Inspector with Escape must restore grid focus"
+        );
+    })
+    .unwrap();
+
+    // 6. Command Palette ToggleCellInspector opens the drawer cleanly.
+    cx.update_window(win.into(), |_, window, cx| {
+        let doc_id = controller.read(cx).scheduler().active_document(win_id);
+        view.update(cx, |q, cx| {
+            q.execute_palette_command(
+                win_id,
+                doc_id,
+                quarry_workbench::CommandId::ToggleCellInspector,
+                window,
+                cx,
+            );
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.update(|cx| {
+        assert!(view.read(cx).cell_inspector.read(cx).is_open());
+    });
+}
