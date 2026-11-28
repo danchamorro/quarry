@@ -1,448 +1,114 @@
 # Quarry Product Requirements Document
 
-**Version:** 0.5 (living product requirements)
+**Status:** Living product requirements (targeting `v1.0`, current beta series `v0.2.0`)
 **Platforms:** macOS and Linux / Omarchy (native Wayland / Hyprland)
-**Core engine & UI:** Rust + GPUI (`apps/quarry-gpui`, [ADR 0013](adr/0013-adopt-gpui-desktop-frontend.md))
-**Model:** Free and open source (`MIT OR Apache-2.0`)
+**Architecture:** Shared Rust streaming engine (`crates/quarry-delimited`, `crates/quarry-core`, `crates/quarry-workbench`) with a GPU-accelerated **GPUI** desktop frontend (`apps/quarry-gpui`, [ADR 0013](adr/0013-adopt-gpui-desktop-frontend.md)) and headless CLI (`apps/quarry-cli`)
+**License & Privacy:** Free and open source (`MIT OR Apache-2.0`), 100% local-first, zero telemetry, zero network calls
 
-This document records product requirements and design context. Current progress
-and claim verification live in [`docs/ROADMAP.md`](ROADMAP.md),
-[`docs/V1_CLAIM_LEDGER.md`](V1_CLAIM_LEDGER.md), and the
-[Quarry Roadmap project](https://github.com/users/danchamorro/projects/1).
+Current delivery progress, upcoming milestones, and quantitative claim verification live in [`docs/ROADMAP.md`](ROADMAP.md), [`docs/V1_CLAIM_LEDGER.md`](V1_CLAIM_LEDGER.md), and [GitHub Issues](https://github.com/danchamorro/quarry/issues).
 
-## Product vision
-Quarry is a performance-first, local-only desktop and CLI application for people who work with delimited text files too large for conventional editors and spreadsheets.
+---
 
-### North star
-> A user should be able to open a 10 GB CSV on macOS or Linux, see useful data within milliseconds, and begin navigating, filtering, sorting, and editing it without waiting for the entire file to load into memory.
+## Product Vision
 
-Longer term, Quarry makes files substantially larger than physical RAM—up to multi-terabyte files via bounded section windows—practical to inspect and transform.
+Quarry is a performance-first, local-only desktop and CLI editor for people who inspect, query, clean, reshape, and edit delimited text files far too large for spreadsheets and conventional text editors.
 
-Quarry is fully open source under MIT or Apache-2.0. All application features
-remain available in source builds, with no paid tiers, license keys, telemetry,
-or Contributor License Agreement. Official releases are free of charge. See the
-[project policy](../README.md#free-open-source-and-local-first).
+> **North star:** Open a 10+ GB CSV on macOS or Linux, see useful rows in milliseconds, and navigate, filter, sort, join, and edit it with bounded memory—or slice into multi-terabyte files via bounded section windows—without ever risking silent corruption of the source file.
 
-## Problem
-Data professionals regularly receive multi-gigabyte CSV, TSV, and pipe-delimited files. Common tools consume enormous memory, freeze, impose row limits, or require importing the data elsewhere before inspection. Quarry solves this natively on macOS and Linux (including Omarchy).
+Quarry is completely free and open source under `MIT OR Apache-2.0`. Every feature is available in source builds and official releases with no paid tiers, license keys, telemetry, or Contributor License Agreement (see the [project policy](../README.md#free-open-source-and-local-first)).
 
-## Target users
-Data operations professionals, data engineers, ETL developers, analysts, database professionals, integration engineers, and technical users receiving massive exports.
+### Target Users
 
-## Product principles
-1. Performance is a feature.
-2. File size must not imply equivalent RAM usage.
-3. Useful data appears before complete indexing.
-4. Background work must not freeze the interface.
-5. Every major feature needs a credible strategy for files larger than RAM.
-6. Benchmark continuously.
-7. The Rust engine owns data-intensive work; the UI remains thin.
-8. Do not chase feature parity with EmEditor or another editor.
-9. Correctness and data integrity outrank clever optimization.
-10. Fail explicitly rather than silently corrupt data.
+Data engineers, data operations teams, ETL and integration developers, analysts, database engineers, and technical users who regularly inspect and repair multi-gigabyte CSV, TSV, PSV, and semicolon-delimited exports.
 
-## Version 0.1 — read-only exploration
-Required: local file opening; delimiter detection/override; header selection;
-virtualized grid; navigation; jump-to-row; view-only column
-resize/hide/show/reorder; streaming search; bounded copy of one cell or row;
-one or more text or exact numeric filter predicates with same-column
-alternatives and AND across filtered columns; background structural
-indexing; safe streaming filtered export to a new file;
-progress/cancellation; parsing metadata; diagnostics and benchmarks.
+### Product Principles
 
-Column controls operate on stable source-column identities. Save As writes the
-current column order, including hidden columns, and is available after a view
-reorder alone. Ordinary Save retains document order. Header columns are
-available immediately, while extra fields in ragged rows become available when
-the viewer encounters them.
+1. **Performance is a feature.** Multi-gigabyte files are the normal case, not an edge case.
+2. **File size never dictates RAM usage.** Every operation uses bounded memory and explicit out-of-core disk spilling when needed.
+3. **Useful rows appear immediately.** Progressive opening renders the first viewport before background indexing finishes.
+4. **Never freeze the interface.** Long operations run off the UI thread with progress reporting and prompt cancellation.
+5. **Correctness and data safety outrank cleverness.** Never mutate source bytes in place without guarded atomic staging and source-identity verification; fail explicitly rather than silently corrupting data.
+6. **Thin UI over a shared Rust engine.** `quarry-core` and `quarry-workbench` own data processing, document lifecycles, and safety invariants so desktop and CLI share identical semantics.
+7. **Evidence over guesswork.** Quantitative claims are tied to reproducible benchmarks and verified in [`docs/V1_CLAIM_LEDGER.md`](V1_CLAIM_LEDGER.md).
+8. **Design for Quarry's own identity.** Solve large-file data workflows cleanly without blindly chasing feature parity with unrelated editors.
 
-Find/Replace, Filters, Text sorting, and Find Duplicates each expose their own **Match case** option.
-Each option is off by default, so its tool compares ASCII letters without
-regard to case. Turning it on uses exact case-sensitive text matching. The
-Filter to This Value and Filter Out This Value cell actions inherit the current
-Filters setting.
+---
 
-Numeric filters provide Greater than, Greater than or equal, Less than, Less
-than or equal, and inclusive Between using the same exact decimal and
-scientific notation rules as Number sorting. They do not round through
-floating point. Blank, missing, and invalid data do not match a numeric rule;
-invalid or blank bounds and reversed Between bounds fail before scanning.
-Numeric rules join the existing same-column inclusion alternatives, while
-both bounds inside a Between rule must match. Different filtered columns all
-apply, and same-column Does not equal exclusions all apply. Text semantics and
-their Match case setting remain unchanged. Numeric rules use the existing
-bounded filter index, navigation, cancellation, and source-preserving filtered
-export path. The [priority 2 validation](benchmarks/2026-09-05-numeric-filters.md)
-records exact regressions and the deterministic 1 GB workload.
+## Core Requirements (Implemented on `main`)
 
-Pre-beta priority 3 adds **Find Duplicates…** to selected numbered columns.
-Matching uses decoded selected-field tuples, ASCII-insensitive by default with
-an explicit Match case setting. Blank and missing fields match; whitespace and
-numeric spelling remain significant. A cancellable bounded external-sort pass
-prepares a private candidate and shows the extra-row count before explicit
-removal. It keeps the first occurrence in current document order, preserves
-retained rows and the fixed header, and includes unsaved values. The preview
-blocks edits until accepted or cancelled. Removal reuses working-copy history,
-Save, Save As, and Discard; cancellation and failure preserve the current
-document and source. See the [validation report](benchmarks/2026-09-05-find-remove-duplicates.md).
+### 1. Streaming Engine, Indexing & Scale
 
-Pre-beta priority 4 adds a session-level temporary working-folder choice,
-capacity checks for all output operations, and a storage review for allowances
-of at least 256 MiB. The review shows additional required bytes, available
-space, and retained versions. Folder changes preserve the active document and
-its Undo/Redo files. Save and export retain atomic staging on the destination
-volume. Failed checks, later write errors, and cancellation preserve the current
-document and remove unpublished output. The
-[user guide](USER_GUIDE.md#temporary-storage-index-cache-and-free-space) documents the
-controls and cleanup contract.
+- **Progressive open & lazy decoding:** Sample a bounded prefix to detect delimiter/header/BOM and render the first viewport immediately while background indexing builds structural checkpoints (starting at a 256 KiB byte stride on the parallel large-file path, or every 4,096 records on smaller/serial inputs) under a bounded 16 MiB memory budget.
+- **Parallel positional I/O (no `mmap` on user source files):** Read source files via positional `pread` / `seek_read` across an engine-owned bounded worker pool so external truncation or media removal surfaces as a clean error instead of `SIGBUS` ([ADR 0001](adr/0001-initial-engine.md)).
+- **SIMD structural scanning:** Runtime-dispatched 64-byte SIMD block classification (Apple Silicon NEON, x86_64 AVX2, and pure-scalar fallback) verified against a scalar reference oracle for RFC 4180 quotes, escaped quotes, embedded newlines, CRLF/LF, and malformed-record boundaries.
+- **Privacy-preserving persistent sidecar index cache:** Optional local cache under owner-only permissions (`0700`/`0600`) with keyed opaque filenames storing only structural offsets, file identity, and content hashes—never source filenames, headers, or cell values—with automatic opt-out on network/FAT/exFAT volumes and a user-accessible clear/disable control.
+- **Encodings & compression:** Explicit support for Auto (Unicode BOM, otherwise UTF-8), UTF-8, UTF-16 LE/BE, Windows-1252, and ISO-8859-1 with no silent legacy guessing; read-only streaming `.csv.gz` support via private temporary decompression ([ADR 0012](adr/0012-compressed-delimited-files.md)).
 
-Not required: general-purpose text-editor behavior, formulas, charts, database
-connectivity, plugins, cloud sync, collaboration, direct in-place byte
-mutation, or EmEditor feature parity.
+### 2. Desktop Workbench, Themes & Accessibility
 
-## Version 0.2: direct editing and transformations
+- **Native GPU-rendered desktop UI (`apps/quarry-gpui`):** Cross-platform desktop application for macOS and Linux/Omarchy (native Wayland / Hyprland, fractional scaling, native macOS menu bar and Linux in-window menu bar, XDG portals).
+- **Theme system & typography:** Built-in **System**, **Light**, WCAG AA **Dark**, and hardened live **Omarchy** theme sync backed by a single semantic token palette ([Design System](DESIGN.md)); OpenType `tnum` tabular figures with automatic numeric right-alignment and configurable inline whitespace markers.
+- **Multi-window, 200-tab scalability:** Single-process workbench supporting multiple windows and up to 200 open tabs with automatic idle-tab dormancy (evicting heavy indexes and buffers while preserving edits on dirty tabs under explicit overlay and scratch caps) and an internal `< 128` open file descriptor reservation budget ([ADR 0007](adr/0007-document-tabs.md)).
+- **Accessibility:** Full semantic trees via `accesskit_macos` (macOS) and `accesskit_unix` / AT-SPI (Linux), keyboard operability across controls and dialogs, and quiet status telemetry that announces real state transitions without flooding screen readers.
 
-Phase 5 has delivered direct in-grid header and existing data-cell editing,
-sparse unsaved document state, atomic Save with metadata-based conflict
-detection, no-clobber Save As, and repeatable Split and Combine edits applied
-from selected grid columns. Each confirmed operation materializes a private CSV
-and reopens it as the ordinary editable working copy. Explicit selected-column
-Move Selected Columns and Delete Selected Columns use that same workflow while
-the Columns manager remains view-only. Overlay-aware Find Next, Replace in Cell,
-and bounded Replace All complete Phase 5.
+### 3. Large-File Controls, Sections, Bookmarks & Live Watch
 
-Edit headers and cells directly in the grid. Existing UTF-8 data cells support
-multiline input and use sparse unsaved document state keyed by stable physical
-record row and column identity in the current indexed document. Missing fields
-in ragged rows and invalid UTF-8 cells fail explicitly rather than creating or
-corrupting data.
-Find Next scans the active indexed CSV while treating each sparse data-cell edit
-as that cell's effective value. Replace in Cell changes every non-overlapping
-literal occurrence that matches the Find/Replace case setting in the current
-matched cell and continues searching. Replace All uses that same setting,
-applies sparse cell edits first, skips the header, and streams every data row
-through the bounded private rewrite worker. A successful replacement reopens as
-the ordinary unsaved working document; no match, cancellation, or failure
-changes nothing. Filters still require unsaved data-cell edits to be saved or
-discarded. After a materialized operation is reindexed, its working CSV becomes
-the ordinary searchable document. Find Previous revisits matches already
-reached through Find Next without scanning the file backward. Split replaces
-one selected column with the fields found by a
-non-empty literal separator. Quarry derives the resulting width from the
-current data plus sparse edits, keeps the original header on the first result,
-and creates blank editable headers for additional results. If the separator is
-absent from the selected column, the operation reports that no split is
-possible and leaves the document unchanged. Combine merges at least two
-selected columns in document order with a literal separator that may be empty,
-inserts the result at the leftmost selected position, keeps that position's
-current header, and removes the selected originals. Both operations renumber
-the changed document schema.
+- **Pause / Resume Indexing & Live Resource HUD:** Pause and resume background indexing without parking worker pool threads, paired with a live HUD displaying process memory (`phys_footprint` / `VmRSS`), per-volume free disk space, and active tab counts.
+- **Bounded Section Windows (`Open Section…`):** Open arbitrary byte ranges (`Bytes`–`TiB`, verified on a 20 TiB sparse file) with outward line-boundary snapping, `Verified` vs `Speculative` boundary trust status, pausable **Verify Section Boundary**, **Save Section As New File**, and `Verified`-only **Guarded Section Splice-Save** (APFS CoW / Linux `FICLONE` with streaming fallback) ([ADR 0014](adr/0014-large-file-controller-and-section-windows.md), [ADR 0015](adr/0015-guarded-section-splice-save.md)).
+- **Session Row Bookmarks:** Up to 10,000 session-only bookmarks per document with `#` gutter markers, toolbar popover, toggle (`Cmd/Ctrl+B`) and next/previous jump (`Cmd/Ctrl+]` / `Cmd/Ctrl+[`) shortcuts, and preservation across edits, inserts/deletes, filters, and tab dormancy.
+- **Adaptive Word Wrap:** Opt-in two-line cell wrapping (`Option+Z` / `Alt+Z`) with bounded layout caching and a persisted auto-disable file-size threshold (default `300 MB`, with one-click per-tab override).
+- **Live Watch Mode:** Opt-in append-only tailing (`Cmd/Ctrl+Shift+L`) using native `kqueue` (macOS), `inotify` (Linux), or bounded network polling, with provisional tail handling, scroll-preserving follow, incremental updates for active filters, and rotation/truncation recovery ([ADR 0016](adr/0016-live-watch-mode.md)).
 
-Move takes the selected known columns in ascending current-document order and
-places them as one block at a one-based destination after removing them from
-the current order. Unselected columns retain their order, and an identity move
-is a true no-op that preserves Undo/Redo history. Delete removes only the
-explicitly selected known columns, cannot remove every known column, and
-selects the nearest surviving column. Hidden or view-reordered columns are not
-implicit output instructions. Undiscovered trailing fields in ragged rows stay
-after the arranged known columns so a partial view cannot silently discard
-data.
+### 4. Search, Filtering & Querying
 
-Users start **Split Columns…** or **Combine Columns…** from the context menu of
-the numbered column headers. A compact modal uses the current selection and
-asks only for the operation's separator. **OK** starts the operation, with any
-required storage review before writing a private working CSV. **Cancel** does
-nothing. Quarry opens and indexes the completed working file as the normal
-editable grid. Users may edit
-the resulting cells and headers or repeat any structural column command before
-writing a file. One-level structural Undo and Redo move between adjacent
-document versions. Every shown document column is horizontally reachable while
-the renderer paints at most 64 columns at once. Quarry applies the core
-65,536-column structural safety limit. Bounded display work does not otherwise
-limit Save or Save As.
+- **Overlay-aware Search & Replace:** Parallel literal **Find**, **Replace in Cell**, and bounded parallel **Replace All** honoring unsaved sparse cell edits and per-tool **Match case** settings.
+- **Multi-column Filters & Filtered Export:** Compound filters combining same-column alternatives, exclusions (`Does not equal`), text operators (`Contains`, `Equals`), and exact arbitrary-precision decimal numeric rules (`>`, `>=`, `<`, `<=`, `Between`) without floating-point rounding. Filters include unsaved sparse cell edits, refresh asynchronously on value edits/Undo, and stream cleanly to **Export Filtered…**.
+- **Bounded Regex & Filter Expressions:** Opt-in ReDoS-bounded regular expressions (`quarry search --regex`, `filter --operator regex`, `export --operator regex`, and Live Watch filter evaluation) with explicit pattern/DFA/nesting limits, plus an exact `FilterQuery` expression parser/printer (`--where EXPR` in `quarry-cli`) ready for desktop query-bar integration.
 
-Committed cell values, header names, and Replace in Cell support individual
-Undo and Redo, including repeated edits to the same target. Toolbar controls and
-standard shortcuts share the document history; focused text fields keep their
-own typing history. Adjacent structural snapshots retain earlier individual
-history, so later edits are undone before crossing the structural boundary.
-Each retained indexed version limits individual history to 1,000 combined
-Undo/Redo entries and 16 MiB of before-and-after payload, without copying the
-CSV for each edit. Oldest entries are dropped; an oversized edit clears that
-version's history and is not undoable. A new effective change clears Redo;
-unchanged or cancelled edits do not. Successful Save or Save As reopening,
-Discard, and document replacement reset history. The
-[user guide](USER_GUIDE.md#undo-and-redo-changes) defines the resource cutoff
-and command availability, and the
-[priority 1 validation](benchmarks/2026-09-04-individual-edit-undo.md) records
-regression and installed-app evidence.
+### 5. Direct Editing, Safety Guards & Recovery
 
-Users start **Move Selected Columns…** or **Delete Selected Columns** from the
-same numbered-header context menu. Move uses a compact modal with the selected
-columns and a labelled one-based destination field, plus Move and Cancel.
-Delete validates that at least one known column will survive, then starts after
-any required storage review (for allowances of at least 256 MiB). Both operations
-stream into a private working CSV and return to the ordinary editable grid.
+- **Sparse overlays & bounded history:** Direct cell and header editing (including multiline UTF-8 values) stored as a sparse overlay keyed by physical record identity; bounded individual Undo/Redo (1,000 entries / 16 MiB payload) integrated with one-level structural working-copy Undo/Redo.
+- **Atomic guarded writes:** Streaming **Save**, no-clobber **Save As**, and **Save As UTF-8** using owner-only (`0700`/`0600`) same-volume staging, flush + sync, permission/ACL preservation, and source-stamp conflict checks before replacement. Final-path symlinks require Save As.
+- **Temporary storage & preflight:** Persisted scratch folder choice (revalidated on every use; on Linux automatically avoiding RAM-backed `tmpfs` when unset), upfront capacity checks, and an explicit storage-review prompt for allowances `>= 256 MiB` ([ADR 0005](adr/0005-temporary-storage.md)).
+- **Inspect File & Recovery:** Cancellable diagnostic scan surfacing malformed quotes, encoding errors, oversized records, and ragged widths, with selective **Create Recovery Copy…** that leaves the source untouched ([Inspection validation](INSPECTION_VALIDATION.md)).
 
-Numbered column headers expose their selected state and **Split Columns…**,
-**Combine Columns…**, **Move Selected Columns…**, and **Delete Selected
-Columns** context actions to accessibility clients. Transformation dialog
-headings, selected-column summaries, labelled fields, confirmation and Cancel
-buttons, background status, and cancellation actions have stable accessible
-names and remain keyboard operable. After materialization, focus returns to the
-ordinary grid and an affected surviving working column remains selected.
+### 6. Out-of-Core Transforms & Multi-File Workflows
 
-Save As writes a selected destination, leaves the previous source unchanged,
-and makes the new file current only after success. Save writes through a
-same-directory temporary file, preserves standard file permissions, rejects
-the Save when a metadata-visible source change is found at startup or
-immediately before replacement, flushes and syncs, then atomically replaces the
-current regular file. Final-path symbolic links require Save As. Neither
-operation mutates records in place. Discard Changes removes every sparse edit
-and private working version, then restores the last opened or saved file.
+- **Adaptive 300 MB fast path & bounded pipelines:** Out-of-core Sort and Duplicates draw from a shared memory budget (default 300 MB, split across active workers) to avoid disk spills on inputs that fit in a single run while preserving identical external-merge semantics when spilling. Parallel Replace All streams through a bounded 64 MiB reorder buffer, and partitioned Hash-Join uses its own bounded 512 MiB memory budget ([ADR 0011](adr/0011-bounded-file-joining.md)).
+- **Multi-column Sort:** Stable parallel external sort across 1–16 columns supporting Text (case-insensitive/sensitive), exact arbitrary-precision Number, Natural (`v1.9 < v1.10`), explicit Date / time ([ADR 0008](adr/0008-date-time-sorting.md)), and whole-row single-level Shuffle and Reverse in both the desktop dialog and CLI, plus Character count and Word count in the core engine and CLI ([ADR 0010](adr/0010-multi-column-sorting.md)).
+- **Find & Remove Duplicates:** Parallel bounded external deduplication over selected columns or whole rows, previewing exact extra-row counts before removal and keeping the first occurrence in current order ([ADR 0004](adr/0004-bounded-duplicate-removal.md)).
+- **Structural & Cleanup Operations:** Selected-column **Clean Up** (Trim, Collapse spaces, Uppercase, Lowercase, Fill empty), **Split**, **Combine**, **Move**, **Delete**, and **Insert Rows / Columns** ([ADR 0009](adr/0009-row-column-insertion.md)), plus view-only column search/hide/reorder/auto-fit.
+- **Combine Files & Join Files:** Multi-file exact-schema streaming **Combine Files** ([ADR 0006](adr/0006-combine-files.md)) and 4-mode (Inner, Left, Right, Full) compound-key **Join Files** using partitioned multi-threaded hash-join with automatic external sort-merge skew fallback ([ADR 0011](adr/0011-bounded-file-joining.md)).
 
-Save and Save As scan the current indexed CSV, copy unedited records byte for
-byte, and serialize only records with newer sparse edits using the document
-delimiter and original line ending. For a fixed edit set, RAM depends on the
-bounded scanner record and sparse overlay rather than file size. A structural
-operation uses disk proportional to the current CSV, plus one prior private CSV
-when retained for one-level Undo. Overlay memory may grow with the number and
-size of edits.
+---
 
-Replace All reuses that private rewrite worker, progress, cancellation,
-guarded publication, and working-copy history. It retains a fixed read chunk,
-one bounded decoded record and its output fields, plus the sparse overlay and
-literal inputs rather than a file-sized replacement list. Existing 1 GB and
-12 GB persistence measurements cover the shared worker; exact core and desktop
-regressions own Replace All semantics. The
-[12 GB Replace All benchmark](benchmarks/2026-08-22-12gb-replace-all.md) and
-[50 GB capability suite](benchmarks/2026-08-22-50gb-capability-suite.md)
-measure the production Replace All path directly.
+## Remaining Requirements for `v1.0`
 
-## Version 0.3: sorting (complete)
+Tracked at milestone level in [`docs/ROADMAP.md`](ROADMAP.md) and contract level in [`docs/V1_CLAIM_LEDGER.md`](V1_CLAIM_LEDGER.md):
 
-Phase 6A adds stable single-column text sorting through a disk-aware external
-merge worker. The desktop, core, and validation CLI passed the deterministic
-1 GB and 12 GB release validation. It sorts data rows by exactly one selected
-numbered column as ASCII case-insensitive text by default, ascending or
-descending. The Sort tool's **Match case** option switches to exact
-case-sensitive ordering. The header stays fixed, missing ragged fields compare
-as empty values, and equal keys keep their current row order. With exactly one
-selected column, **Sort Rows…** opens an accessible ascending/descending
-text-sort dialog with explicit semantics, a conservative temporary-disk
-allowance, Sort, and Cancel. That worker builds
-bounded runs, caps merge payload memory, reports a conservative temporary-space
-allowance before starting, and publishes only a complete private sorted CSV.
-The desktop immediately reopens that CSV as Modified and reuses Save, Save As,
-Discard, Undo, and Redo. Cancellation, failure, or a source conflict leaves the
-current document unchanged. Exact regressions and deterministic 1 GB and 12 GB
-release runs pass with peak RSS below 20 MiB, measured temporary storage below
-the conservative estimate, bounded effective-record multiset evidence, exact
-stable-tie source-ordinal checks, unchanged source hashes, and prompt
-cancellation without leftovers.
+1. **Interactive Exploration & Keyboard-First UX:** Inline `/` desktop Query Bar (wiring the core regex and expression parser), Vim/arrow cell cursor (`hjkl`, `gg`, `G`), fuzzy Command Palette (`Cmd/Ctrl+K`), syntax-highlighted Cell Inspector Drawer, rectangular Smart Copy (`CSV`, `Markdown`, `JSON`, `SQL IN`), multi-row freeze & column pinning, async column summary headers, Focus Mode, and custom TOML themes.
+2. **File Workflows, Dialects & Interchange:** Guided File Splitter (every N rows or at bookmarks, with optional header/footer injection), Combine Files v2 (opt-in column alignment, schema-drift report, `_source_file`), `.csv.zst` compression, format converters (`CSV`/`TSV`/`PSV`/`JSON`/`NDJSON`/`Markdown`), and reusable custom CSV format profiles.
+3. **Built-In Analysis & Shaping Tools:** Out-of-core Pivot Tables (`SUM`, `AVG`, `COUNT`, `MIN`, `MAX`), Autofill (series/dates) & Flash Fill by example, Combine Lines rollup, Transpose, and Extract Frequent Strings.
+4. **Release & Platform Verification:** Signed/notarized Apple Silicon and Intel macOS releases, Linux distribution packages, hardware-verified 120 Hz frame pacing and accessibility checks, and full `V1_CLAIM_LEDGER.md` reconciliation.
 
-Phase 6B adds an explicit **Text / Number** choice to the same Sort dialog.
-Number compares signed decimal values exactly, without floating-point rounding,
-and accepts dot decimals, scientific notation with exponents between -1,000,000
-and 1,000,000, and surrounding ASCII whitespace. Empty or missing values sort
-first ascending and last descending; equivalent numbers retain source order.
-Invalid nonblank values abort with a data-row and column error before publication.
-The existing bounded runs, guarded working copy, cancellation, and history apply
-to both modes. Text remains the default. The [1 GB numeric validation](benchmarks/2026-09-04-numeric-sort.md)
-records exact output, Text compatibility, memory, temporary disk, and
-cancellation. Locale-aware and multi-column sorting are tracked in
-[issues #63](https://github.com/danchamorro/quarry/issues/63) and
-[#64](https://github.com/danchamorro/quarry/issues/64).
+### Explicit Non-Goals (for `v1.0`)
 
-Phase 6C extends the same Sort window with Character count, Word count,
-Shuffle, and Reverse. Character count measures Unicode scalar values, including
-spaces and combining marks; Word count splits on Unicode whitespace. Invalid
-UTF-8 in the selected count column aborts with row/column context. Equal counts
-remain stable. Shuffle and Reverse ignore the selected column and reorder
-whole data rows with the header fixed. They reuse guarded working copies,
-bounded merging, cancellation, and structural history. The [1 GB mode validation](benchmarks/2026-09-04-additional-sort-modes.md)
-records complete count, Shuffle, and Reverse runs.
+General-purpose code/text editing, spreadsheet formula recalculation engines, remote database connectors, cloud sync, real-time collaboration, telemetry/analytics, paid feature gating, and silent in-place byte mutation.
 
-Phase 6D ([issue #56](https://github.com/danchamorro/quarry/issues/56)) adds Date / time to the same window with explicit YYYY-MM-DD,
-MM/DD/YYYY, DD/MM/YYYY, timezone-free timestamps, and an RFC 3339 subset.
-Oldest/newest order uses exact seconds and nanoseconds. Offsets compare as UTC
-instants; clock values do not inherit a machine timezone. Blank keys follow the
-numeric blank policy; invalid nonblank values stop with row/column diagnostics.
-Original text and equal-key order are retained, with existing edits, working-copy
-history, saving, and cancellation. See [ADR 0008](adr/0008-date-time-sorting.md)
-and [supported formats](USER_GUIDE.md#date-and-time-formats).
+---
 
-## Version 0.4: desktop packaging and workflow polish (complete)
+## Performance, Packaging & Reliability Bar
 
-Phase 7A packages the desktop application as the user-facing
-`/Applications/Quarry.app`. The GPU-rendered GPUI application
-(`apps/quarry-gpui`) replaced the earlier egui prototype at the Phase 4B-3
-cutover ([ADR 0013](adr/0013-adopt-gpui-desktop-frontend.md)). Its stable bundle
-identifier is `io.github.danchamorro.quarry`, and the bundle executable is
-`Quarry`.
-The checked-in icon, Cargo version, numeric build version, full Git commit,
-source-tree status, architecture, and declared minimum macOS version are
-recorded in the bundle metadata. The initial plist declares macOS 11.0 or later.
-Current acceptance validates Apple Silicon on the documented host; it does not
-claim that the packaged binary was exercised on macOS 11.
+- **Measured benchmarks:** Every performance claim must record hardware, OS, dataset SHA-256, build mode, thread count, and cache state (see [`docs/BENCHMARK_DATASETS.md`](BENCHMARK_DATASETS.md) and [`docs/benchmarks/`](benchmarks/)).
+- **Packaging & integrity:**
+  - **macOS:** Canonical `/Applications/Quarry.app` bundle (`io.github.danchamorro.quarry`), Developer ID signed, hardened runtime, notarized, stapled, and shipped as `.dmg` and `.zip` with `SHA256SUMS` and verified local rollback ([macOS Packaging](MACOS_PACKAGING.md)).
+  - **Linux & Omarchy:** Architecture-specific `x86_64` and `arm64` tarballs with XDG `.desktop` integration, manifest-tracked `install.sh` / `uninstall.sh`, and audited third-party notices ([Linux & Omarchy Guide](LINUX_AND_OMARCHY.md)).
+- **Zero-network verification:** Release dependency graphs, linked binaries, and offline runtime socket checks verify zero HTTP/TLS/network transport dependencies across shipping targets.
 
-One command performs a locked release build, bundle assembly, signing, and
-verification. When a previous app exists, installation verifies it before
-replacement, preserves a rollback archive outside `/Applications`, restores it
-after any replacement failure, verifies the final payload, and removes the
-legacy and staging bundles. Acceptance testing uses only the canonical installed
-application.
-
-Local source builds use ad-hoc signing. Official releases are Developer ID
-signed with a hardened runtime, notarized, stapled, and Gatekeeper-assessed
-([macOS packaging](MACOS_PACKAGING.md)); ad-hoc-signed local bundles make no
-trusted-publisher claim.
-
-Phase 7B completed owner-reviewed connected-workflow dogfooding and a focused
-interface pass. The accepted toolbar keeps the grid primary, moves status and
-progress into the footer, exposes secondary controls contextually, and preserves
-keyboard and accessibility behavior. The current workflow is documented in the
-[user guide](USER_GUIDE.md).
-
-## Version 0.5: row and column operations (complete)
-
-The first row-operation slice, **Delete Selected Rows**, is implemented. Users
-select one or more data rows through the numbered row gutter, then explicitly
-remove those rows from the working document. The header is never a deletable
-data row.
-
-Deletion must stream the current document and sparse edits into a bounded
-private working CSV, preserve every unselected row, reopen the result as the
-ordinary modified document, and use the existing Save, Save As, Discard Changes,
-and one-level structural Undo and Redo lifecycle. Cancellation, failure, or a
-source conflict must leave both the current document and source unchanged and
-remove unpublished output.
-
-Filtered-view deletion resolves to "clear the filter first": **Delete Selected
-Rows** stays unavailable while a filter is active, so a visible filtered
-position is never treated as a physical data row. Row and column insertion are
-implemented in [ADR 0009](adr/0009-row-column-insertion.md) (**Insert Rows
-Above…** / **Insert Rows Below…**, **Insert Columns Before…** / **Insert
-Columns After…**).
-
-## Combining matching files
-
-**Combine Files** creates one new file from two or more saved files. Users
-select inputs, control their order and explicitly select header mode. Every
-input must use the same delimiter and every record must have the same column
-count. Header names and order match exactly, including case and whitespace.
-The first header is kept once; all data rows, including duplicates, are retained.
-
-A cancellable bounded scan validates the entire selection before writing and
-reports file-specific mismatch errors. The result summary includes column and
-row counts and exact output size. A destination-volume capacity check precedes
-the streaming write. Source stamps are rechecked before reads and publication;
-atomic no-clobber publication and staging cleanup preserve inputs and existing
-destinations on failure or cancellation.
-
-This workflow reads saved disk contents and leaves the current document and
-unsaved edits intact. The user opens the completed output explicitly through
-the existing document guard. It does not append to the active document or add
-cross-file history. See [the user guide](USER_GUIDE.md#combine-files) and
-[ADR 0006](adr/0006-combine-files.md).
-
-## Joining files by matching keys
-
-**Join Files** matches two different saved files or current open documents and
-creates a separate UTF-8 result. One to sixteen paired columns compare complete
-values, case-sensitively by default, with an explicit ASCII-only insensitive
-option. Empty or missing components never match. Source values are preserved.
-
-Users retain all Main rows, matching pairs only, all Additional rows or all rows
-from both inputs. Every matching pair is retained; duplicate groups can multiply
-rows and require explicit review. Output columns can be included, ordered and
-renamed independently of the keys. Full analysis supplies exact counts, bounded
-samples and storage allowances before guarded creation.
-
-Current documents retain source/format/edit provenance and private-generation
-ownership. Inputs stay reserved through analysis, a retained preview and creation;
-unrelated documents remain usable. Joining uses bounded external processing,
-the two-operation policy, private temporary storage and atomic no-clobber
-publication. Close/quit waits for active cleanup and retains unsaved-work review.
-The saved result opens in an ordinary editable tab without changing input history.
-
-The accepted specification and dependencies live on
-[#71](https://github.com/danchamorro/quarry/issues/71).
-See [the user guide](USER_GUIDE.md#join-files),
-[ADR 0011](adr/0011-bounded-file-joining.md), and
-[the integrated acceptance report](benchmarks/2026-10-19-join-acceptance.md).
-
-## Progressive opening
-1. Open the file and sample a bounded region.
-2. Detect likely encoding/delimiter/quote settings.
-3. Parse enough records for the first viewport.
-4. Display them immediately.
-5. Continue structural indexing in background workers.
-6. Enable index-dependent navigation and search as structural indexes become available.
-7. Start filtering directly from the source file as an independent, cancellable scan.
-
-## Performance requirements
-Reference benchmark: representative **10 GB CSV** on modern Apple Silicon with SSD storage.
-
-Initial targets:
-- First useful rows: under 3 seconds target.
-- Initial viewing memory: under 500 MB target.
-- No RAM growth proportional to file size during read-only viewing.
-- Responsive UI during indexing, search, filtering, filtered navigation,
-  export, editing, Find/Replace, Split, Combine, Move, Delete Selected Columns,
-  and Delete Selected Rows.
-- Streaming Save and Save As with memory bounded by scanner limits and the
-  sparse edit set rather than source-file size.
-- Long operations cancellable.
-- Smooth interactive scrolling.
-
-Every benchmark must identify hardware, OS, dataset, build mode, and cache state. Cold-cache performance must not be hidden behind warm-cache numbers.
-
-## Reliability and safety
-
-Opening and editing never modify source bytes. Committed edits remain unsaved
-document state until Save or Save As succeeds. Both operations stream through
-temporary output and flush and sync it before publication. Cancellation or
-failure before publication removes Quarry's temporary output without Quarry
-replacing the current file or clobbering an existing destination. Opening,
-reopening, or closing a changed document requires an explicit save or discard
-decision.
-
-Installing or updating Quarry never replaces the current installed app until a
-new candidate passes bundle verification. When a prior app exists, a failed
-replacement restores it and a successful update retains a verified rollback
-archive outside `/Applications`.
-
-Replace All follows the same rule: it publishes only a complete private working
-copy, leaves the opened or saved source unchanged, and removes unpublished
-output after no match, cancellation, or failure.
-
-## Accessibility
-The selected UI must preserve keyboard navigation, VoiceOver, focus behavior,
-native text behavior, and high-DPI rendering as features are added.
-
-## Alpha success criterion
-A 10 GB CSV is repeatedly practical to open and navigate on supported Macs while memory stays bounded and the UI remains responsive.
+---
 
 ## Positioning
-> **Quarry — the open-source, performance-first data file editor for macOS.**
 
-Another editor's trademark should not be Quarry's official tagline.
+> **Quarry — the free, open-source, GPU-accelerated editor for massive CSV and delimited files on macOS and Linux.**
 
-## Open questions
-
-Resolved since this document was first written:
-
-- **Minimum macOS version:** the bundle declares macOS 11.0 or later; packaged
-  acceptance covers Apple Silicon on macOS 26 and 27 ([macOS
-  packaging](MACOS_PACKAGING.md)).
-- **Encoding breadth:** Auto (Unicode BOM, otherwise UTF-8), UTF-8, UTF-16
-  LE/BE, Windows-1252, and ISO-8859-1, with no legacy guessing.
-- **Persistent index format and invalidation:** implemented as the optional
-  privacy-preserving sidecar index cache ([architecture](ARCHITECTURE.md#structural-indexing-and-persistent-sidecar-cache)).
-- **UI framework:** [ADR 0013](adr/0013-adopt-gpui-desktop-frontend.md) selects
-  GPUI, superseding the earlier [ADR 0003](adr/0003-select-egui-ui.md) egui
-  bake-off.
-
-Quarry, including the desktop application, engine, and benchmark-oriented CLI,
-is dual-licensed under MIT or Apache-2.0.
+Another editor's trademark must never be used as Quarry's official tagline.

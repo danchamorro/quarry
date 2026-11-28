@@ -950,26 +950,25 @@ are used alone.
    - **Text** (the default): alphabetical text order, such as `1, 10, 2`.
    - **Number**: exact numeric order, such as `1, 2, 10`.
    - **Natural**: human-friendly alphanumeric order, such as `item2, item10`.
-   - **Date / time**: chronological order using an explicit format. Choose
-     **Oldest first** or **Newest first**, then select the matching format.
-   - **Character count**: shortest or longest values first, including spaces
-     and embedded newlines. Counts Unicode scalar values, so a combining mark
-     counts separately from its base letter. It does not count UTF-8 bytes.
-   - **Word count**: fewest or most words first. A word is a nonempty group
-     separated by Unicode whitespace, including tabs and newlines.
-   - **Shuffle**: randomly reorder all data rows. Each use generates a fresh
-     shuffle; equal-looking or duplicate rows remain separate records.
-   - **Reverse**: put the last data row first and the first data row last.
-3. Use the **Direction** buttons for Text, Number, Natural, Date / time, Character count, or Word count.
-   Shuffle and Reverse operate on the current whole-row order and ignore the
-   selected column, so they have no direction control.
-4. For Text, leave **Match case** off to ignore ASCII letter case, or turn it
-   on for exact case ordering. This option applies only to Text.
-5. Click **Add sort level** for each tie-breaker. Choose its **Then by** column,
-   comparison type, direction, and case or date format independently.
-   **Move up** and **Move down** change priority; **Remove** deletes a level.
-   Up to 16 distinct columns can be used. A duplicate column must be changed or
-   removed before sorting.
+   - **Date / Time**: chronological order using an explicit format, then select
+     the matching format.
+   - **Reverse Rows**: put the last data row first and the first data row last
+     (single-level whole-row mode without a direction).
+   - **Shuffle Rows**: randomly reorder all data rows. Each use generates a
+     fresh shuffle; equal-looking or duplicate rows remain separate records
+     (single-level whole-row mode without a direction).
+   - *(CLI only — `quarry-cli`)* **Character count** (Unicode scalar values) and
+     **Word count** (nonempty Unicode whitespace-separated groups) are also
+     supported via `quarry sort-save-as`.
+3. Use **Ascending** / **Descending** for column-based levels (Text, Number,
+   Natural, or Date / Time). Reverse Rows and Shuffle Rows operate on the
+   current whole-row order and ignore the selected column and direction.
+4. For Text levels, leave **Match case** off to ignore ASCII letter case, or
+   turn it on for exact case ordering. In the desktop dialog, **Match case**
+   applies across all Text levels in the plan.
+5. Click **Add sort level** for each tie-breaker. Choose its column, comparison
+   type, direction, and date format. Up to 16 distinct columns can be used; a
+   duplicate column must be changed or removed before sorting.
 6. Review the temporary-disk allowance, then click **Sort**.
 
 Column choices show their file number and name, including hidden columns.
@@ -1036,10 +1035,11 @@ RFC 3339 uses uppercase `T` and `Z`, or a signed `HH:MM` offset within 23:59.
 Leap seconds, unknown offset `-00:00`, timezone names, and mixed date formats
 are unsupported. Quarry never guesses date order or uses the machine timezone.
 
-Blank, missing, or ASCII-whitespace-only cells sort first with **Oldest first**
-and last with **Newest first**. Surrounding ASCII whitespace is ignored when
-comparing; original cell spelling is preserved. Equal dates or UTC instants
-keep their relative order in either direction. Unsaved cell edits are included.
+Blank, missing, or ASCII-whitespace-only cells sort first with **Ascending**
+(oldest first) and last with **Descending** (newest first). Surrounding ASCII
+whitespace is ignored when comparing; original cell spelling is preserved. Equal
+dates or UTC instants keep their relative order in either direction. Unsaved
+cell edits are included.
 
 A nonblank value that does not match the selected format stops the sort and
 identifies its one-based data row and column. The current document and source

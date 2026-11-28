@@ -12,7 +12,7 @@ Intel Macs and Windows are out of scope.
 ## Release and compatibility
 
 - Current release: **[v0.2.0-beta.3](https://github.com/danchamorro/quarry/releases/tag/v0.2.0-beta.3)**,
-  **0.2.0 beta 3**, build **215**, clean revision `d57dec9`.
+  **0.2.0 beta 3**, build **215**, clean revision `c3febf3`.
 - Assets: `Quarry-v0.2.0-beta.3-macos-arm64.dmg` and `.zip`, plus
   `Quarry-v0.2.0-beta.3-linux-x86_64.tar.gz` and
   `Quarry-v0.2.0-beta.3-linux-arm64.tar.gz`. Each platform ships a matching

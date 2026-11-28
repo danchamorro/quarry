@@ -94,14 +94,16 @@ convert-utf8 provides the explicit conversion path.
 ## File access
 
 The GPUI desktop app runs in a single process across multiple windows and up to
-200 open document tabs managed by `quarry_workbench::WorkbenchScheduler`. Clean
-idle tabs transition to a dormant state (retaining canonical-path and
-`(dev, ino)` hard-link identity without holding live file descriptors or
-structural indexes) while active and dirty tabs stay hydrated within a
-code-counted `< 128` internal FD budget; at most two file-writing operations run
-concurrently across tabs, Combine Files, and Join Files. Temporary working
-files are released when their owning document closes. See
-[ADR 0007](adr/0007-document-tabs.md) for lifecycle and resource policy.
+200 open document tabs managed by `quarry_workbench::WorkbenchScheduler`. Idle
+tabs—both clean and dirty—can transition to a dormant state (retaining
+canonical-path and `(dev, ino)` hard-link identity, plus sparse edits, history,
+and private working copies for dirty tabs under explicit overlay and scratch
+caps, while evicting heavy structural indexes and row buffers) so active tabs
+stay within an internal code-counted `< 128` file-descriptor reservation budget
+(`FdBudgetLedger`); at most two file-writing operations run concurrently across
+tabs, Combine Files, and Join Files. Temporary working files are released when
+their owning document closes. See [ADR 0007](adr/0007-document-tabs.md) for
+lifecycle and resource policy.
 
 Core uses parallel positional reads (`pread` / `FileExt::read_at` with OS read-ahead hints on Unix; `seek_read` on Windows) through `crates/quarry-core/src/positional_io.rs` and a bounded `EnginePool`. Memory mapping (`mmap`) on user source files remains intentionally avoided so external file truncation or media removal surfaces as a clean `SourceChanged` or I/O error rather than an unrecoverable `SIGBUS` ([ADR 0001](adr/0001-initial-engine.md)).
 
@@ -181,14 +183,14 @@ to normal editing.
 
 Delimited files cannot be indexed correctly by blindly finding newline bytes because quoted fields may contain line breaks. The indexer tracks dialect and quote state across chunk boundaries.
 
-`crates/quarry-delimited/src/simd.rs` provides a runtime-dispatched 64-byte SIMD structural scanner (Apple Silicon NEON, x86_64 AVX2, and pure-scalar fallback) verified against a scalar oracle for byte-identical record boundaries. Multi-threaded parallel indexing splits large files across `EnginePool` workers using positional I/O, starting with one byte-offset checkpoint per 4,096 records under a 16 MiB default checkpoint budget (doubling the interval and compacting checkpoints if needed).
+`crates/quarry-delimited/src/simd.rs` provides a runtime-dispatched 64-byte SIMD structural scanner (Apple Silicon NEON, x86_64 AVX2, and pure-scalar fallback) verified against a scalar oracle for byte-identical record boundaries. Multi-threaded parallel indexing splits large files across `EnginePool` workers using positional I/O, starting with a 256 KiB byte-stride checkpoint interval (smaller or serial-path inputs start at one checkpoint per 4,096 records) under a 16 MiB default checkpoint budget, doubling the stride/interval and compacting checkpoints if needed.
 
 An optional privacy-preserving **persistent sidecar index cache** (`crates/quarry-core/src/sidecar.rs`) accelerates reopening large unchanged files. Sidecar files live under an owner-only cache directory (`0700` dir / `0600` files, `O_NOFOLLOW`/`O_EXCL` atomic writes, 256 MiB LRU cap, automatic opt-out on network/FAT/exFAT filesystems) with keyed opaque filenames and store **only** structural offsets, file identity, and content hashes—never filenames, headers, or cell contents. Users can clear the cache at any time via **File → Temporary Storage…**.
 
 ## Parallel out-of-core execution, adaptive 300 MB budget, and hash-join
-Out-of-core Sort (including Natural sort), Find & Remove Duplicates (selected columns or whole-row `DuplicateTarget::AllFields`), Replace All, and Join share bounded parallel workers and an adaptive **300 MB** single-run in-RAM fast path drawn from `EnginePool`'s shared byte budget ([ADR 0005](adr/0005-temporary-storage.md) amendment). Inputs below the budget avoid disk spills while producing byte-identical output to the multi-pass external merge path.
+Out-of-core Sort (including Natural sort) and Find & Remove Duplicates (selected columns or whole-row `DuplicateTarget::AllFields`) share bounded parallel workers and an adaptive **300 MB** default memory budget drawn from `EnginePool`'s shared byte budget ([ADR 0005](adr/0005-temporary-storage.md) amendment). When a run fits within its share of the budget it completes without disk spills while producing byte-identical output to the multi-pass external merge path; larger or worker-split runs spill seamlessly. Parallel Replace All streams through an output-byte-bounded 64 MiB reorder buffer (`crates/quarry-core/src/replace_parallel.rs`).
 
-Join Files uses a partitioned multi-threaded **Hash-Join** with key-only late materialization and automatic fallback to external sort-merge on heavy key skew ([ADR 0011](adr/0011-bounded-file-joining.md) amendment).
+Join Files uses a partitioned multi-threaded **Hash-Join** under its own 512 MiB memory budget with key-only late materialization and automatic fallback to external sort-merge on heavy key skew ([ADR 0011](adr/0011-bounded-file-joining.md) amendment).
 
 ## Pause/resume indexing, bounded section windows, splice-save, and row bookmarks
 - **Pause / Resume Indexing & Live Resource HUD:** Background indexing supports park-the-job pause/resume without parking pool worker threads (`PinReason::IndexingPaused`), paired with an off-thread (`<= 2 Hz`) Live Resource HUD reporting `phys_footprint` (macOS), `VmRSS` (Linux), and per-volume free disk space without probe writes.
@@ -291,7 +293,10 @@ destination. Public Save, Save As, and filtered export still publish without
 waiting for result consumption. Private-job elapsed time can include the wait
 for the caller's handoff; final publication errors still come from `wait()`.
 
-The GUI's working-folder choice lasts for the app session. Each generation is
+The GUI's working-folder choice persists across restarts and is revalidated on
+every use (mounted, owner-accessible, not a symlink); if validation fails, Quarry
+surfaces a notice and requires reselection rather than silently falling back to
+another volume. Each generation is
 created in an owner-only directory under that folder. A folder change retains
 previous directories needed by the active document and adjacent Undo/Redo
 snapshot. History lookup and cleanup recognize all owned directories. Existing
@@ -496,9 +501,15 @@ external run/merge budgets, source guards, progress, cancellation, storage revie
 completed-index handoff, and structural history apply unchanged. Original cell
 spelling is preserved. See [the date/time decision](adr/0008-date-time-sorting.md).
 
-Quarry sorts data rows by exactly one selected numbered column using stable,
-ASCII case-insensitive text ordering by default. The Sort tool's **Match case**
-setting switches key comparison to raw bytes. **Number** instead builds exact,
+Quarry's core sort engine supports 1 to 16 selected numbered columns ([ADR 0010](adr/0010-multi-column-sorting.md))
+using stable, ASCII case-insensitive text ordering by default. Column-based
+levels support **Text** (with **Match case** switching to raw bytes; the GPUI
+desktop dialog applies one shared **Match case** setting across Text levels),
+**Number** (exact canonical decimal byte keys), **Natural** (prefix-orderable
+ASCII digit-run keys so `v1.9 < v1.10`), **Date / time**, and—in the core engine
+and CLI—**Character count** and **Word count**. Whole-row **Shuffle** and
+**Reverse** must be used alone as a single-level plan without a sort direction.
+**Number** builds exact,
 canonical decimal byte keys once per row. The key encodes sign, decimal order,
 and significant digits so the same lexicographic run sort and merge compare
 numbers without floating-point rounding or expanding scientific exponents.
@@ -536,10 +547,14 @@ ordinals for every stable tie.
 
 The desktop waits for structural indexing to finish so the data-row count is
 known. It combines the current file size, a two-byte-per-row fidelity cushion,
-and conservative upper bounds for committed and active sparse edits. The
-allowance is four times the effective byte bound plus 68 bytes per data row.
-This covers two generations of framed runs, duplicated keys (including numeric
-encoding overhead), and the guarded output. Scan progress switches to an active
+and conservative upper bounds for committed and active sparse edits. For a single non-Natural sort key, the allowance is four times the effective
+byte bound plus 68 bytes per data row; single-key Natural plans use `6×`
+effective bytes plus 52 bytes per data row; multi-column non-Natural plans use
+`6×` effective bytes plus `48 + 44K` bytes per data row (`K` = sort level
+count); and multi-column Natural plans use `8×` effective bytes plus `48 + 44K`
+bytes per data row—covering two generations of framed runs, duplicated keys
+(including numeric and NUL-escaped Natural encoding overhead), and the guarded
+output. Scan progress switches to an active
 merge phase instead of displaying 100 percent before the worker is done.
 
 Run directories are owner-only, run files and the working CSV are owner-only,
@@ -615,8 +630,9 @@ streams those ranges through the private working-copy path, preserves the
 header and unselected records, applies sparse edits to retained records, and
 keeps Save, Save As, Discard, Undo, and Redo behavior. Filtering clears row
 selection, and row selection plus deletion remain unavailable while filtered.
-Row insertion is tracked separately in
-[issue #73](https://github.com/danchamorro/quarry/issues/73).
+Row and column insertion are implemented via the guarded rewrite path; see
+[Row and column insertion](#row-and-column-insertion) and
+[ADR 0009](adr/0009-row-column-insertion.md).
 
 A document is dirty while effective cell or header edits exist, or while its
 active CSV is a materialized working copy that differs from the last opened or

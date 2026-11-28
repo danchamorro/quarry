@@ -86,7 +86,7 @@ See the [Linux & Omarchy Guide](docs/LINUX_AND_OMARCHY.md) for Wayland/Hyprland,
 |---|---|
 | **Desktop & Platforms** | Native GPU-rendered Rust app (`apps/quarry-gpui`) for **macOS** and **Linux / Omarchy** (native Wayland / Hyprland, crisp fractional scaling, XDG portals, AccessKit accessibility on macOS and Linux AT-SPI). |
 | **Themes & Typography** | Built-in **Light**, WCAG AA **Dark**, **System**, and hardened live **Omarchy** theme sync (`View → Theme`). Right-aligned OpenType `tnum` tabular numeric columns and configurable `Show All Whitespace` inspection. |
-| **Multi-Window & Scale** | Single-process multi-window workbench supporting **up to 200 open tabs** with automatic dormant-tab eviction and a strict `< 128` open-file-descriptor cap. |
+| **Multi-Window & Scale** | Single-process multi-window workbench supporting **up to 200 open tabs** with automatic idle-tab dormancy (preserving edits on dirty tabs under explicit overlay/scratch caps) and an internal `< 128` open-file-descriptor reservation budget. |
 | **Engine & Indexing** | Parallel positional `pread`/`seek_read` I/O (no `mmap` on user source files, preventing `SIGBUS` on external truncation), 64-byte SIMD (Apple Silicon NEON / x86_64 AVX2) structural indexing, and an optional privacy-preserving **persistent sidecar index cache** (owner-only `0700`/`0600`, stores only offsets and hashes—never filenames or cell text). |
 | **Large-File Control & Sections** | **Pause / Resume Indexing** without blocking background threads, a **Live Resource HUD** (`phys_footprint` / `VmRSS` and per-volume free disk), and **Open Section…** (`Bytes`–`TiB`, verified on a 20 TiB sparse file) with outward line-boundary snapping, `Verified` vs `Speculative` trust badges, **Verify Section Boundary**, **Save Section As New File**, and `Verified`-only **Guarded Section Splice-Save** (APFS CoW / Linux `FICLONE` with streaming fallback). |
 | **Navigation & Bookmarks** | Direct `Row → Go`, Page Up/Down, and **Session Row Bookmarks** (up to 10,000 bookmarks per document, `#` gutter markers, `Bookmarks` popover, `Cmd/Ctrl+B`, `Cmd/Ctrl+]`, `Cmd/Ctrl+[`, preserved across cell edits, row inserts/deletes, filters, and tab dormancy). |
@@ -187,7 +187,7 @@ Quarry is actively working toward v1.0. High-level upcoming areas include:
 - **Analysis & Data Tools:** Out-of-core Pivot Tables (`SUM`, `AVG`, `COUNT`, `MIN`, `MAX`), Autofill (series/dates) & Flash Fill by example, Combine Lines rollup, Transpose, and Extract Frequent Strings.
 - **Cross-Platform Packaging & Release Verification:** Signed/notarized macOS builds (Apple Silicon and Intel), Linux packages, bare-metal 120 Hz & accessibility verification, and full [v1.0 Claim Ledger](docs/V1_CLAIM_LEDGER.md) reconciliation.
 
-Track active issues and priorities in the [Roadmap](docs/ROADMAP.md) and the [Quarry GitHub Project](https://github.com/users/danchamorro/projects/1).
+Track active issues and milestones in the [Roadmap](docs/ROADMAP.md) and [Open GitHub Issues](https://github.com/danchamorro/quarry/issues).
 
 ---
 
