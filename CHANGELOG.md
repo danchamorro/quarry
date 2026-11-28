@@ -13,6 +13,8 @@ GitHub pull requests.
 
 ### Added
 
+- Added a docked **Cell Inspector** drawer (`Cmd+I` / `Ctrl+I`, **View → Cell Inspector**, toolbar **Inspect**, right-click **Inspect Cell**, and Command Palette) with automatic JSON, stack-trace, and Markdown syntax highlighting, bounded line/column panning, **Copy**, and **Edit…** actions. (#242)
+- Added streaming RFC 8259 **Pretty JSON** formatting (preserving duplicate keys and exact numbers, with line/column error diagnostics and explicit size/depth limits) plus lazy **Hover-to-Peek** tooltips for truncated and multiline cells. Documented in `docs/USER_GUIDE.md`. (#242)
 - Added native arrow-key grid cursor navigation (`Up`/`Down`/`Left`/`Right`, `Home`/`End`, `Cmd/Ctrl+Arrow`, `PageUp`/`PageDown`, and `Enter`/`F2`), an explicit `Tab` focus contract (leaving the grid outside edit mode; committing and moving one cell right inside the cell editor), `/` Quick Filter, and direct **Find…** / **Filter…** toggles. (#240)
 - Added opt-in persisted **Vim Motions** (**View → Vim Motions**, off by default) supporting `hjkl`, `gg` (with a pending-key indicator and timeout), `G`, `0`, `$`, and `n`/`N` on the focused grid while staying inactive inside text inputs, IME composition, and VoiceOver chords. (#240)
 - Added a fuzzy **Command Palette** (`Cmd+K` / `Ctrl+K`, **View → Command Palette…**) and **Go to Row / Column** (`Cmd+L` / `Ctrl+L` or `#` prefix) with 1-based column indices, duplicate header disambiguation, automatic unhiding of hidden columns, and horizontal centering. Documented in `docs/USER_GUIDE.md`. (#240)
