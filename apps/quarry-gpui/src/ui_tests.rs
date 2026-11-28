@@ -5770,7 +5770,7 @@ fn query_bar_applies_syncs_rules_isolates_tabs_and_preserves_active_filter_on_er
         });
     })
     .unwrap();
-    cx.background_executor()
+    cx.background_executor
         .advance_clock(Duration::from_millis(50));
     cx.run_until_parked();
     cx.update_window(win.into(), |_, window, cx| {
@@ -5781,7 +5781,7 @@ fn query_bar_applies_syncs_rules_isolates_tabs_and_preserves_active_filter_on_er
         });
     })
     .unwrap();
-    cx.background_executor()
+    cx.background_executor
         .advance_clock(Duration::from_millis(250));
     cx.run_until_parked();
     wait_for_ui(cx, win, &controller, &view, |q, _, cx| {
