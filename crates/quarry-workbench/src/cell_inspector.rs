@@ -159,12 +159,19 @@ impl LineIndex {
         let mut line_start = 0usize;
         let mut line_idx = 0usize;
 
-        for (i, &b) in bytes.iter().enumerate() {
+        let mut i = 0usize;
+        while i < bytes.len() {
             if (i & 0xFFFF) == 0 && cancel.load(Ordering::Relaxed) {
                 return None;
             }
-            if b == b'\n' {
-                let line_bytes = strip_trailing_cr(&bytes[line_start..i]);
+            let b = bytes[i];
+            if b == b'\n' || b == b'\r' {
+                let break_len = if b == b'\r' && bytes.get(i + 1) == Some(&b'\n') {
+                    2
+                } else {
+                    1
+                };
+                let line_bytes = &bytes[line_start..i];
                 max_line_bytes = max_line_bytes.max(line_bytes.len());
                 update_fence_state(
                     line_bytes,
@@ -172,23 +179,27 @@ impl LineIndex {
                     &mut active_fence,
                     &mut fenced_body_ranges,
                 );
-                if i + 1 < bytes.len() {
+                let next_start = i + break_len;
+                if next_start < bytes.len() {
                     if starts.len() >= cap {
                         truncated_lines = true;
-                        last_line_end = i + 1;
+                        last_line_end = next_start;
                         break;
                     }
-                    starts.push(i + 1);
-                    line_start = i + 1;
+                    starts.push(next_start);
+                    line_start = next_start;
                     line_idx += 1;
                 } else {
                     line_start = bytes.len();
                     last_line_end = bytes.len();
                 }
+                i = next_start;
+            } else {
+                i += 1;
             }
         }
         if !truncated_lines && line_start < bytes.len() {
-            let line_bytes = strip_trailing_cr(&bytes[line_start..]);
+            let line_bytes = &bytes[line_start..];
             max_line_bytes = max_line_bytes.max(line_bytes.len());
             update_fence_state(
                 line_bytes,
@@ -300,10 +311,6 @@ impl LineIndex {
             }),
         }
     }
-}
-
-fn strip_trailing_cr(line: &[u8]) -> &[u8] {
-    line.strip_suffix(b"\r").unwrap_or(line)
 }
 
 /// Parses a CommonMark-compatible code fence opener/closer delimiter (`char`, `run_len`, `has_info`).
@@ -1355,7 +1362,7 @@ impl CellInspectorJob {
         raw: whitespace::Input,
         force_json: bool,
         on_done: Option<Arc<dyn Fn() + Send + Sync>>,
-    ) -> Self {
+    ) -> std::io::Result<Self> {
         let cancel = Arc::new(AtomicBool::new(false));
         let result = Arc::new(Mutex::new(None));
         let cancel_bg = Arc::clone(&cancel);
@@ -1375,15 +1382,14 @@ impl CellInspectorJob {
                 if let Some(wake) = on_done {
                     wake();
                 }
-            })
-            .ok();
+            })?;
 
-        Self {
+        Ok(Self {
             generation,
             cancel,
             result,
-            handle,
-        }
+            handle: Some(handle),
+        })
     }
 
     pub fn generation(&self) -> u64 {
@@ -1395,13 +1401,7 @@ impl CellInspectorJob {
     }
 
     pub fn try_take(&mut self) -> Option<CellInspectorSnapshot> {
-        let taken = self.result.lock().ok().and_then(|mut g| g.take());
-        if taken.is_some()
-            && let Some(handle) = self.handle.take()
-        {
-            let _ = handle.join();
-        }
-        taken
+        self.result.lock().ok().and_then(|mut g| g.take())
     }
 
     /// Blocks until the background worker finishes (intended for tests).
@@ -1557,7 +1557,7 @@ mod tests {
     fn ten_mib_single_line_cell_stays_bounded_and_fast() {
         let raw = owned(vec![b'a'; 10 * 1024 * 1024]);
         let began = Instant::now();
-        let job = CellInspectorJob::spawn(1, raw, false, None);
+        let job = CellInspectorJob::spawn(1, raw, false, None).expect("spawn inspector job");
         let snap = job.wait().expect("inspector job must finish");
         assert_eq!(snap.raw_lines.len(), 1);
         assert_eq!(snap.detected_format, CellFormat::PlainText);
@@ -1639,8 +1639,19 @@ mod tests {
         assert_eq!(oops_err.column, 2);
         assert_eq!(oops_err.byte_offset, 1);
 
-        // Lone CR line endings and multi-byte UTF-8 characters advance line/column accurately.
+        // Lone CR line endings and multi-byte UTF-8 characters advance line/column accurately
+        // and LineIndex splits bare CR consistently with the JSON diagnostic line numbers.
         let cr_non_ascii = "{\"café\": 1,\r  \"x\": ]}".as_bytes();
+        let cr_index = LineIndex::build_cancellable(cr_non_ascii, &cancel).unwrap();
+        assert_eq!(cr_index.len(), 2);
+        assert_eq!(
+            cr_index.line_slice(cr_non_ascii, 0, 1024).unwrap().text,
+            "{\"café\": 1,"
+        );
+        assert_eq!(
+            cr_index.line_slice(cr_non_ascii, 1, 1024).unwrap().text,
+            "  \"x\": ]}"
+        );
         let PrettyJsonResult::Invalid(cr_err) = pretty_print_json_streaming(cr_non_ascii, &cancel)
         else {
             panic!("expected invalid JSON error on CR + UTF-8 input");

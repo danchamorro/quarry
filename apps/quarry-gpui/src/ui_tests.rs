@@ -7220,7 +7220,10 @@ fn cell_inspector_drawer_json_pretty_invalid_stack_markdown_10mib_and_escape_foc
             super::cell_inspector::InspectorViewMode::Raw
         );
         let err = insp.pretty_json_error_for_test().unwrap();
-        assert!(err.contains("line 1"), "expected error position: {err}");
+        assert!(
+            err.contains("line 1, column 19 (byte 18)"),
+            "expected error position: {err}"
+        );
         let (raw_line, _) = insp.line_preview_for_test(0).unwrap();
         assert_eq!(raw_line, invalid_json);
     });

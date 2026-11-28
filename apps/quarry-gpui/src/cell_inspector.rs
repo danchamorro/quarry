@@ -22,6 +22,8 @@ use crate::workbench::WorkbenchController;
 const INSPECTOR_LINE_HEIGHT_PX: f32 = 20.0;
 const INSPECTOR_HPAN_STEP_CHARS: usize = 24;
 const INSPECTOR_PAGE_LINES: usize = 16;
+const INSPECTOR_VISIBLE_SCAN_LINES: usize = 32;
+pub(crate) const MAX_INLINE_EDIT_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InspectorViewMode {
@@ -245,8 +247,45 @@ impl CellInspector {
         }
     }
 
+    fn max_visible_line_preview_chars(&self) -> usize {
+        let Some(snap) = &self.snapshot else {
+            return 0;
+        };
+        let (bytes, line_index): (&[u8], &quarry_workbench::LineIndex) = if self.view_mode
+            == InspectorViewMode::Pretty
+            && let Some(PrettyJsonResult::Ready { text, lines }) = &snap.pretty_json
+        {
+            (text.as_bytes(), lines)
+        } else {
+            (snap.raw.bytes(), &snap.raw_lines)
+        };
+        let start = self.current_viewport_top_line();
+        let end = start
+            .saturating_add(INSPECTOR_VISIBLE_SCAN_LINES)
+            .min(line_index.len());
+        let mut max_chars = 0usize;
+        for line_idx in start..end {
+            if let Some(slice) = line_index.line_slice(bytes, line_idx, MAX_INSPECTOR_LINE_BYTES) {
+                let capped = if slice.text.len() > MAX_INSPECTOR_LINE_BYTES {
+                    let mut end = MAX_INSPECTOR_LINE_BYTES;
+                    while end > 0 && !slice.text.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    &slice.text[..end]
+                } else {
+                    slice.text.as_ref()
+                };
+                max_chars = max_chars.max(capped.chars().count());
+            }
+        }
+        max_chars
+    }
+
     fn pan_horizontal(&mut self, next_col: usize, cx: &mut Context<Self>) {
-        let max_col = MAX_INSPECTOR_LINE_BYTES.saturating_sub(16);
+        let max_line_chars = self.max_visible_line_preview_chars();
+        let max_col = max_line_chars
+            .saturating_sub(16)
+            .min(MAX_INSPECTOR_LINE_BYTES.saturating_sub(16));
         let clamped = next_col.min(max_col);
         if clamped != self.h_offset_chars {
             self.h_offset_chars = clamped;
@@ -454,7 +493,7 @@ impl CellInspector {
     fn slice_line_with_pan(
         &self,
         line_idx: usize,
-    ) -> Option<(String, Vec<quarry_workbench::TokenSpan>, usize, usize, bool)> {
+    ) -> Option<(String, Vec<quarry_workbench::TokenSpan>, usize, bool, bool)> {
         let snap = self.snapshot.as_ref()?;
         let (bytes, line_index, format): (&[u8], &quarry_workbench::LineIndex, CellFormat) =
             if self.view_mode == InspectorViewMode::Pretty
@@ -468,9 +507,8 @@ impl CellInspector {
         let in_fence = format == CellFormat::Markdown && line_index.in_code_fence_before(line_idx);
         let slice = line_index.line_slice(bytes, line_idx, MAX_INSPECTOR_LINE_BYTES)?;
         let tokenized = tokenize_line(&slice.text, format, in_fence, MAX_INSPECTOR_LINE_BYTES);
-        let total_truncated = slice
-            .truncated_bytes
-            .saturating_add(tokenized.truncated_bytes);
+        let source_truncated_bytes = slice.truncated_bytes;
+        let display_truncated = slice.truncated_bytes > 0 || tokenized.truncated_bytes > 0;
 
         let pan_byte_start = tokenized
             .text
@@ -498,8 +536,8 @@ impl CellInspector {
         Some((
             visible_text,
             spans,
-            total_truncated,
-            slice.total_line_bytes,
+            source_truncated_bytes,
+            display_truncated,
             overflows_drawer,
         ))
     }
@@ -508,7 +546,7 @@ impl CellInspector {
         let resolved = self.controller.read(cx).resolved_theme();
         let tokens = resolved.palette;
         let appearance = resolved.appearance;
-        let Some((mut text_content, spans, total_truncated, _, overflows_drawer)) =
+        let Some((mut text_content, spans, _, display_truncated, overflows_drawer)) =
             self.slice_line_with_pan(line_idx)
         else {
             return div().h(px(INSPECTOR_LINE_HEIGHT_PX)).into_any_element();
@@ -567,7 +605,7 @@ impl CellInspector {
                     .child(styled),
             );
 
-        if total_truncated > 0 {
+        if display_truncated {
             row = row.child(
                 div()
                     .flex_shrink_0()
@@ -668,9 +706,14 @@ impl Render for CellInspector {
             .snapshot
             .as_ref()
             .is_some_and(|s| s.valid_utf8 || self.has_ready_pretty_json());
+        let within_inline_edit_limit = self
+            .snapshot
+            .as_ref()
+            .is_some_and(|s| s.raw.bytes().len() <= MAX_INLINE_EDIT_BYTES);
         let can_edit = target.as_ref().is_some_and(|t| t.can_edit)
             && !self.absent_cell
-            && self.snapshot.as_ref().is_some_and(|s| s.valid_utf8);
+            && self.snapshot.as_ref().is_some_and(|s| s.valid_utf8)
+            && within_inline_edit_limit;
         let is_json = self
             .snapshot
             .as_ref()
@@ -810,11 +853,8 @@ impl Render for CellInspector {
                     }
                     "end" => {
                         cx.stop_propagation();
-                        let cur = this.current_viewport_top_line();
-                        if let Some((text, _, _, _, _)) = this.slice_line_with_pan(cur) {
-                            let total_chars = self_line_chars(this.h_offset_chars, &text);
-                            this.pan_horizontal(total_chars.saturating_sub(32), cx);
-                        }
+                        let max_chars = this.max_visible_line_preview_chars();
+                        this.pan_horizontal(max_chars.saturating_sub(32), cx);
                     }
                     _ => {}
                 }
@@ -1021,6 +1061,11 @@ impl Render for CellInspector {
             .child(
                 Button::new("cell-inspector-edit")
                     .label("Edit…")
+                    .tooltip(if !within_inline_edit_limit && self.snapshot.is_some() {
+                        "Cells larger than 1 MiB cannot be edited inline"
+                    } else {
+                        "Edit cell"
+                    })
                     .ghost()
                     .xsmall()
                     .disabled(!can_edit)
@@ -1037,16 +1082,26 @@ impl Render for CellInspector {
 
         // Diagnostic banners (invalid JSON error position, nesting/size caps, line budget, invalid UTF-8)
         let long_line_notice: Option<String> = self.snapshot.as_ref().and_then(|snap| {
-            let active_lines = if self.view_mode == InspectorViewMode::Pretty
-                && let Some(PrettyJsonResult::Ready { lines, .. }) = &snap.pretty_json
+            let (active_lines, active_bytes_len) = if self.view_mode == InspectorViewMode::Pretty
+                && let Some(PrettyJsonResult::Ready { text, lines }) = &snap.pretty_json
             {
-                lines
+                (lines, text.len())
             } else {
-                &snap.raw_lines
+                (&snap.raw_lines, snap.raw.bytes().len())
             };
             (active_lines.max_line_bytes() > MAX_INSPECTOR_LINE_BYTES).then(|| {
+                let tail = if !can_copy {
+                    "invalid UTF-8 cannot be copied as text.".to_string()
+                } else if active_bytes_len > MAX_COPY_BYTES {
+                    format!(
+                        "exceeds the {} clipboard limit.",
+                        format_byte_count(MAX_COPY_BYTES)
+                    )
+                } else {
+                    "use Copy for full text.".to_string()
+                };
                 format!(
-                    "Long line capped at {} per line (longest line: {}); use Copy for full text.",
+                    "Long line capped at {} per line (longest line: {}); {tail}",
                     format_byte_count(MAX_INSPECTOR_LINE_BYTES),
                     format_byte_count(active_lines.max_line_bytes()),
                 )
@@ -1159,10 +1214,6 @@ impl Render for CellInspector {
 
         drawer
     }
-}
-
-fn self_line_chars(offset: usize, visible_tail: &str) -> usize {
-    offset.saturating_add(visible_tail.chars().count())
 }
 
 fn format_byte_count(bytes: usize) -> String {

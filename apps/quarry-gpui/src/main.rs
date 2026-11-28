@@ -227,6 +227,13 @@ impl QuarryWindow {
                             .display_position_for_source(*source_row, *source_col, cx)
                         {
                             this.edit_cell(table_row, table_col, window, cx);
+                        } else {
+                            this.set_message(
+                                AppMessage::warning(
+                                    "Scroll back to the inspected row before editing this cell.",
+                                ),
+                                cx,
+                            );
                         }
                     }
                     CellInspectorEvent::CopyText { text, label } => {
@@ -1478,6 +1485,10 @@ impl QuarryWindow {
         let Some((source_row, source_col)) =
             self.table.read(cx).delegate().cell_at(row, column, cx)
         else {
+            self.set_message(
+                AppMessage::warning("Scroll back to the inspected row before editing this cell."),
+                cx,
+            );
             return;
         };
         let (doc_id, title, initial_value, disabled_reason) = {
@@ -1489,9 +1500,19 @@ impl QuarryWindow {
                 return;
             };
             let source = doc.source_cell(source_row, source_col);
-            let disabled = doc.cell_edit_disabled_reason(source);
             let value_bytes = doc.effective_cell(source_row, source_col).unwrap_or(&[]);
-            let value = String::from_utf8_lossy(value_bytes).into_owned();
+            let disabled = if let Some(reason) = doc.document_cell_edit_disabled_reason() {
+                Some(reason)
+            } else if value_bytes.len() > cell_inspector::MAX_INLINE_EDIT_BYTES {
+                Some("Cells larger than 1 MiB cannot be edited inline.")
+            } else {
+                doc.cell_edit_disabled_reason(source)
+            };
+            let value = if disabled.is_some() {
+                String::new()
+            } else {
+                String::from_utf8_lossy(value_bytes).into_owned()
+            };
             (doc_id, doc.column_name(source_col), value, disabled)
         };
         if let Some(reason) = disabled_reason {
