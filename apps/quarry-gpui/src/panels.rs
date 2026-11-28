@@ -15,6 +15,7 @@ use quarry_core::{
     CaseSensitivity, Encoding, FilterOperator, FilterPredicate, FilterQuery, HeaderMode,
     OpenOptions,
 };
+use quarry_workbench::DocumentId;
 
 use crate::menus::{encoding_from_label, encoding_index, encoding_label};
 use crate::workbench::{BookmarkListEntry, DocumentSnapshot};
@@ -95,6 +96,7 @@ pub enum Tool {
 
 pub struct Panels {
     path: Option<PathBuf>,
+    active_doc: Option<(DocumentId, u64)>,
     headers: Vec<String>,
     order: Vec<usize>,
     shown: Vec<bool>,
@@ -207,6 +209,7 @@ impl Panels {
         ];
         Self {
             path: None,
+            active_doc: None,
             headers: vec![],
             order: vec![],
             shown: vec![],
@@ -243,6 +246,17 @@ impl Panels {
         }
     }
 
+    fn activate_tool(&mut self, tool: Tool, window: &mut Window, cx: &mut Context<Self>) {
+        if tool == Tool::Format {
+            self.restore_format(window, cx);
+        } else if tool == Tool::Filters && self.last_synced_filter != self.latest_filter_key {
+            let query = self.latest_filter_query.clone();
+            self.sync_rules_from_query(query.as_ref(), window, cx);
+            self.last_synced_filter = self.latest_filter_key;
+        }
+        self.active = Some(tool);
+    }
+
     pub fn open_tool(&mut self, tool: Tool, window: &mut Window, cx: &mut Context<Self>) {
         if self.path.is_none() {
             return;
@@ -250,14 +264,7 @@ impl Panels {
         if self.active == Some(tool) {
             self.close(window, cx);
         } else {
-            if tool == Tool::Format {
-                self.restore_format(window, cx);
-            } else if tool == Tool::Filters && self.last_synced_filter != self.latest_filter_key {
-                let query = self.latest_filter_query.clone();
-                self.sync_rules_from_query(query.as_ref(), window, cx);
-                self.last_synced_filter = self.latest_filter_key;
-            }
-            self.active = Some(tool);
+            self.activate_tool(tool, window, cx);
             cx.notify();
         }
     }
@@ -266,6 +273,7 @@ impl Panels {
         if self.path.is_some() {
             self.close(window, cx);
             self.path = None;
+            self.active_doc = None;
             self.headers.clear();
             self.order.clear();
             self.shown.clear();
@@ -336,10 +344,14 @@ impl Panels {
                 self.restore_format(window, cx);
             }
         }
-        let added_columns = self.path.as_ref() == Some(&info.path)
+        let doc_key = (info.document_id, info.instance_id);
+        let doc_changed = self.active_doc != Some(doc_key);
+        let added_columns = !doc_changed
+            && self.path.as_ref() == Some(&info.path)
             && info.headers.len() > self.headers.len()
             && info.headers.starts_with(&self.headers);
-        let renamed_headers = self.path.as_ref() == Some(&info.path)
+        let renamed_headers = !doc_changed
+            && self.path.as_ref() == Some(&info.path)
             && info.headers.len() == self.headers.len()
             && info.headers != self.headers;
         if added_columns {
@@ -383,8 +395,12 @@ impl Panels {
                 });
             }
             self.refresh_matches(cx);
-        } else if self.path.as_ref() != Some(&info.path) || self.headers != info.headers {
+        } else if doc_changed
+            || self.path.as_ref() != Some(&info.path)
+            || self.headers != info.headers
+        {
             self.close(window, cx);
+            self.active_doc = Some(doc_key);
             self.path = Some(info.path.clone());
             self.headers = info.headers.clone();
             let mut is_shown = vec![false; self.headers.len()];
@@ -671,10 +687,7 @@ impl Panels {
                         && this.active.is_some()
                         && this.active != Some(tool)
                     {
-                        if tool == Tool::Format {
-                            this.restore_format(window, cx);
-                        }
-                        this.active = Some(tool);
+                        this.activate_tool(tool, window, cx);
                         cx.notify();
                     }
                 }),
@@ -692,10 +705,7 @@ impl Panels {
                     )
                     .on_open_change(cx.listener(move |this, open, window, cx| {
                         if *open {
-                            if tool == Tool::Format {
-                                this.restore_format(window, cx);
-                            }
-                            this.active = Some(tool);
+                            this.activate_tool(tool, window, cx);
                         } else if this.active == Some(tool) {
                             this.close(window, cx);
                         }

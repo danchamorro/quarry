@@ -582,9 +582,57 @@ fn live_watch_ignores_superseded_filter_snapshot_while_replacement_attaches() {
                 .is_some_and(|i| i.matches_found() == 1)
     }));
 
-    // Start replacement filter B (`INFO`) and immediately append another `WARN` row so the
-    // watcher publishes a snapshot while A is still installed.
+    // Deterministically simulate the window where filter B (`INFO`) is active on the Document
+    // while the watcher still has filter A (`WARN`) attached: append another `WARN` row and wait
+    // for the watcher to publish the new row + 2-match WARN snapshot, then verify `poll_live_watch`
+    // ingests the appended row while ignoring the mismatched WARN filter snapshot.
     let info_query = FilterQuery::single(1, FilterOperator::Equals, b"INFO".to_vec());
+    {
+        let doc = scheduler
+            .tab_mut(doc_id)
+            .unwrap()
+            .document
+            .as_mut()
+            .unwrap();
+        doc.filter_query = Some(info_query.clone());
+        doc.filter_index = None;
+        doc.filter_index_tag = None;
+        doc.filter_status = Some("Filtering live file…".into());
+        if let Some(progress) = doc.filter_progress.as_mut() {
+            progress.matches_found = 0;
+            progress.done = false;
+        }
+    }
+    let mut writer = FsOpenOptions::new().append(true).open(&path).unwrap();
+    writer.write_all(b"40000,WARN\n").unwrap();
+    writer.flush().unwrap();
+
+    assert!(wait_until(Duration::from_secs(5), || {
+        let doc = scheduler
+            .tab_mut(doc_id)
+            .unwrap()
+            .document
+            .as_mut()
+            .unwrap();
+        let _ = doc.poll_live_watch().unwrap();
+        // Ordinary watch progress must still ingest row 40000 (40_002 committed rows incl. header).
+        doc.progress.rows_scanned >= 40_002
+    }));
+    {
+        let doc = scheduler.tab(doc_id).unwrap().document.as_ref().unwrap();
+        assert!(
+            doc.filter_index.is_none(),
+            "stale filter A index must never be installed while filter B is active"
+        );
+        assert_eq!(doc.filter_status.as_deref(), Some("Filtering live file…"));
+        assert_eq!(
+            doc.filter_progress.as_ref().map(|p| p.matches_found),
+            Some(0)
+        );
+        assert_eq!(doc.filter_progress.as_ref().map(|p| p.done), Some(false));
+    }
+
+    // Now start and complete the real replacement attachment for B (`INFO`, 39_999 matches).
     scheduler
         .tab_mut(doc_id)
         .unwrap()
@@ -593,23 +641,10 @@ fn live_watch_ignores_superseded_filter_snapshot_while_replacement_attaches() {
         .unwrap()
         .start_filter(info_query.clone())
         .unwrap();
-    let mut writer = FsOpenOptions::new().append(true).open(&path).unwrap();
-    writer.write_all(b"40000,WARN\n").unwrap();
-    writer.flush().unwrap();
-
-    // Poll until replacement B finishes attaching, checking on every step that A's match count
-    // (1 or 2) is NEVER installed or published while `filter_query` is B (`INFO`).
     assert!(wait_until(Duration::from_secs(5), || {
-        let _ = scheduler.poll_all();
+        let errors = scheduler.poll_all();
+        assert!(errors.is_empty(), "live watch poll failed: {errors:?}");
         let doc = scheduler.tab(doc_id).unwrap().document.as_ref().unwrap();
-        if let Some(idx) = doc.filter_index.as_ref() {
-            assert_eq!(
-                idx.query(),
-                &info_query,
-                "stale filter A index must never be installed while filter B is active"
-            );
-            assert_eq!(idx.matches_found(), 39_999);
-        }
         doc.live_watch_filter_attach.is_none()
             && doc
                 .filter_index

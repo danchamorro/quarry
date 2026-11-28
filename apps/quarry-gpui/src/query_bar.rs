@@ -33,6 +33,7 @@ struct QueryTabDraft {
     draft_dirty: bool,
     last_synced_query: Option<FilterQuery>,
     last_synced_headers: Vec<String>,
+    last_synced_expression: Option<Result<String, String>>,
     print_omitted_reason: Option<String>,
 }
 
@@ -46,9 +47,10 @@ pub struct QueryBar {
     live_mode: bool,
     live_override: Option<bool>,
     draft_dirty: bool,
-    awaiting_apply_sync: bool,
+    pending_applied_query: Option<FilterQuery>,
     last_synced_query: Option<FilterQuery>,
     last_synced_headers: Vec<String>,
+    last_synced_expression: Option<Result<String, String>>,
     draft_generation: u64,
     suppress_change: bool,
     parse_error: Option<FilterExprError>,
@@ -95,9 +97,10 @@ impl QueryBar {
             live_mode: true,
             live_override: None,
             draft_dirty: false,
-            awaiting_apply_sync: false,
+            pending_applied_query: None,
             last_synced_query: None,
             last_synced_headers: Vec::new(),
+            last_synced_expression: None,
             draft_generation: 0,
             suppress_change: false,
             parse_error: None,
@@ -136,6 +139,10 @@ impl QueryBar {
         }
     }
 
+    pub fn cancel_pending_apply_sync(&mut self) {
+        self.pending_applied_query = None;
+    }
+
     pub fn clear_document(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.active_doc = None;
         self.tab_drafts.clear();
@@ -145,9 +152,10 @@ impl QueryBar {
         self.live_override = None;
         self.live_mode = true;
         self.draft_dirty = false;
-        self.awaiting_apply_sync = false;
+        self.pending_applied_query = None;
         self.last_synced_query = None;
         self.last_synced_headers.clear();
+        self.last_synced_expression = None;
         self.set_input_silently("", window, cx);
         self.open = false;
         cx.notify();
@@ -175,7 +183,7 @@ impl QueryBar {
                 self.save_active_draft(cx);
             }
             self.debounce_task = None;
-            self.awaiting_apply_sync = false;
+            self.pending_applied_query = None;
             self.active_doc = Some(doc_key);
             if let Some(saved) = self.tab_drafts.get(&info.document_id).cloned() {
                 self.live_override = saved.live_override;
@@ -186,6 +194,7 @@ impl QueryBar {
                 self.draft_dirty = saved.draft_dirty;
                 self.last_synced_query = saved.last_synced_query;
                 self.last_synced_headers = saved.last_synced_headers;
+                self.last_synced_expression = saved.last_synced_expression;
                 self.print_omitted_reason = saved.print_omitted_reason;
                 self.set_input_silently(&saved.text, window, cx);
             } else {
@@ -198,6 +207,7 @@ impl QueryBar {
                 self.draft_dirty = false;
                 self.last_synced_query = None;
                 self.last_synced_headers = info.headers.clone();
+                self.last_synced_expression = None;
                 self.print_omitted_reason = None;
                 self.set_input_silently("", window, cx);
             }
@@ -206,17 +216,21 @@ impl QueryBar {
         }
         self.tab_drafts.retain(|id, _| open_tabs.contains(id));
 
-        // Track applied query changes, header renames, and dirty drafts independently of
+        // Track applied query changes, header renames (including changes past the 120-char
+        // display-header truncation via `filter_expression`), and dirty drafts independently of
         // `filter_query_generation` so cell-edit rescans never overwrite an unapplied draft
         // while header renames refresh clean expressions and revalidate dirty drafts.
         let query_changed = self.last_synced_query != info.filter_query;
-        let headers_changed = self.last_synced_headers != info.headers;
-        let force_apply_sync = self.awaiting_apply_sync && info.filter_query.is_some();
+        let headers_changed = self.last_synced_headers != info.headers
+            || self.last_synced_expression != info.filter_expression;
+        let force_apply_sync = self.pending_applied_query.is_some()
+            && info.filter_query.as_ref() == self.pending_applied_query.as_ref();
         if doc_changed || query_changed || headers_changed || force_apply_sync {
             self.last_synced_query = info.filter_query.clone();
             self.last_synced_headers = info.headers.clone();
+            self.last_synced_expression = info.filter_expression.clone();
             if force_apply_sync {
-                self.awaiting_apply_sync = false;
+                self.pending_applied_query = None;
             }
             let should_sync_expression = if query_changed || force_apply_sync {
                 true
@@ -273,6 +287,7 @@ impl QueryBar {
                     draft_dirty: self.draft_dirty,
                     last_synced_query: self.last_synced_query.clone(),
                     last_synced_headers: self.last_synced_headers.clone(),
+                    last_synced_expression: self.last_synced_expression.clone(),
                     print_omitted_reason: self.print_omitted_reason.clone(),
                 },
             );
@@ -389,13 +404,25 @@ impl QueryBar {
                 }
                 match query {
                     Some(q) => {
-                        if current.filter_query.as_ref() != Some(&q) {
-                            this.awaiting_apply_sync = true;
-                            cx.emit(QueryBarEvent::Apply(q));
+                        // Reparse against current headers before emitting so a header rename
+                        // during the debounce window cannot apply a stale column mapping.
+                        match this.revalidate_current(cx) {
+                            Some(Ok(reparsed)) if reparsed == q => {
+                                if current.filter_query.as_ref() != Some(&reparsed) {
+                                    this.pending_applied_query = Some(reparsed.clone());
+                                    cx.emit(QueryBarEvent::Apply(reparsed));
+                                }
+                            }
+                            _ => {
+                                cx.notify();
+                            }
                         }
                     }
                     None => {
-                        if current.filter_active {
+                        if this.input.read(cx).value().trim().is_empty()
+                            && this.print_omitted_reason.is_none()
+                            && current.filter_active
+                        {
                             cx.emit(QueryBarEvent::Clear);
                         }
                     }
@@ -406,9 +433,15 @@ impl QueryBar {
 
     pub fn apply_now(&mut self, cx: &mut Context<Self>) {
         self.debounce_task = None;
+        let Some(info) = self.controller.read(cx).active_snapshot(self.window_id) else {
+            return;
+        };
+        if info.busy || info.export_running || info.search_running || info.source_changed {
+            return;
+        }
         match self.revalidate_current(cx) {
             Some(Ok(query)) => {
-                self.awaiting_apply_sync = true;
+                self.pending_applied_query = Some(query.clone());
                 cx.emit(QueryBarEvent::Apply(query));
             }
             Some(Err(_)) => {
@@ -420,12 +453,7 @@ impl QueryBar {
                 if self.print_omitted_reason.is_some() {
                     return;
                 }
-                let has_active_filter = self
-                    .controller
-                    .read(cx)
-                    .active_snapshot(self.window_id)
-                    .is_some_and(|s| s.filter_active);
-                if has_active_filter {
+                if info.filter_active {
                     cx.emit(QueryBarEvent::Clear);
                 }
             }
@@ -434,19 +462,20 @@ impl QueryBar {
     }
 
     pub fn clear_now(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(info) = self.controller.read(cx).active_snapshot(self.window_id) else {
+            return;
+        };
+        if info.busy || info.export_running || info.search_running || info.source_changed {
+            return;
+        }
         self.debounce_task = None;
         self.draft_dirty = false;
-        self.awaiting_apply_sync = false;
+        self.pending_applied_query = None;
         self.parse_error = None;
         self.print_omitted_reason = None;
         self.set_input_silently("", window, cx);
         self.input.update(cx, |input, cx| input.focus(window, cx));
-        let has_active_filter = self
-            .controller
-            .read(cx)
-            .active_snapshot(self.window_id)
-            .is_some_and(|s| s.filter_active);
-        if has_active_filter {
+        if info.filter_active {
             cx.emit(QueryBarEvent::Clear);
         }
         cx.notify();

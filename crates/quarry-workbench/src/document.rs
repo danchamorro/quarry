@@ -3348,6 +3348,9 @@ impl Document {
                         if !self.filtered_rows.is_empty() {
                             self.filtered_rows_tag = Some(tag);
                         }
+                        if matches > 0 {
+                            let _ = self.schedule_filter_buffer(self.filter_viewport_start);
+                        }
                     } else {
                         self.filter_query = None;
                         self.filter_index = None;
@@ -3428,6 +3431,18 @@ impl Document {
                         }
                         self.filter_status =
                             Some(format!("Filter cancelled after {matches} matches."));
+                    }
+                    if matches > 0
+                        && (self.filtered_rows.is_empty()
+                            || self.filter_viewport_start < self.filter_buffer_start
+                            || self.filter_viewport_start
+                                >= self.filter_buffer_start + self.filtered_rows.len() as u64)
+                        && self
+                            .schedule_filter_buffer(self.filter_viewport_start)
+                            .is_err()
+                    {
+                        self.pending_filter_read =
+                            self.filter_read_window(self.filter_viewport_start);
                     }
                 } else {
                     self.filter_query = None;
@@ -3819,6 +3834,15 @@ impl Document {
     }
 
     pub fn poll_filter_read(&mut self) -> Result<(), String> {
+        if self.filter_read.is_none() {
+            if let Some(pending) = self.pending_filter_read.take() {
+                self.schedule_filter_buffer_inner(
+                    pending.start_match,
+                    self.is_live_watching() && self.live_watch_tail_follow,
+                )?;
+            }
+            return Ok(());
+        }
         let done = self
             .filter_read
             .as_ref()
@@ -8685,6 +8709,10 @@ mod tests {
             let q2 = doc
                 .parse_filter_expression("state == \"FL\"", CaseSensitivity::Sensitive)
                 .unwrap();
+            // Clear buffered rows before the failing replacement so we also prove recovery
+            // reschedules a page read for the current viewport under the restored tag.
+            doc.filtered_rows.clear();
+            doc.filtered_rows_tag = None;
             let start_res = doc.start_filter(q2);
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
             assert!(start_res.is_err());
@@ -8692,17 +8720,19 @@ mod tests {
             assert_eq!(doc.filter_query.as_ref(), Some(&q1));
             let reconciled_tag = doc.current_filter_tag();
             assert_eq!(doc.filter_index_tag, Some(reconciled_tag));
+            assert!(
+                doc.filter_read.is_some() || doc.pending_filter_read.is_some(),
+                "recovery must reschedule a filtered page read when viewport is outside buffer"
+            );
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while doc.filter_rows_loading() {
+                assert!(Instant::now() < deadline);
+                doc.poll_filter().unwrap();
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert_eq!(doc.filtered_rows.len(), 2);
             assert_eq!(doc.filtered_rows_tag, Some(reconciled_tag));
-            let window = doc.filter_read_window(0).unwrap();
-            let rows: Vec<FilterMatch> = doc.filtered_rows.iter().map(|r| (**r).clone()).collect();
-            assert!(doc.accept_filter_page_result(
-                reconciled_tag,
-                window,
-                rows,
-                Instant::now(),
-                false,
-                false,
-            ));
+            assert_eq!(doc.filtered_rows[0].fields[0], b"TX");
         }
 
         doc.shutdown();

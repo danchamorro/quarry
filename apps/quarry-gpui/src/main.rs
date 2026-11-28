@@ -187,6 +187,8 @@ impl QuarryWindow {
                             controller.start_filter_active(this.window_id, query.clone(), cx)
                         });
                         if let Err(error) = res {
+                            this.query_bar
+                                .update(cx, |bar, _| bar.cancel_pending_apply_sync());
                             this.set_message(AppMessage::error(error), cx);
                         }
                     }

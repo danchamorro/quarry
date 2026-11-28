@@ -2732,7 +2732,8 @@ fn waking_dormant_filtered_tab_and_superseding_filter_discards_pending_restore()
     scheduler.start_filter(ids[0], keep_query).unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
     while {
-        let _ = scheduler.poll_all();
+        let errors = scheduler.poll_all();
+        assert!(errors.is_empty(), "initial filter poll failed: {errors:?}");
         let doc = scheduler.tab(ids[0]).unwrap().document.as_ref().unwrap();
         doc.filter_job.is_some() || doc.filter_rows_loading()
     } {
@@ -2769,7 +2770,11 @@ fn waking_dormant_filtered_tab_and_superseding_filter_discards_pending_restore()
 
     let deadline = Instant::now() + Duration::from_secs(5);
     while {
-        let _ = scheduler.poll_all();
+        let errors = scheduler.poll_all();
+        assert!(
+            errors.is_empty(),
+            "replacement filter poll failed: {errors:?}"
+        );
         let doc = scheduler.tab(ids[0]).unwrap().document.as_ref().unwrap();
         doc.filter_job.is_some() || doc.filter_rows_loading()
     } {
@@ -2779,6 +2784,12 @@ fn waking_dormant_filtered_tab_and_superseding_filter_discards_pending_restore()
 
     let doc = scheduler.tab(ids[0]).unwrap().document.as_ref().unwrap();
     assert_eq!(doc.available_filter_rows(), 1);
+    assert_eq!(
+        doc.filtered_rows.len(),
+        1,
+        "replacement page must be loaded so pending restore evaluation was exercised"
+    );
+    assert_eq!(doc.filtered_rows[0].fields[1], b"ONLY_ONE");
     assert_eq!(
         doc.filter_viewport_start, 0,
         "superseded wake must NOT apply previous filter's viewport offset (150) onto replacement filter"

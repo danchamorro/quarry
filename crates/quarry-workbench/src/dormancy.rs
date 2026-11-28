@@ -2504,6 +2504,13 @@ impl WorkbenchScheduler {
                 }
                 replacement.document_id = Some(id);
                 slot.tab.document = Some(replacement);
+                if let SlotResidency::Hydrated {
+                    pending_filter_restore,
+                    ..
+                } = &mut slot.residency
+                {
+                    *pending_filter_restore = None;
+                }
                 slot.tab.delimiter_mode =
                     crate::tab::DelimiterMode::from_delimiter(options.delimiter);
                 slot.tab.header_mode = options.header_mode;
