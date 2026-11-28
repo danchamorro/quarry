@@ -590,8 +590,8 @@ impl CellInspector {
     }
 
     #[cfg(test)]
-    pub fn scroll_top_index_for_test(&self) -> usize {
-        self.scroll_handle.logical_scroll_top_index()
+    pub fn scroll_offset_y_for_test(&self) -> f32 {
+        -f32::from(self.scroll_handle.0.borrow().base_handle.offset().y)
     }
 
     #[cfg(test)]

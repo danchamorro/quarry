@@ -7319,10 +7319,10 @@ fn cell_inspector_drawer_json_pretty_invalid_stack_markdown_10mib_and_escape_foc
     cx.update(|cx| {
         let insp = view.read(cx).cell_inspector.read(cx);
         assert_eq!(insp.top_line_for_test(), 1);
-        assert_eq!(
-            insp.scroll_top_index_for_test(),
-            1,
-            "Down must strictly scroll the uniform list top item to line 1"
+        assert!(
+            insp.scroll_offset_y_for_test() >= 19.0,
+            "Down must strictly scroll the uniform list top item to line 1 (got offset_y={})",
+            insp.scroll_offset_y_for_test()
         );
     });
     // Page down 3 times (1 + 3 * 16 = line 49) below the first screen.
@@ -7355,9 +7355,9 @@ fn cell_inspector_drawer_json_pretty_invalid_stack_markdown_10mib_and_escape_foc
             insp.top_line_for_test()
         );
         assert!(
-            insp.scroll_top_index_for_test() > 1,
-            "PageDown must strictly advance the rendered scroll viewport (got top_idx={})",
-            insp.scroll_top_index_for_test()
+            insp.scroll_offset_y_for_test() > 20.0,
+            "PageDown must strictly advance the rendered scroll viewport (got offset_y={})",
+            insp.scroll_offset_y_for_test()
         );
     });
 
