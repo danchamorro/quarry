@@ -87,9 +87,10 @@ jobs:
 
   test:
     needs: [detect-changes]
-    # Never allow a skipped `test` job to satisfy branch protection if
-    # `detect-changes` fails or is cancelled.
-    if: always()
+    # Run even if `detect-changes` fails (so a skipped `test` job can never
+    # satisfy branch protection), while still honoring `cancel-in-progress`
+    # when a newer commit supersedes this PR run.
+    if: ${{ !cancelled() }}
     runs-on: macos-latest
     steps:
       - name: Verify change detection succeeded
